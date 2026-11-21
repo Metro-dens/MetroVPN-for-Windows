@@ -4,6 +4,7 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 import { WebviewWindow } from '@tauri-apps/api/webviewWindow';
 import { readText, writeText } from '@tauri-apps/plugin-clipboard-manager';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
+import { open as openShellUrl } from '@tauri-apps/plugin-shell';
 
 export const IN_TAURI = isTauri();
 
@@ -68,6 +69,22 @@ export async function pickExeFile() {
     filters: [{ name: 'Windows Applications', extensions: ['exe'] }],
   });
   return typeof selected === 'string' ? selected : null;
+}
+
+export async function openExternalUrl(url) {
+  if (IN_TAURI) {
+    try {
+      await openShellUrl(url);
+      return true;
+    } catch {
+      // fallback
+    }
+  }
+  if (typeof window !== 'undefined') {
+    window.open(url, '_blank', 'noopener,noreferrer');
+    return true;
+  }
+  return false;
 }
 
 export async function windowMinimize() {

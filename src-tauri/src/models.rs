@@ -80,10 +80,124 @@ pub struct AppSettings {
     pub start_with_windows: bool,
     pub active_node_id: Option<String>,
     pub windows_apps: Vec<WindowsAppRule>,
+
+    // General & Local Proxy settings (inspired by v2rayN & nekoray)
+    #[serde(default = "default_socks_port")]
+    pub socks_port: u16,
+    #[serde(default = "default_http_port")]
+    pub http_port: u16,
+    #[serde(default = "default_true")]
+    pub udp_enabled: bool,
+    #[serde(default = "default_true")]
+    pub sniffing_enabled: bool,
+    #[serde(default)]
+    pub sniffing_route_only: bool,
+    #[serde(default = "default_proxy_exceptions")]
+    pub system_proxy_exceptions: String,
+    #[serde(default)]
+    pub auto_connect_on_launch: bool,
+    #[serde(default = "default_true")]
+    pub close_to_tray: bool,
+
+    // Routing, Fragment & TUN settings (inspired by v2rayN, nekoray, MetroVpn Android)
+    #[serde(default = "default_routing_mode")]
+    pub routing_mode: String, // "rule" | "global" | "direct"
+    #[serde(default = "default_frag_packets")]
+    pub fragment_packets: String,
+    #[serde(default = "default_frag_length")]
+    pub fragment_length: String,
+    #[serde(default = "default_frag_interval")]
+    pub fragment_interval: String,
+    #[serde(default)]
+    pub ipv6_enabled: bool,
+    #[serde(default = "default_true")]
+    pub tun_strict_route: bool,
+    #[serde(default)]
+    pub tun_exclude_cidrs: String,
+
+    // DNS, Core & TLS Security settings
+    #[serde(default = "default_bootstrap_dns")]
+    pub bootstrap_dns: String,
+    #[serde(default)]
+    pub allow_insecure_fallback: bool,
+    #[serde(default = "default_fp")]
+    pub default_fingerprint: String,
+    #[serde(default)]
+    pub mux_enabled: bool,
+    #[serde(default = "default_mux_concurrency")]
+    pub mux_concurrency: u16,
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
+
+    // Subscriptions, Speedtest & First-Run Onboarding
+    #[serde(default)]
+    pub saved_subscriptions: Vec<String>,
+    #[serde(default)]
+    pub sub_use_proxy: bool,
+    #[serde(default)]
+    pub sub_clear_before_update: bool,
+    #[serde(default = "default_latency_mode")]
+    pub latency_mode: String, // "http_204" | "tcp_tls"
+    #[serde(default = "default_latency_url")]
+    pub latency_test_url: String,
+    #[serde(default)]
+    pub onboarding_completed: bool,
 }
 
 fn default_custom_doh() -> String {
     "https://dns.quad9.net/dns-query".to_string()
+}
+
+fn default_socks_port() -> u16 {
+    10808
+}
+
+fn default_http_port() -> u16 {
+    10809
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_proxy_exceptions() -> String {
+    "<local>;localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.2*;172.30.*;172.31.*;192.168.*".to_string()
+}
+
+fn default_routing_mode() -> String {
+    "rule".to_string()
+}
+
+fn default_frag_packets() -> String {
+    "tlshello".to_string()
+}
+
+fn default_frag_length() -> String {
+    "10-50".to_string()
+}
+
+fn default_frag_interval() -> String {
+    "10-20".to_string()
+}
+
+fn default_bootstrap_dns() -> String {
+    "1.1.1.1".to_string()
+}
+
+fn default_mux_concurrency() -> u16 {
+    8
+}
+
+fn default_log_level() -> String {
+    "warning".to_string()
+}
+
+fn default_latency_mode() -> String {
+    "http_204".to_string()
+}
+
+fn default_latency_url() -> String {
+    "https://www.gstatic.com/generate_204".to_string()
 }
 
 impl Default for AppSettings {
@@ -101,6 +215,33 @@ impl Default for AppSettings {
             start_with_windows: false,
             active_node_id: None,
             windows_apps: default_windows_apps(),
+            socks_port: default_socks_port(),
+            http_port: default_http_port(),
+            udp_enabled: true,
+            sniffing_enabled: true,
+            sniffing_route_only: false,
+            system_proxy_exceptions: default_proxy_exceptions(),
+            auto_connect_on_launch: false,
+            close_to_tray: true,
+            routing_mode: default_routing_mode(),
+            fragment_packets: default_frag_packets(),
+            fragment_length: default_frag_length(),
+            fragment_interval: default_frag_interval(),
+            ipv6_enabled: false,
+            tun_strict_route: true,
+            tun_exclude_cidrs: String::new(),
+            bootstrap_dns: default_bootstrap_dns(),
+            allow_insecure_fallback: false,
+            default_fingerprint: default_fp(),
+            mux_enabled: false,
+            mux_concurrency: default_mux_concurrency(),
+            log_level: default_log_level(),
+            saved_subscriptions: Vec::new(),
+            sub_use_proxy: false,
+            sub_clear_before_update: false,
+            latency_mode: default_latency_mode(),
+            latency_test_url: default_latency_url(),
+            onboarding_completed: false,
         }
     }
 }
@@ -228,6 +369,16 @@ pub struct PingResult {
     pub online: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleaseUpdateInfo {
+    pub current_version: String,
+    pub latest_version: String,
+    pub update_available: bool,
+    pub release_url: String,
+    pub published_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct PersistedStore {
@@ -237,39 +388,5 @@ pub struct PersistedStore {
 }
 
 pub fn initial_seed_nodes() -> Vec<ServerNode> {
-    vec![
-        ServerNode {
-            id: "sg-01".into(),
-            name: "SG-01 • SLT Fiber Direct".into(),
-            region: "SG".into(),
-            isp: "SLT Fiber".into(),
-            address: "sg01.metrovpn.io".into(),
-            port: 443,
-            uuid: "a94b7c12-e3f1-48a2-b910-81c450d912fa".into(),
-            sni: "st1.zoom.us".into(),
-            protocol: "TCP • TLS+VCN".into(),
-            transport: "tcp".into(),
-            tls_mode: "tls".into(),
-            vcn: true,
-            vcn_host: Some("vpn.metrodens.site".into()),
-            fingerprint: "chrome".into(),
-            alpn: Some("h2,http/1.1".into()),
-            flow: Some("xtls-rprx-vision".into()),
-            public_key: None,
-            short_id: None,
-            spider_x: None,
-            path: None,
-            host: None,
-            service_name: None,
-            allow_insecure: false,
-            ping: None,
-            quota_used_gb: 0.0,
-            quota_total_gb: 100.0,
-            starred: true,
-            online: false,
-            ip: "sg01.metrovpn.io".into(),
-            uri: "vless://a94b7c12-e3f1-48a2-b910-81c450d912fa@sg01.metrovpn.io:443?encryption=none&security=tls&sni=st1.zoom.us&vcn=vpn.metrodens.site&fp=chrome&alpn=h2,http/1.1&flow=xtls-rprx-vision&type=tcp#SG-01%20%E2%80%A2%20SLT%20Fiber%20Direct".into(),
-            raw_outbound: None,
-        },
-    ]
+    Vec::new()
 }

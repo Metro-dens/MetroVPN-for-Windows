@@ -18,6 +18,18 @@ pub fn build_xray_config(
         "127.0.0.1"
     };
 
+    let sniffing_obj = if settings.sniffing_enabled {
+        json!({
+            "enabled": true,
+            "destOverride": ["http", "tls", "quic"],
+            "routeOnly": settings.sniffing_route_only
+        })
+    } else {
+        json!({
+            "enabled": false
+        })
+    };
+
     let mut inbounds = vec![
         json!({
             "tag": "socks-in",
@@ -26,22 +38,16 @@ pub fn build_xray_config(
             "protocol": "socks",
             "settings": {
                 "auth": "noauth",
-                "udp": true
+                "udp": settings.udp_enabled
             },
-            "sniffing": {
-                "enabled": true,
-                "destOverride": ["http", "tls", "quic"]
-            }
+            "sniffing": sniffing_obj.clone()
         }),
         json!({
             "tag": "http-in",
             "listen": listen_addr,
             "port": http_port,
             "protocol": "http",
-            "sniffing": {
-                "enabled": true,
-                "destOverride": ["http", "tls"]
-            }
+            "sniffing": sniffing_obj
         }),
     ];
 
@@ -73,14 +79,30 @@ pub fn build_xray_config(
     ];
 
     if settings.tunnel_profile == "TLS Frag" {
+        let packets = if settings.fragment_packets.trim().is_empty() {
+            "tlshello"
+        } else {
+            settings.fragment_packets.trim()
+        };
+        let length = if settings.fragment_length.trim().is_empty() {
+            "10-50"
+        } else {
+            settings.fragment_length.trim()
+        };
+        let interval = if settings.fragment_interval.trim().is_empty() {
+            "10-20"
+        } else {
+            settings.fragment_interval.trim()
+        };
+
         outbounds.push(json!({
             "tag": "fragment-out",
             "protocol": "freedom",
             "settings": {
                 "fragment": {
-                    "packets": "tlshello",
-                    "length": "10-50",
-                    "interval": "10-20"
+                    "packets": packets,
+                    "length": length,
+                    "interval": interval
                 }
             }
         }));
@@ -97,42 +119,92 @@ pub fn build_xray_config(
         }));
     }
 
-    if settings.bypass_lan {
+    // Block Windows NetBIOS/mDNS multicast chatter (inspired by v2rayN SampleTunRules)
+    routing_rules.push(json!({
+        "type": "field",
+        "network": "udp",
+        "port": "135,137-139,5353",
+        "outboundTag": "block"
+    }));
+    routing_rules.push(json!({
+        "type": "field",
+        "ip": ["224.0.0.0/3", "ff00::/8"],
+        "outboundTag": "block"
+    }));
+
+    if !settings.ipv6_enabled {
+        // Prevent IPv6 leaks when IPv6 dual-stack routing is disabled
         routing_rules.push(json!({
             "type": "field",
-            "ip": [
-                "geoip:private",
-                "127.0.0.0/8",
-                "10.0.0.0/8",
-                "172.16.0.0/12",
-                "192.168.0.0/16"
-            ],
-            "outboundTag": "direct"
+            "ip": ["::/0"],
+            "outboundTag": "block"
         }));
     }
 
-    if settings.split_tunneling {
-        let bypassed_exes: Vec<String> = settings
-            .windows_apps
-            .iter()
-            .filter(|a| a.bypassed)
-            .map(|a| a.exe.clone())
-            .collect();
-        if !bypassed_exes.is_empty() {
+    if settings.routing_mode == "direct" {
+        routing_rules.push(json!({
+            "type": "field",
+            "inboundTag": ["socks-in", "http-in"],
+            "outboundTag": "direct"
+        }));
+    } else {
+        if settings.bypass_lan && settings.routing_mode != "global" {
             routing_rules.push(json!({
                 "type": "field",
-                "process": bypassed_exes,
+                "ip": [
+                    "geoip:private",
+                    "127.0.0.0/8",
+                    "10.0.0.0/8",
+                    "172.16.0.0/12",
+                    "192.168.0.0/16"
+                ],
                 "outboundTag": "direct"
             }));
         }
+
+        let extra_cidrs: Vec<String> = settings
+            .tun_exclude_cidrs
+            .split([',', '\n', ';', ' '])
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !extra_cidrs.is_empty() {
+            routing_rules.push(json!({
+                "type": "field",
+                "ip": extra_cidrs,
+                "outboundTag": "direct"
+            }));
+        }
+
+        if settings.split_tunneling {
+            let bypassed_exes: Vec<String> = settings
+                .windows_apps
+                .iter()
+                .filter(|a| a.bypassed)
+                .map(|a| a.exe.clone())
+                .collect();
+            if !bypassed_exes.is_empty() {
+                routing_rules.push(json!({
+                    "type": "field",
+                    "process": bypassed_exes,
+                    "outboundTag": "direct"
+                }));
+            }
+        }
     }
+
+    let log_level = match settings.log_level.as_str() {
+        "debug" | "info" | "warning" | "error" | "none" => settings.log_level.as_str(),
+        _ => "warning",
+    };
 
     let mut root = json!({
         "log": {
-            "loglevel": "info"
+            "loglevel": log_level
         },
         "dns": {
-            "servers": dns_servers
+            "servers": dns_servers,
+            "queryStrategy": if settings.ipv6_enabled { "UseIP" } else { "UseIPv4" }
         },
         "inbounds": inbounds,
         "outbounds": outbounds,
@@ -168,14 +240,20 @@ pub fn build_xray_config(
 }
 
 fn build_dns_servers(settings: &AppSettings) -> Vec<Value> {
+    let bootstrap = if settings.bootstrap_dns.trim().is_empty() {
+        "1.1.1.1"
+    } else {
+        settings.bootstrap_dns.trim()
+    };
     match settings.dns_resolver.as_str() {
-        "Google 8.8.8.8" => vec![json!("https://8.8.8.8/dns-query"), json!("8.8.8.8")],
-        "Quad9 9.9.9.9" => vec![json!("https://9.9.9.9/dns-query"), json!("9.9.9.9")],
+        "Cloudflare 1.1.1.2" => vec![json!("https://1.1.1.2/dns-query"), json!(bootstrap)],
+        "Google 8.8.8.8" => vec![json!("https://8.8.8.8/dns-query"), json!(bootstrap)],
+        "Quad9 9.9.9.9" => vec![json!("https://9.9.9.9/dns-query"), json!(bootstrap)],
         "Custom DoH" => vec![
             json!(settings.custom_doh_url),
-            json!("1.1.1.1"),
+            json!(bootstrap),
         ],
-        _ => vec![json!("https://1.1.1.1/dns-query"), json!("1.1.1.1")],
+        _ => vec![json!("https://1.1.1.1/dns-query"), json!(bootstrap)],
     }
 }
 
@@ -197,6 +275,14 @@ fn build_proxy_outbound(node: &ServerNode, settings: &AppSettings) -> Value {
         node.tls_mode.as_str()
     };
 
+    let fp = if !node.fingerprint.is_empty() {
+        node.fingerprint.as_str()
+    } else if !settings.default_fingerprint.is_empty() {
+        settings.default_fingerprint.as_str()
+    } else {
+        "chrome"
+    };
+
     let mut stream_settings = json!({
         "network": node.transport,
         "security": security
@@ -205,7 +291,7 @@ fn build_proxy_outbound(node: &ServerNode, settings: &AppSettings) -> Value {
     if security == "reality" {
         stream_settings["realitySettings"] = json!({
             "show": false,
-            "fingerprint": node.fingerprint,
+            "fingerprint": fp,
             "serverName": node.sni,
             "publicKey": node.public_key.clone().unwrap_or_default(),
             "shortId": node.short_id.clone().unwrap_or_default(),
@@ -213,7 +299,10 @@ fn build_proxy_outbound(node: &ServerNode, settings: &AppSettings) -> Value {
         });
     } else if security == "tls" {
         let alpn_list: Vec<String> = if let Some(alpn) = &node.alpn {
-            alpn.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+            alpn.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
         } else if node.transport == "ws" {
             // Avoid HTTP/2 upgrade 400 trap on WebSocket+TLS inbounds
             vec!["http/1.1".to_string()]
@@ -222,17 +311,21 @@ fn build_proxy_outbound(node: &ServerNode, settings: &AppSettings) -> Value {
         };
 
         let strict_verify = settings.tunnel_profile == "Strict VCN" && settings.cert_pinning;
-        let allow_insecure = if strict_verify { false } else { node.allow_insecure };
+        let allow_insecure = if strict_verify {
+            false
+        } else {
+            node.allow_insecure || settings.allow_insecure_fallback
+        };
 
         let mut tls_obj = json!({
             "serverName": node.sni,
             "allowInsecure": allow_insecure,
-            "fingerprint": if node.fingerprint.is_empty() { "chrome" } else { &node.fingerprint },
+            "fingerprint": fp,
             "alpn": alpn_list
         });
 
         if let Some(vcn_host) = &node.vcn_host {
-            if !vcn_host.is_empty() {
+            if !vcn_host.is_empty() && settings.cert_pinning {
                 tls_obj["verifyPeerCertByName"] = json!(vcn_host);
             }
         }
@@ -265,7 +358,13 @@ fn build_proxy_outbound(node: &ServerNode, settings: &AppSettings) -> Value {
         });
     }
 
-    if is_vmess {
+    let has_vision_flow = node
+        .flow
+        .as_deref()
+        .map(|f| f.contains("vision"))
+        .unwrap_or(false);
+
+    let mut outbound = if is_vmess {
         json!({
             "tag": "proxy",
             "protocol": "vmess",
@@ -304,17 +403,26 @@ fn build_proxy_outbound(node: &ServerNode, settings: &AppSettings) -> Value {
             },
             "streamSettings": stream_settings
         })
+    };
+
+    if settings.mux_enabled && !has_vision_flow {
+        outbound["mux"] = json!({
+            "enabled": true,
+            "concurrency": settings.mux_concurrency.clamp(1, 32)
+        });
     }
+
+    outbound
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::initial_seed_nodes;
+    use crate::parser::parse_vless_uri;
 
     #[test]
     fn test_xray_config_strict_vcn_and_lan_sharing() {
-        let node = initial_seed_nodes().remove(0);
+        let node = parse_vless_uri("vless://a94b7c12-e3f1-48a2-b910-81c450d912fa@1.2.3.4:443?encryption=none&security=tls&sni=st1.zoom.us&vcn=vpn.metrodens.site&fp=chrome&alpn=h2,http/1.1&flow=xtls-rprx-vision&type=tcp#SG-01%20SLT").unwrap();
         let mut settings = AppSettings::default();
         settings.lan_proxy_sharing = true;
         settings.tunnel_profile = "Strict VCN".into();
@@ -335,9 +443,10 @@ mod tests {
 
     #[test]
     fn test_xray_config_tls_frag_adds_dialer_proxy() {
-        let node = initial_seed_nodes().remove(0);
+        let node = parse_vless_uri("vless://a94b7c12-e3f1-48a2-b910-81c450d912fa@1.2.3.4:443?encryption=none&security=tls&sni=st1.zoom.us&type=tcp#SG-01").unwrap();
         let mut settings = AppSettings::default();
         settings.tunnel_profile = "TLS Frag".into();
+        settings.fragment_length = "20-40".into();
 
         let cfg = build_xray_config(&node, &settings, SOCKS_PORT, HTTP_PORT, true);
         let outbounds = cfg["outbounds"].as_array().unwrap();
@@ -345,7 +454,7 @@ mod tests {
             outbounds[0]["streamSettings"]["sockopt"]["dialerProxy"],
             "fragment-out"
         );
-        assert!(outbounds.iter().any(|o| o["tag"] == "fragment-out"));
+        let frag = outbounds.iter().find(|o| o["tag"] == "fragment-out").unwrap();
+        assert_eq!(frag["settings"]["fragment"]["length"], "20-40");
     }
 }
-

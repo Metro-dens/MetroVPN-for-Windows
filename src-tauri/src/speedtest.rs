@@ -1,6 +1,6 @@
 use crate::models::{SpeedTestHistoryEntry, SpeedTestProgress};
 use crate::vpn_manager::{resolve_resource_dir, resolve_sidecar_path, AppState};
-use crate::xray_config::{build_xray_config, SOCKS_PORT};
+use crate::xray_config::build_xray_config;
 use chrono::Local;
 use futures_util::StreamExt;
 use std::process::{Child, Command, Stdio};
@@ -61,13 +61,19 @@ pub async fn run_speed_test(
         )
     };
 
-    // Route through active Xray SOCKS5 (:10808) if connected to this node,
-    // otherwise spin up an isolated temporary Xray test proxy on :10818.
     let (_temp_guard, socks_port) = if is_connected_to_target {
-        (TempXrayGuard(None), SOCKS_PORT)
+        (TempXrayGuard(None), settings.socks_port.max(1024))
     } else {
-        let test_socks = 10818u16;
-        let test_http = 10819u16;
+        let test_socks = std::net::TcpListener::bind("127.0.0.1:0")
+            .ok()
+            .and_then(|l| l.local_addr().ok())
+            .map(|a| a.port())
+            .unwrap_or(10818);
+        let test_http = std::net::TcpListener::bind("127.0.0.1:0")
+            .ok()
+            .and_then(|l| l.local_addr().ok())
+            .map(|a| a.port())
+            .unwrap_or(10819);
         let cfg = build_xray_config(&target_node, &settings, test_socks, test_http, false);
         let cfg_path = app_data_dir.join("xray-speedtest.json");
         let json = serde_json::to_string_pretty(&cfg)
@@ -90,7 +96,16 @@ pub async fn run_speed_test(
         let child = cmd
             .spawn()
             .map_err(|e| format!("Failed to start temporary Xray speedtest core: {e}"))?;
-        tokio::time::sleep(Duration::from_millis(550)).await;
+
+        for _ in 0..20 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", test_socks))
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(60)).await;
+        }
         (TempXrayGuard(Some(child)), test_socks)
     };
 

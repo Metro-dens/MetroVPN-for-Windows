@@ -10,6 +10,10 @@ pub struct ProxyBackup {
     pub proxy_server: String,
     pub had_override: bool,
     pub proxy_override: String,
+    #[serde(default)]
+    pub had_autoconfig: bool,
+    #[serde(default)]
+    pub auto_config_url: String,
 }
 
 /// Returns the machine's active LAN IPv4 address using a non-blocking UDP route lookup.
@@ -75,6 +79,7 @@ mod win_impl {
         backup_path: &Path,
         http_port: u16,
         bypass_lan: bool,
+        custom_exceptions: &str,
     ) -> Result<(), String> {
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         let key = hkcu
@@ -95,6 +100,10 @@ mod win_impl {
                 backup.had_override = true;
                 backup.proxy_override = val;
             }
+            if let Ok(val) = key.get_value::<String, _>("AutoConfigURL") {
+                backup.had_autoconfig = true;
+                backup.auto_config_url = val;
+            }
             if let Some(parent) = backup_path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
@@ -105,12 +114,17 @@ mod win_impl {
         }
 
         let proxy_addr = format!("127.0.0.1:{http_port}");
-        let override_str = if bypass_lan {
-            "<local>;localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.2*;172.30.*;172.31.*;192.168.*"
+        let trimmed_custom = custom_exceptions.trim();
+        let override_str = if !bypass_lan {
+            "<local>".to_string()
+        } else if !trimmed_custom.is_empty() {
+            trimmed_custom.replace(['\r', '\n'], ";")
         } else {
-            "<local>"
+            "<local>;localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.2*;172.30.*;172.31.*;192.168.*".to_string()
         };
 
+        // Clear any leftover PAC AutoConfigURL (v2rayN best practice) so ProxyServer takes precedence
+        let _ = key.delete_value("AutoConfigURL");
         key.set_value("ProxyEnable", &1u32)
             .map_err(|e| format!("Failed to set ProxyEnable: {e}"))?;
         key.set_value("ProxyServer", &proxy_addr)
@@ -153,6 +167,12 @@ mod win_impl {
             let _ = key.delete_value("ProxyOverride");
         }
 
+        if backup.had_autoconfig {
+            let _ = key.set_value("AutoConfigURL", &backup.auto_config_url);
+        } else {
+            let _ = key.delete_value("AutoConfigURL");
+        }
+
         notify_wininet();
         let _ = std::fs::remove_file(backup_path);
         Ok(true)
@@ -187,21 +207,22 @@ mod win_impl {
         interface_name: &str,
         server_host: &str,
         dns_server: &str,
-    ) -> Result<Option<String>, String> {
+        mtu: u16,
+    ) -> Result<Vec<String>, String> {
         // Resolve physical default gateway before adding split default route
         let gw_output = Command::new("powershell")
             .args([
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
-                "(Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Sort-Object RouteMetric | Select-Object -First 1).NextHop",
+                "(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' | Where-Object { $_.NextHop -ne '0.0.0.0' -and $_.InterfaceAlias -ne 'Metrovpn-TUN' } | Sort-Object RouteMetric | Select-Object -First 1).NextHop",
             ])
             .creation_flags(CREATE_NO_WINDOW)
             .output()
             .map_err(|e| format!("Failed to query default gateway: {e}"))?;
         let orig_gw = String::from_utf8_lossy(&gw_output.stdout).trim().to_string();
 
-        // Assign static IP to Wintun adapter
+        // Assign non-persistent static IP (store=active) without adding a competing 0.0.0.0/0 gateway
         let _ = Command::new("netsh")
             .args([
                 "interface",
@@ -212,7 +233,20 @@ mod win_impl {
                 "static",
                 "198.18.0.1",
                 "255.255.255.0",
-                "198.18.0.2",
+                "store=active",
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+
+        let _ = Command::new("netsh")
+            .args([
+                "interface",
+                "ipv4",
+                "set",
+                "subinterface",
+                interface_name,
+                &format!("mtu={}", mtu.clamp(1280, 9000)),
+                "store=active",
             ])
             .creation_flags(CREATE_NO_WINDOW)
             .output();
@@ -231,19 +265,20 @@ mod win_impl {
             .creation_flags(CREATE_NO_WINDOW)
             .output();
 
-        // Pin direct host route for VPN server IP so TUN traffic doesn't loop
-        let mut pinned_ip = None;
+        // Pin direct host routes for ALL resolved server IPv4s so TUN traffic never loops
+        let mut pinned_ips = Vec::new();
         if !orig_gw.is_empty() {
             if let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&(server_host, 443)) {
                 for addr in addrs {
                     if let std::net::SocketAddr::V4(v4) = addr {
                         let ip = v4.ip().to_string();
-                        let _ = Command::new("route")
-                            .args(["add", &ip, "mask", "255.255.255.255", &orig_gw, "metric", "1"])
-                            .creation_flags(CREATE_NO_WINDOW)
-                            .output();
-                        pinned_ip = Some(ip);
-                        break;
+                        if !pinned_ips.contains(&ip) {
+                            let _ = Command::new("route")
+                                .args(["add", &ip, "mask", "255.255.255.255", &orig_gw, "metric", "1"])
+                                .creation_flags(CREATE_NO_WINDOW)
+                                .output();
+                            pinned_ips.push(ip);
+                        }
                     }
                 }
             }
@@ -259,10 +294,10 @@ mod win_impl {
             .creation_flags(CREATE_NO_WINDOW)
             .output();
 
-        Ok(pinned_ip)
+        Ok(pinned_ips)
     }
 
-    pub fn teardown_tun_routes(pinned_server_ip: Option<&str>) {
+    pub fn teardown_tun_routes(pinned_server_ips: &[String]) {
         let _ = Command::new("route")
             .args(["delete", "0.0.0.0", "mask", "128.0.0.0", "198.18.0.2"])
             .creation_flags(CREATE_NO_WINDOW)
@@ -271,7 +306,7 @@ mod win_impl {
             .args(["delete", "128.0.0.0", "mask", "128.0.0.0", "198.18.0.2"])
             .creation_flags(CREATE_NO_WINDOW)
             .output();
-        if let Some(ip) = pinned_server_ip {
+        for ip in pinned_server_ips {
             let _ = Command::new("route")
                 .args(["delete", ip, "mask", "255.255.255.255"])
                 .creation_flags(CREATE_NO_WINDOW)
@@ -289,6 +324,7 @@ mod win_impl {
         backup_path: &Path,
         _http_port: u16,
         _bypass_lan: bool,
+        _custom_exceptions: &str,
     ) -> Result<(), String> {
         if let Some(parent) = backup_path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -317,11 +353,12 @@ mod win_impl {
         _interface_name: &str,
         _server_host: &str,
         _dns_server: &str,
-    ) -> Result<Option<String>, String> {
-        Ok(None)
+        _mtu: u16,
+    ) -> Result<Vec<String>, String> {
+        Ok(Vec::new())
     }
 
-    pub fn teardown_tun_routes(_pinned_server_ip: Option<&str>) {}
+    pub fn teardown_tun_routes(_pinned_server_ips: &[String]) {}
 }
 
 pub use win_impl::{

@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: "Release tag to create (e.g. v2.4.0)"
+        description: "Release tag to create (e.g. v2.5.0)"
         required: true
-        default: "v2.4.0"
+        default: "v2.5.0"
         type: string
       draft:
         description: "Create as a draft release (hidden until published)"
@@ -76,11 +76,11 @@ jobs:
             - **`Metrovpn-windows-x64-portable.zip`** — Portable folder archive with all binaries side-by-side.
             - **`SHA256SUMS.txt`** — SHA-256 verification checksums (`Get-FileHash <file> -Algorithm SHA256`).
 
-            ### Highlights
-            - **System Proxy Mode (No Admin Required)** with instant WinINET refresh & automatic crash/stale-lock registry cleanup.
-            - **TUN Mode (`Metrovpn-TUN` via Wintun)** with UAC elevation prompt, selectable MTU (`1500` / `1420` / `1280`), and Split Tunneling `.exe` exclusions.
-            - **`vless://` (`tls`, `vcn`, `reality`, `ws`, `grpc`, `tcp`), `vmess://`, raw `.json`, subscriptions & QR import**, plus `Strict VCN`, `TLS Frag`, and custom DoH resolvers.
-            - **Concurrent Node Ping**, **3-Phase Cloudflare Speed Test**, **ISP server tabs (`SLT`, `Dialog`, `Hutch`, `Airtel`, `Mobitel`)**, and **System Tray flyout**.
+            ### What's New in v2.5.0
+            - **First-Run Onboarding Guide (`?`):** 3-step walkthrough for importing VLESS/VMess/Subscriptions, choosing System Proxy vs Wintun TUN Mode, and configuring Strict VCN / TLS Frag / System Tray.
+            - **5-Tab Settings (v2rayN & NekoRay Style + MetroVPN Android Parity):** `General & Proxy`, `TUN & Routing` (`Rule`/`Global`/`Direct`, custom fragment, IPv6 control, Split Tunnel `.exe` exclusions), `DNS & Security` (`1.1.1.2`, bootstrap DNS, Mux, uTLS), `Subs & Speed`, and `About & Guide` (in-app update checker + Telegram links).
+            - **Cleaner, Faster & Offline-Safe Desktop UI:** Removed dead dummy node, fixed last-node deletion, fixed window button hitboxes (`data-tauri-drag-region`), removed blocking remote Google Fonts, and prevented keystroke-induced tunnel drops.
+            - **True Xray HTTP 204 Ping & Stronger Windows Proxy/TUN:** Real `generate_204` Xray latency testing, PAC (`AutoConfigURL`) backup/restore, `store=active` route fixes, and multi-IP server bypass pinning.
 
             > **SmartScreen Note:** If Windows Defender SmartScreen prompts on an unsigned build, verify the SHA-256 checksum against `SHA256SUMS.txt` and click **More info → Run anyway**.
           releaseDraft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft || false }}

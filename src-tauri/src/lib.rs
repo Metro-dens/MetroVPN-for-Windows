@@ -13,10 +13,11 @@ use tauri::{
     Manager, PhysicalPosition, RunEvent, WindowEvent,
 };
 use vpn_manager::{
-    add_custom_windows_app, clear_logs, connect_internal, connect_server, decode_qr_image,
-    delete_server, disconnect, emit_status, get_logs, get_settings, get_status,
-    import_subscription, import_uri, is_admin, list_servers, quit_app, refresh_local_ip,
-    restart_as_admin, toggle_star, update_server, update_settings, AppState,
+    add_custom_windows_app, check_github_update, clear_logs, connect_internal, connect_server,
+    decode_qr_image, delete_server, disconnect, emit_status, get_logs, get_settings, get_status,
+    import_subscription, import_uri, is_admin, list_servers, quit_app, reconnect_active,
+    refresh_local_ip, reset_settings, restart_as_admin, toggle_star, update_all_subscriptions,
+    update_server, update_settings, AppState,
 };
 
 fn toggle_tray_flyout(app: &tauri::AppHandle) {
@@ -193,15 +194,50 @@ pub fn run() {
                 }
             }
 
+            // Auto-connect active server if enabled in settings
+            {
+                let (should_auto, node_id_opt, mode) = {
+                    let Ok(g) = state.inner.lock() else {
+                        return Ok(());
+                    };
+                    (
+                        g.store.settings.auto_connect_on_launch,
+                        g.store
+                            .settings
+                            .active_node_id
+                            .clone()
+                            .or_else(|| g.store.servers.first().map(|s| s.id.clone())),
+                        g.store.settings.system_mode.clone(),
+                    )
+                };
+                if should_auto {
+                    if let Some(id) = node_id_opt {
+                        let app_h = app.handle().clone();
+                        let st_c = state.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let _ = connect_internal(app_h, st_c, id, mode).await;
+                        });
+                    }
+                }
+            }
+
             Ok(())
         })
         .on_window_event(|window, event| {
             match window.label() {
                 "main" => {
                     if let WindowEvent::CloseRequested { api, .. } = event {
-                        // Closing main window hides to system tray without killing VPN tunnel
-                        api.prevent_close();
-                        let _ = window.hide();
+                        let close_to_tray = window
+                            .app_handle()
+                            .try_state::<AppState>()
+                            .and_then(|st| st.inner.lock().ok().map(|g| g.store.settings.close_to_tray))
+                            .unwrap_or(true);
+                        if close_to_tray {
+                            api.prevent_close();
+                            let _ = window.hide();
+                        } else if let Some(st) = window.app_handle().try_state::<AppState>() {
+                            st.cleanup_all();
+                        }
                     }
                 }
                 "tray" => {
@@ -215,6 +251,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             import_uri,
             import_subscription,
+            update_all_subscriptions,
             decode_qr_image,
             list_servers,
             update_server,
@@ -222,9 +259,12 @@ pub fn run() {
             toggle_star,
             connect_server,
             disconnect,
+            reconnect_active,
             get_status,
             get_settings,
             update_settings,
+            reset_settings,
+            check_github_update,
             get_logs,
             clear_logs,
             refresh_local_ip,

@@ -1,13 +1,13 @@
 use crate::models::{
-    initial_seed_nodes, AppSettings, LogEntry, PersistedStore, ServerNode, SpeedTestHistoryEntry,
-    TelemetryPayload, VpnStatusPayload, WindowsAppRule,
+    AppSettings, LogEntry, PersistedStore, ReleaseUpdateInfo, ServerNode, TelemetryPayload,
+    VpnStatusPayload, WindowsAppRule,
 };
 use crate::network_win::{
     backup_file_path, configure_tun_interface, enable_system_proxy, get_active_lan_ipv4,
     is_elevated, relaunch_as_admin, restore_system_proxy, teardown_tun_routes, CREATE_NO_WINDOW,
 };
 use crate::parser::{decode_qr_from_bytes, fetch_subscription, parse_any};
-use crate::xray_config::{build_xray_config, HTTP_PORT, SOCKS_PORT, STATS_API_PORT};
+use crate::xray_config::{build_xray_config, STATS_API_PORT};
 use crate::xray_stats::query_xray_stats;
 use chrono::Local;
 use std::collections::VecDeque;
@@ -30,7 +30,7 @@ pub struct InnerState {
     pub status: String, // "Disconnected" | "Connecting" | "Connected" | "Error"
     pub error_message: Option<String>,
     pub connected_at: Option<Instant>,
-    pub pinned_server_ip: Option<String>,
+    pub pinned_server_ips: Vec<String>,
     pub logs: VecDeque<LogEntry>,
     pub telemetry_generation: u64,
     pub last_up_bytes: u64,
@@ -54,9 +54,8 @@ impl AppState {
         let recovered = restore_system_proxy(&backup_path).unwrap_or(false);
 
         let mut store = load_store(&store_path);
-        if store.servers.is_empty() {
-            store.servers = initial_seed_nodes();
-            store.settings.active_node_id = store.servers.first().map(|s| s.id.clone());
+        if store.servers.is_empty() && store.settings.active_node_id.is_some() {
+            store.settings.active_node_id = None;
             save_store(&store_path, &store);
         }
 
@@ -82,7 +81,7 @@ impl AppState {
                 status: "Disconnected".into(),
                 error_message: None,
                 connected_at: None,
-                pinned_server_ip: None,
+                pinned_server_ips: Vec::new(),
                 logs,
                 telemetry_generation: 0,
                 last_up_bytes: 0,
@@ -111,7 +110,7 @@ impl AppState {
     }
 
     pub fn cleanup_all(&self) {
-        let (xray_child, tun_child, pinned_ip, backup_path) = {
+        let (xray_child, tun_child, pinned_ips, backup_path) = {
             let Ok(mut guard) = self.inner.lock() else {
                 return;
             };
@@ -121,7 +120,7 @@ impl AppState {
             (
                 guard.xray_child.take(),
                 guard.tun_child.take(),
-                guard.pinned_server_ip.take(),
+                std::mem::take(&mut guard.pinned_server_ips),
                 backup_file_path(&guard.app_data_dir),
             )
         };
@@ -130,7 +129,7 @@ impl AppState {
             let _ = child.kill();
             let _ = child.wait();
         }
-        teardown_tun_routes(pinned_ip.as_deref());
+        teardown_tun_routes(&pinned_ips);
 
         if let Some(mut child) = xray_child {
             let _ = child.kill();
@@ -431,8 +430,11 @@ pub async fn connect_internal(
         ),
     );
 
+    let socks_port = settings.socks_port.max(1024);
+    let http_port = settings.http_port.max(1024);
+
     // Build and write runtime Xray config.json
-    let runtime_cfg = build_xray_config(&node, &settings, SOCKS_PORT, HTTP_PORT, true);
+    let runtime_cfg = build_xray_config(&node, &settings, socks_port, http_port, true);
     let config_path = app_data_dir.join("xray-runtime.json");
     let cfg_pretty = serde_json::to_string_pretty(&runtime_cfg)
         .map_err(|e| format!("Failed to serialize Xray config: {e}"))?;
@@ -468,21 +470,34 @@ pub async fn connect_internal(
 
     pipe_child_logs(&mut xray_child, app.clone(), state.clone(), "");
 
-    // Give Xray 450ms to bind local ports and confirm it didn't immediately crash
-    tokio::time::sleep(Duration::from_millis(450)).await;
-    if let Ok(Some(exit_status)) = xray_child.try_wait() {
-        let msg = format!("Xray-core exited prematurely ({exit_status})");
-        if let Ok(mut g) = state.inner.lock() {
-            g.status = "Error".into();
-            g.error_message = Some(msg.clone());
+    // Wait up to 900ms for Xray to bind local port and verify it didn't exit early
+    let mut xray_ready = false;
+    for _ in 0..18 {
+        if let Ok(Some(exit_status)) = xray_child.try_wait() {
+            let msg = format!("Xray-core exited prematurely ({exit_status})");
+            if let Ok(mut g) = state.inner.lock() {
+                g.status = "Error".into();
+                g.error_message = Some(msg.clone());
+            }
+            emit_status(&app, &state);
+            return Err(msg);
         }
-        emit_status(&app, &state);
-        return Err(msg);
+        if tokio::net::TcpStream::connect(("127.0.0.1", socks_port))
+            .await
+            .is_ok()
+        {
+            xray_ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    if !xray_ready {
+        state.push_log(Some(&app), "Warning", "Xray-core still warming up SOCKS5 listener...");
     }
 
     // Apply Windows traffic routing (System Proxy or Wintun TUN)
     let mut tun_child_opt: Option<Child> = None;
-    let mut pinned_ip_opt: Option<String> = None;
+    let mut pinned_ips: Vec<String> = Vec::new();
 
     if mode_norm == "TUN" {
         let tun_bin = match resolve_sidecar_path(&app, "tun2socks") {
@@ -503,7 +518,7 @@ pub async fn connect_internal(
         }
 
         let mtu_str = settings.mtu.to_string();
-        let proxy_arg = format!("socks5://127.0.0.1:{SOCKS_PORT}");
+        let proxy_arg = format!("socks5://127.0.0.1:{socks_port}");
         let mut tun_child = spawn_hidden_process(
             &tun_bin,
             &[
@@ -521,11 +536,12 @@ pub async fn connect_internal(
 
         tokio::time::sleep(Duration::from_millis(900)).await;
         let dns_ip = match settings.dns_resolver.as_str() {
+            "Cloudflare 1.1.1.2" => "1.1.1.2",
             "Google 8.8.8.8" => "8.8.8.8",
             "Quad9 9.9.9.9" => "9.9.9.9",
             _ => "1.1.1.1",
         };
-        pinned_ip_opt = configure_tun_interface("Metrovpn-TUN", &node.address, dns_ip)?;
+        pinned_ips = configure_tun_interface("Metrovpn-TUN", &node.address, dns_ip, settings.mtu)?;
         tun_child_opt = Some(tun_child);
         state.push_log(
             Some(&app),
@@ -534,12 +550,17 @@ pub async fn connect_internal(
         );
     } else {
         let backup_path = backup_file_path(&app_data_dir);
-        enable_system_proxy(&backup_path, HTTP_PORT, settings.bypass_lan)?;
+        enable_system_proxy(
+            &backup_path,
+            http_port,
+            settings.bypass_lan,
+            &settings.system_proxy_exceptions,
+        )?;
         state.push_log(
             Some(&app),
             "VCN",
             &format!(
-                "Windows System Proxy active on 127.0.0.1:{HTTP_PORT} (WinINET refreshed)"
+                "Windows System Proxy active on 127.0.0.1:{http_port} (WinINET refreshed)"
             ),
         );
     }
@@ -549,7 +570,7 @@ pub async fn connect_internal(
         state.push_log(
             Some(&app),
             "Info",
-            &format!("LAN Proxy Sharing bound to {lan_ip}:{SOCKS_PORT} (SOCKS5) / :{HTTP_PORT} (HTTP)"),
+            &format!("LAN Proxy Sharing bound to {lan_ip}:{socks_port} (SOCKS5) / :{http_port} (HTTP)"),
         );
     }
 
@@ -557,7 +578,7 @@ pub async fn connect_internal(
         let mut guard = state.inner.lock().map_err(|_| "State lock poisoned")?;
         guard.xray_child = Some(xray_child);
         guard.tun_child = tun_child_opt;
-        guard.pinned_server_ip = pinned_ip_opt;
+        guard.pinned_server_ips = pinned_ips;
         guard.status = "Connected".into();
         guard.error_message = None;
         guard.connected_at = Some(Instant::now());
@@ -669,9 +690,16 @@ pub async fn import_subscription(
     state: State<'_, AppState>,
     url: String,
 ) -> Result<Vec<ServerNode>, String> {
-    let (nodes, quota) = fetch_subscription(&url).await?;
+    let clean_url = url.trim().to_string();
+    let (nodes, quota) = fetch_subscription(&clean_url).await?;
     {
         let mut guard = state.inner.lock().map_err(|_| "State lock poisoned")?;
+        if guard.store.settings.sub_clear_before_update {
+            guard.store.servers.clear();
+        }
+        if !clean_url.is_empty() && !guard.store.settings.saved_subscriptions.contains(&clean_url) {
+            guard.store.settings.saved_subscriptions.push(clean_url.clone());
+        }
         for n in nodes.iter().rev() {
             guard.store.servers.insert(0, n.clone());
         }
@@ -689,6 +717,57 @@ pub async fn import_subscription(
         &format!("Synced {} node(s) from subscription{quota_note}", nodes.len()),
     );
     Ok(nodes)
+}
+
+#[tauri::command]
+pub async fn update_all_subscriptions(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Vec<ServerNode>, String> {
+    let (subs, clear_first) = {
+        let guard = state.inner.lock().map_err(|_| "State lock poisoned")?;
+        (
+            guard.store.settings.saved_subscriptions.clone(),
+            guard.store.settings.sub_clear_before_update,
+        )
+    };
+    if subs.is_empty() {
+        return Err("No saved subscription URLs configured yet".into());
+    }
+
+    let mut fetched_all = Vec::new();
+    for url in subs {
+        if let Ok((nodes, _)) = fetch_subscription(&url).await {
+            fetched_all.extend(nodes);
+        }
+    }
+
+    if fetched_all.is_empty() {
+        return Err("Failed to fetch nodes from saved subscriptions".into());
+    }
+
+    let all_nodes = {
+        let mut guard = state.inner.lock().map_err(|_| "State lock poisoned")?;
+        if clear_first {
+            guard.store.servers.clear();
+        }
+        for n in fetched_all.iter().rev() {
+            guard.store.servers.insert(0, n.clone());
+        }
+        if guard.store.settings.active_node_id.is_none() {
+            guard.store.settings.active_node_id =
+                guard.store.servers.first().map(|s| s.id.clone());
+        }
+        save_store(&guard.store_path, &guard.store);
+        guard.store.servers.clone()
+    };
+
+    state.push_log(
+        Some(&app),
+        "Info",
+        &format!("Synced {} node(s) from saved subscriptions", fetched_all.len()),
+    );
+    Ok(all_nodes)
 }
 
 #[tauri::command]
@@ -728,9 +807,6 @@ pub async fn update_server(
 #[tauri::command]
 pub async fn delete_server(state: State<'_, AppState>, id: String) -> Result<Vec<ServerNode>, String> {
     let mut guard = state.inner.lock().map_err(|_| "State lock poisoned")?;
-    if guard.store.servers.len() <= 1 {
-        return Err("At least one tunnel node is required".into());
-    }
     guard.store.servers.retain(|s| s.id != id);
     if guard.store.settings.active_node_id.as_deref() == Some(id.as_str()) {
         guard.store.settings.active_node_id =
@@ -800,6 +876,7 @@ pub async fn update_settings(
     app: AppHandle,
     state: State<'_, AppState>,
     settings: AppSettings,
+    reconnect: Option<bool>,
 ) -> Result<AppSettings, String> {
     #[cfg(desktop)]
     {
@@ -827,13 +904,97 @@ pub async fn update_settings(
 
     emit_status(&app, state.inner());
 
-    if was_connected {
+    if was_connected && reconnect.unwrap_or(false) {
         if let Some(id) = active_id {
             let _ = connect_internal(app, state.inner().clone(), id, new_mode).await;
         }
     }
 
     Ok(settings)
+}
+
+#[tauri::command]
+pub async fn reconnect_active(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<VpnStatusPayload, String> {
+    let (active_id, mode) = {
+        let guard = state.inner.lock().map_err(|_| "State lock poisoned")?;
+        let id = guard
+            .store
+            .settings
+            .active_node_id
+            .clone()
+            .or_else(|| guard.store.servers.first().map(|s| s.id.clone()))
+            .ok_or_else(|| "No active server node selected".to_string())?;
+        (id, guard.store.settings.system_mode.clone())
+    };
+    connect_internal(app, state.inner().clone(), active_id, mode).await
+}
+
+#[tauri::command]
+pub async fn reset_settings(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<AppSettings, String> {
+    let fresh = {
+        let mut guard = state.inner.lock().map_err(|_| "State lock poisoned")?;
+        let active_id = guard.store.settings.active_node_id.clone();
+        let onboarding_done = guard.store.settings.onboarding_completed;
+        let mut defaults = AppSettings::default();
+        defaults.active_node_id = active_id;
+        defaults.onboarding_completed = onboarding_done;
+        guard.store.settings = defaults.clone();
+        save_store(&guard.store_path, &guard.store);
+        defaults
+    };
+    emit_status(&app, state.inner());
+    state.push_log(Some(&app), "Info", "Settings restored to MetroVPN defaults");
+    Ok(fresh)
+}
+
+#[tauri::command]
+pub async fn check_github_update() -> Result<ReleaseUpdateInfo, String> {
+    let current = env!("CARGO_PKG_VERSION").to_string();
+    let client = reqwest::Client::builder()
+        .user_agent("Metrovpn-Desktop")
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("Failed to initialize update client: {e}"))?;
+
+    let resp = client
+        .get("https://api.github.com/repos/Metro-dens/MetroVPN-for-Windows/releases/latest")
+        .send()
+        .await
+        .map_err(|e| format!("Failed to reach GitHub Releases: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("GitHub Releases returned HTTP {}", resp.status()));
+    }
+
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Invalid GitHub release payload: {e}"))?;
+
+    let tag = body["tag_name"]
+        .as_str()
+        .unwrap_or(&current)
+        .trim_start_matches('v')
+        .to_string();
+    let html_url = body["html_url"]
+        .as_str()
+        .unwrap_or("https://github.com/Metro-dens/MetroVPN-for-Windows/releases")
+        .to_string();
+    let published_at = body["published_at"].as_str().unwrap_or("").to_string();
+
+    Ok(ReleaseUpdateInfo {
+        update_available: tag != current && !tag.is_empty(),
+        current_version: current,
+        latest_version: tag,
+        release_url: html_url,
+        published_at,
+    })
 }
 
 #[tauri::command]

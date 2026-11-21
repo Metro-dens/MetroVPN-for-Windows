@@ -1,5 +1,24 @@
 # Changelog
 
+## [v2.5.0] - 2026-11-21
+
+### Fixed & Improved
+- **First-Run User Guidance (Onboarding):** Added a 3-step interactive onboarding modal (`OnboardingGuideModal`) guiding new users through importing servers/subscriptions, choosing System Proxy vs Admin Wintun TUN mode, and using Strict VCN / TLS Frag / System Tray. Accessible anytime via the `?` button in the titlebar or `Settings → About & Guide`.
+- **Clean First-Launch Server List & Last-Node Deletion:** Removed the dead dummy `sg01.metrovpn.io` seed server (`100 GB` fake quota) and fixed `delete_server` so users can delete every server cleanly.
+- **Offline-Safe UI Rendering & Fixed Window Dragging:** Removed external Google Fonts `@import` that stalled WebView2 startup before connecting; constrained `data-tauri-drag-region` strictly to the titlebar spacer so top-bar Minimize/Maximize/Close/Import buttons respond cleanly on Windows.
+- **ISP & Node Badges Parity with MetroVPN Android:** Fixed Home Active Exit card and Speed screen header to render proper ISP badges (`SLT`, `Dialog`, `Hutch`, `Airtel`, `Mobitel`) cleanly with null-safe fallbacks.
+- **No Keystroke Tunnel Drops:** Typing custom DoH URLs, ports, or routes in Settings no longer restarts the active VPN tunnel mid-typing; displays an `"Apply & Reconnect"` banner when tunnel-affecting changes are pending.
+- **True Xray HTTP 204 Ping & Dynamic Speed Test Ports:** `ping.rs` now defaults to real `generate_204` delay through an ephemeral Xray instance (`Semaphore(6)` concurrency) alongside TCP+TLS handshake ping; `speedtest.rs` dynamically binds free localhost ports.
+- **Windows Proxy & TUN Routing Reliability (`network_win.rs`):** Clears & backs up `AutoConfigURL` on System Proxy connect/disconnect, sets `netsh ... store=active` cleanly without duplicate gateway injection, applies MTU dynamically, and pins all resolved server IPv4 addresses.
+
+### Added
+- **5-Tab Settings Inspired by v2rayN, NekoRay & MetroVPN Android:**
+  - `General & Proxy`: SOCKS5/HTTP ports, LAN Proxy Sharing, Auto-Connect on launch, Close-to-Tray behavior, Bypass LAN, custom Windows Proxy exceptions.
+  - `TUN & Routing`: Routing Mode (`Rule`, `Global`, `Direct`), TUN Interface MTU, Strict Route, IPv6 control, Split Tunneling `.exe` exclusions, extra bypass CIDRs, and custom Fragment packets/length/interval.
+  - `DNS & Security`: DoH resolvers (including Android's Cloudflare Malware-Block `1.1.1.2`), Bootstrap DNS, Strict VCN Cert Pinning, Allow-Insecure TLS fallback, uTLS fingerprint selector, and Xray Mux concurrency.
+  - `Subs & Speed`: Persistent Subscription Manager with `"Update All Subscriptions"` + proxy toggle, plus Ping Mode (`Xray HTTP 204` vs `TCP+TLS`) & Speed Test target URL.
+  - `About & Guide`: Direct `@MetroVpnPaidProof` / `@Metrodens_bot` / GitHub actions, in-app GitHub Release Update Checker, Reset to Defaults, and Onboarding Guide relaunch.
+
 ## [v2.4.0] - 2026-11-21
 
 ### Added

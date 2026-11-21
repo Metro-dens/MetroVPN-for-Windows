@@ -1,5 +1,12 @@
 # Changelog
 
+## [v2.5.1] - 2026-11-21
+
+### Fixed
+- **App Launch Crash (Black Window):** Fixed missing `lucide-react` icon imports (`Cpu`, `ExternalLink`, `HelpCircle`, `Lock`, `RotateCcw`, `Send`) and `openExternalUrl` import in `src/App.jsx` that caused a `ReferenceError` on startup, plus added an inline React `ErrorBoundary` fallback.
+- **Titlebar Drag Region & Guide Button:** Moved `data-tauri-drag-region` exclusively to the left titlebar spacer so top-bar action buttons are always clickable, and added the `?` Onboarding Guide button to the titlebar.
+- **Removed Window Maximize Feature:** Disabled `maximizable` and `resizable` on the main window in `tauri.conf.json` and removed the maximize/restore button from the custom titlebar.
+
 ## [v2.5.0] - 2026-11-21
 
 ### Fixed & Improved

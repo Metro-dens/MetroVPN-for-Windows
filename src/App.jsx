@@ -16,7 +16,6 @@ import {
   Plus,
   QrCode,
   Minus,
-  Square,
   X,
   Power,
   ShieldCheck,
@@ -37,7 +36,6 @@ import {
   Monitor,
   ClipboardPaste,
   FileJson,
-  Minimize2,
   Wifi,
   Sparkles,
   AlertCircle,
@@ -56,6 +54,12 @@ import {
   Play,
   ShieldAlert,
   FolderOpen,
+  HelpCircle,
+  Lock,
+  RotateCcw,
+  Send,
+  ExternalLink,
+  Cpu,
 } from 'lucide-react';
 import {
   IN_TAURI,
@@ -63,12 +67,12 @@ import {
   invokeCmd,
   isTrayWindowMode,
   listenEvent,
+  openExternalUrl,
   pickExeFile,
   readClipboard,
   showMainWindowFromTray,
   windowHide,
   windowMinimize,
-  windowToggleMaximize,
 } from './tauriBridge';
 import ispSltImg from './assets/isp_slt.jpg';
 import ispDialogImg from './assets/isp_dialog.jpg';
@@ -406,7 +410,6 @@ const DEFAULT_SETTINGS_STATE = {
 function MetroProvider({ children }) {
   const [activeRoute, setActiveRoute] = useState('home');
   const [railExpanded, setRailExpanded] = useState(false);
-  const [isMaximized, setIsMaximized] = useState(false);
   const [windowMinimizedToTray, setWindowMinimizedToTray] = useState(false);
   const [trayFlyoutOpen, setTrayFlyoutOpen] = useState(false);
 
@@ -910,8 +913,6 @@ function MetroProvider({ children }) {
     setActiveRoute,
     railExpanded,
     setRailExpanded,
-    isMaximized,
-    setIsMaximized,
     windowMinimizedToTray,
     setWindowMinimizedToTray,
     trayFlyoutOpen,
@@ -1192,8 +1193,7 @@ function ScallopedConnectButton({ size = 220, status, onClick }) {
 function Titlebar() {
   const {
     openAddModal,
-    isMaximized,
-    setIsMaximized,
+    setOnboardingOpen,
     trayFlyoutOpen,
     setTrayFlyoutOpen,
     minimizeToTray,
@@ -1201,14 +1201,13 @@ function Titlebar() {
 
   return (
     <header
-      data-tauri-drag-region=""
       className="h-[44px] w-full flex items-center justify-between pl-4 pr-2 select-none shrink-0 border-b"
       style={{
         backgroundColor: COLORS.obsidian,
         borderColor: '#231D1E',
       }}
     >
-      <div data-tauri-drag-region="" className="flex items-center gap-2.5 min-w-0">
+      <div data-tauri-drag-region="" className="flex-1 flex items-center gap-2.5 min-w-0 h-full">
         <div
           className="w-7 h-7 rounded-[9px] flex items-center justify-center shrink-0 pointer-events-none overflow-hidden"
           style={{
@@ -1232,11 +1231,11 @@ function Titlebar() {
           }}
         >
           <span className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: COLORS.coral }} />
-          v2.4 • Xray
+          v2.5.1 • Xray
         </span>
       </div>
 
-      <div className="flex items-center gap-1.5">
+      <div className="flex items-center gap-1.5 shrink-0">
         <motion.button
           whileHover={{ scale: 1.02 }}
           whileTap={{ scale: 0.96 }}
@@ -1271,6 +1270,22 @@ function Titlebar() {
           <QrCode className="w-3.5 h-3.5" />
         </motion.button>
 
+        <motion.button
+          whileHover={{ scale: 1.04 }}
+          whileTap={{ scale: 0.95 }}
+          transition={SPRING}
+          onClick={() => setOnboardingOpen(true)}
+          title="First-Run User Guide"
+          className="w-[29px] h-[29px] rounded-full flex items-center justify-center cursor-pointer transition-colors"
+          style={{
+            backgroundColor: COLORS.surface,
+            border: `1px solid ${COLORS.surfaceBorder}`,
+            color: COLORS.textMuted,
+          }}
+        >
+          <HelpCircle className="w-3.5 h-3.5" />
+        </motion.button>
+
         {!IN_TAURI && (
           <motion.button
             whileHover={{ scale: 1.02 }}
@@ -1301,23 +1316,6 @@ function Titlebar() {
             style={{ color: COLORS.textMuted }}
           >
             <Minus className="w-3.5 h-3.5" />
-          </button>
-
-          <button
-            type="button"
-            title={isMaximized ? 'Restore Window' : 'Maximize Window'}
-            onClick={async () => {
-              if (IN_TAURI) {
-                const max = await windowToggleMaximize();
-                setIsMaximized(max);
-              } else {
-                setIsMaximized((m) => !m);
-              }
-            }}
-            className="w-8 h-7 rounded-[7px] flex items-center justify-center cursor-pointer transition-colors hover:bg-[#251F20]"
-            style={{ color: COLORS.textMuted }}
-          >
-            {isMaximized ? <Minimize2 className="w-3.5 h-3.5" /> : <Square className="w-3 h-3" />}
           </button>
 
           <button
@@ -5626,7 +5624,6 @@ function ToastOverlay() {
 function DesktopStage() {
   const {
     activeRoute,
-    isMaximized,
     windowMinimizedToTray,
     restoreFromTray,
     trayFlyoutOpen,
@@ -5676,9 +5673,7 @@ function DesktopStage() {
 
   return (
     <div
-      className={`min-h-screen w-full flex flex-col items-center justify-center relative transition-all duration-300 ${
-        isMaximized ? 'p-2 pb-12' : 'p-3 sm:p-6 pb-14'
-      }`}
+      className="min-h-screen w-full flex flex-col items-center justify-center relative transition-all duration-300 p-3 sm:p-6 pb-14"
       style={{
         backgroundColor: COLORS.stage,
         backgroundImage:
@@ -5694,11 +5689,7 @@ function DesktopStage() {
             animate={{ opacity: 1, scale: 1, y: 0 }}
             exit={{ opacity: 0, scale: 0.88, y: 40 }}
             transition={SPRING_SOFT}
-            className={`relative flex flex-col overflow-hidden w-full ${
-              isMaximized
-                ? 'max-w-[1440px] h-[calc(100vh-64px)] rounded-[12px]'
-                : 'max-w-[1040px] h-[680px] max-h-[calc(100vh-76px)] rounded-[14px]'
-            }`}
+            className="relative flex flex-col overflow-hidden w-full max-w-[1040px] h-[680px] max-h-[calc(100vh-76px)] rounded-[14px]"
             style={{
               backgroundColor: COLORS.obsidian,
               border: `1px solid ${COLORS.surfaceBorder}`,
@@ -5804,8 +5795,49 @@ function DesktopStage() {
 }
 
 // ============================================================================
-// DEFAULT EXPORT APP
+// DEFAULT EXPORT APP WITH ERROR BOUNDARY
 // ============================================================================
+class MetroErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { error: null };
+  }
+
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <div
+          className="w-screen h-screen flex flex-col items-center justify-center p-6 text-center"
+          style={{ backgroundColor: '#141112', color: '#F4ECEC' }}
+        >
+          <div
+            className="max-w-[480px] rounded-[22px] p-6"
+            style={{ backgroundColor: '#1E191A', border: '1px solid #4A2B2D' }}
+          >
+            <h2 className="text-[18px] font-bold mb-2">Metrovpn encountered a UI error</h2>
+            <p className="text-[12.5px] font-mono break-all mb-4" style={{ color: '#FFB4AB' }}>
+              {String(this.state.error?.message || this.state.error)}
+            </p>
+            <button
+              type="button"
+              onClick={() => window.location.reload()}
+              className="px-5 py-2 rounded-full text-[12.5px] font-semibold cursor-pointer"
+              style={{ backgroundColor: '#9B0A12', color: '#F4ECEC' }}
+            >
+              Reload App
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 export default function App() {
   const isTray = isTrayWindowMode();
 
@@ -5849,15 +5881,17 @@ export default function App() {
         }
       `}</style>
 
-      <MetroProvider>
-        {isTray ? (
-          <div className="w-[320px] h-[420px] overflow-hidden bg-transparent">
-            <TrayFlyoutCard standalone={true} />
-          </div>
-        ) : (
-          <DesktopStage />
-        )}
-      </MetroProvider>
+      <MetroErrorBoundary>
+        <MetroProvider>
+          {isTray ? (
+            <div className="w-[320px] h-[420px] overflow-hidden bg-transparent">
+              <TrayFlyoutCard standalone={true} />
+            </div>
+          ) : (
+            <DesktopStage />
+          )}
+        </MetroProvider>
+      </MetroErrorBoundary>
     </>
   );
 }

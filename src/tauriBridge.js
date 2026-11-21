@@ -92,13 +92,6 @@ export async function windowMinimize() {
   await getCurrentWindow().minimize();
 }
 
-export async function windowToggleMaximize() {
-  if (!IN_TAURI) return false;
-  const win = getCurrentWindow();
-  await win.toggleMaximize();
-  return win.isMaximized();
-}
-
 export async function windowHide() {
   if (!IN_TAURI) return;
   await getCurrentWindow().hide();

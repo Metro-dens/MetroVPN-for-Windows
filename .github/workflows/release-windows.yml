@@ -1,0 +1,122 @@
+name: Build & Publish Windows Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Release tag to create (e.g. v2.4.0)"
+        required: true
+        default: "v2.4.0"
+        type: string
+      draft:
+        description: "Create as a draft release (hidden until published)"
+        required: false
+        default: true
+        type: boolean
+      prerelease:
+        description: "Mark as pre-release"
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout MetroVPN-for-Windows
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: "npm"
+
+      - name: Setup Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Fetch Xray-core, tun2socks, Wintun & GeoIP assets
+        shell: pwsh
+        run: |
+          ./scripts/fetch-core.ps1
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build Tauri Windows installers (NSIS .exe + WiX .msi)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ inputs.tag_name || github.ref_name }}
+          releaseName: "Metrovpn ${{ inputs.tag_name || github.ref_name }}"
+          releaseBody: "Metrovpn Desktop for Windows 11 (Xray-core v26.11.9 + Wintun TUN & System Proxy)."
+          releaseDraft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft || false }}
+          prerelease: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || false }}
+          args: --target x86_64-pc-windows-msvc
+
+      - name: Prepare gzip-compressed standalone payloads & build standalone Metrovpn.exe
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "src-tauri/embedded" | Out-Null
+          $files = @{
+            "src-tauri/binaries/xray-x86_64-pc-windows-msvc.exe"      = "src-tauri/embedded/xray.exe.gz"
+            "src-tauri/binaries/tun2socks-x86_64-pc-windows-msvc.exe" = "src-tauri/embedded/tun2socks.exe.gz"
+            "src-tauri/resources/wintun.dll"                          = "src-tauri/embedded/wintun.dll.gz"
+            "src-tauri/resources/geoip.dat"                           = "src-tauri/embedded/geoip.dat.gz"
+            "src-tauri/resources/geosite.dat"                         = "src-tauri/embedded/geosite.dat.gz"
+          }
+          foreach ($kv in $files.GetEnumerator()) {
+            $inStream = [System.IO.File]::OpenRead($kv.Key)
+            $outStream = [System.IO.File]::Create($kv.Value)
+            $gzip = New-Object System.IO.Compression.GZipStream($outStream, [System.IO.Compression.CompressionLevel]::Optimal)
+            $inStream.CopyTo($gzip)
+            $gzip.Dispose(); $outStream.Dispose(); $inStream.Dispose()
+          }
+          npx tauri build --target x86_64-pc-windows-msvc --no-bundle --features custom-protocol,standalone-exe
+          Copy-Item "src-tauri/target/x86_64-pc-windows-msvc/release/metrovpn.exe" "Metrovpn-standalone-x64.exe" -Force
+
+      - name: Package Portable ZIP
+        shell: pwsh
+        run: |
+          npx tauri build --target x86_64-pc-windows-msvc --no-bundle --features custom-protocol
+          $outDir = "portable-stage"
+          New-Item -ItemType Directory -Force -Path "$outDir/resources" | Out-Null
+          Copy-Item "src-tauri/target/x86_64-pc-windows-msvc/release/metrovpn.exe" "$outDir/Metrovpn.exe"
+          Copy-Item "src-tauri/binaries/xray-x86_64-pc-windows-msvc.exe" "$outDir/xray.exe"
+          Copy-Item "src-tauri/binaries/tun2socks-x86_64-pc-windows-msvc.exe" "$outDir/tun2socks.exe"
+          Copy-Item "src-tauri/resources/*" "$outDir/resources/"
+          Compress-Archive -Path "$outDir/*" -DestinationPath "Metrovpn-windows-x64-portable.zip" -Force
+
+      - name: Upload Standalone EXE & Portable ZIP to Release
+        if: startsWith(github.ref, 'refs/tags/') || inputs.tag_name != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag_name || github.ref_name }}
+          draft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft || false }}
+          prerelease: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || false }}
+          files: |
+            Metrovpn-standalone-x64.exe
+            Metrovpn-windows-x64-portable.zip
+
+      - name: Upload Workflow Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Metrovpn-Windows-x64
+          path: |
+            Metrovpn-standalone-x64.exe
+            Metrovpn-windows-x64-portable.zip

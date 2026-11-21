@@ -64,7 +64,25 @@ jobs:
         with:
           tagName: ${{ inputs.tag_name || github.ref_name }}
           releaseName: "Metrovpn ${{ inputs.tag_name || github.ref_name }}"
-          releaseBody: "Metrovpn Desktop for Windows 11 (Xray-core v26.11.9 + Wintun TUN & System Proxy)."
+          releaseBody: |
+            ## Metrovpn Desktop for Windows 10/11 (x64)
+
+            Powered by **Xray-core `v26.11.9`** and **Wintun (`tun2socks v2.7.0`)**.
+
+            ### Downloads
+            - **`Metrovpn_*_x64-setup.exe`** — Recommended NSIS Windows Installer (desktop/Start Menu shortcuts, WebView2 runtime check, clean uninstaller).
+            - **`Metrovpn_*_x64_en-US.msi`** — WiX Windows Installer package.
+            - **`Metrovpn-standalone-x64.exe`** — Single-file portable executable (auto-extracts `xray.exe`, `tun2socks.exe`, `wintun.dll`, `geoip.dat`, and `geosite.dat` to `%AppData%\site.metrodens.metrovpn\core\` on first launch).
+            - **`Metrovpn-windows-x64-portable.zip`** — Portable folder archive with all binaries side-by-side.
+            - **`SHA256SUMS.txt`** — SHA-256 verification checksums (`Get-FileHash <file> -Algorithm SHA256`).
+
+            ### Highlights
+            - **System Proxy Mode (No Admin Required)** with instant WinINET refresh & automatic crash/stale-lock registry cleanup.
+            - **TUN Mode (`Metrovpn-TUN` via Wintun)** with UAC elevation prompt, selectable MTU (`1500` / `1420` / `1280`), and Split Tunneling `.exe` exclusions.
+            - **`vless://` (`tls`, `vcn`, `reality`, `ws`, `grpc`, `tcp`), `vmess://`, raw `.json`, subscriptions & QR import**, plus `Strict VCN`, `TLS Frag`, and custom DoH resolvers.
+            - **Concurrent Node Ping**, **3-Phase Cloudflare Speed Test**, **ISP server tabs (`SLT`, `Dialog`, `Hutch`, `Airtel`, `Mobitel`)**, and **System Tray flyout**.
+
+            > **SmartScreen Note:** If Windows Defender SmartScreen prompts on an unsigned build, verify the SHA-256 checksum against `SHA256SUMS.txt` and click **More info → Run anyway**.
           releaseDraft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft || false }}
           prerelease: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || false }}
           args: --target x86_64-pc-windows-msvc
@@ -90,7 +108,7 @@ jobs:
           npx tauri build --target x86_64-pc-windows-msvc --no-bundle --features custom-protocol,standalone-exe
           Copy-Item "src-tauri/target/x86_64-pc-windows-msvc/release/metrovpn.exe" "Metrovpn-standalone-x64.exe" -Force
 
-      - name: Package Portable ZIP
+      - name: Package Portable ZIP & SHA256SUMS.txt
         shell: pwsh
         run: |
           npx tauri build --target x86_64-pc-windows-msvc --no-bundle --features custom-protocol
@@ -99,10 +117,21 @@ jobs:
           Copy-Item "src-tauri/target/x86_64-pc-windows-msvc/release/metrovpn.exe" "$outDir/Metrovpn.exe"
           Copy-Item "src-tauri/binaries/xray-x86_64-pc-windows-msvc.exe" "$outDir/xray.exe"
           Copy-Item "src-tauri/binaries/tun2socks-x86_64-pc-windows-msvc.exe" "$outDir/tun2socks.exe"
+          Copy-Item "src-tauri/resources/wintun.dll" "$outDir/wintun.dll"
           Copy-Item "src-tauri/resources/*" "$outDir/resources/"
           Compress-Archive -Path "$outDir/*" -DestinationPath "Metrovpn-windows-x64-portable.zip" -Force
 
-      - name: Upload Standalone EXE & Portable ZIP to Release
+          $hashTargets = @()
+          $hashTargets += Get-ChildItem "src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe" -ErrorAction SilentlyContinue
+          $hashTargets += Get-ChildItem "src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi" -ErrorAction SilentlyContinue
+          $hashTargets += Get-Item "Metrovpn-standalone-x64.exe", "Metrovpn-windows-x64-portable.zip"
+          $lines = foreach ($item in $hashTargets) {
+            $h = (Get-FileHash $item.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$h  $($item.Name)"
+          }
+          $lines | Out-File -FilePath "SHA256SUMS.txt" -Encoding ascii
+
+      - name: Upload Standalone EXE, Portable ZIP & SHA256SUMS to Release
         if: startsWith(github.ref, 'refs/tags/') || inputs.tag_name != ''
         uses: softprops/action-gh-release@v2
         with:
@@ -112,6 +141,7 @@ jobs:
           files: |
             Metrovpn-standalone-x64.exe
             Metrovpn-windows-x64-portable.zip
+            SHA256SUMS.txt
 
       - name: Upload Workflow Artifacts
         uses: actions/upload-artifact@v4
@@ -120,3 +150,4 @@ jobs:
           path: |
             Metrovpn-standalone-x64.exe
             Metrovpn-windows-x64-portable.zip
+            SHA256SUMS.txt

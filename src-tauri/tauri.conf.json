@@ -45,6 +45,10 @@
   "bundle": {
     "active": true,
     "targets": ["nsis", "msi"],
+    "publisher": "Metro Dens",
+    "copyright": "Copyright (c) 2026 Metro Dens",
+    "shortDescription": "Metrovpn Desktop — High-contrast Crimson Void VPN client powered by Xray-core",
+    "longDescription": "Native Windows 11 VPN client powered by Xray-core v26.11.9 and Wintun (tun2socks), supporting System Proxy Mode, TUN Mode, Strict VCN, TLS Frag, DoH resolvers, Split Tunneling, concurrent node ping, and Cloudflare speed tests.",
     "externalBin": [
       "binaries/xray",
       "binaries/tun2socks"
@@ -62,10 +66,15 @@
       "icons/icon.png"
     ],
     "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper",
+        "silent": true
+      },
       "wix": {
         "language": "en-US"
       },
       "nsis": {
+        "installerIcon": "icons/icon.ico",
         "displayLanguageSelector": false,
         "installMode": "both"
       }

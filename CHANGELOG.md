@@ -1,5 +1,18 @@
 # Changelog
 
+## [v2.6.0] - 2026-11-21
+
+### Fixed & Redesigned
+- **Compact NetMod-Inspired Desktop Window (`520×620`):** Eliminated main screen cropping/overflow by redesigning Home, Servers, Speed, Settings, and the compact left rail for a crisp `520×620` window.
+- **No Hover Flicker:** Removed cursor-shifting `whileHover` transform animations across cards and buttons so mouse hover transitions stay smooth and flicker-free.
+- **Fixed Zigzag & Chart Overshoot:** Replaced the erratic zigzag quota line with a smooth pill progress bar and clamped live throughput sparklines cleanly inside card bounds.
+- **Interactive Step-by-Step Guide Tour:** Fixed the `systemMode` crash in onboarding and replaced the static card modal with a live 4-step walkthrough that automatically switches between `Home`, `Servers`, and `Settings → TUN & DNS`.
+- **Real Server Quota & Live Rolling Telemetry Stream:** Removed fake `100 GB` defaults on URI/JSON imports, accumulated live Xray stats into each node's real persistent usage (`KB / MB / GB`), and wired `Speed → Realtime Telemetry Stream` to a 350ms rolling throughput buffer with live `↓ / ↑` readouts.
+- **Windows PC Split Tunneling Scanner:** `WindowsAppsModal` now scans real running processes, Registry Uninstall entries, and `Program Files` / `%LocalAppData%\Programs` to list actual `.exe` apps on the user's PC alongside `Browse .exe`.
+- **Separated `+ Add` and `QR Scan` Flows:** `+ Add` now focuses strictly on `vless://` / `vmess://` URI import; clicking the QR button opens a dedicated QR Scanner featuring **NetMod-style Screen Capture QR** (native Windows GDI capture) and **Live Camera QR** (`getUserMedia` + `jsQR`).
+- **Prevented Duplicate System Tray Icons:** Enforced a Windows single-instance named mutex (`MetrovpnSingleInstanceMutex`) that focuses the running window instead of spawning duplicates, and explicitly removes the tray icon (`Shell_NotifyIconW(NIM_DELETE)`) on exit/relaunch.
+- **Simplified 3-Tab Settings (`General`, `TUN & DNS`, `About & Guide`):** Removed `Subs & Speed` and advanced clutter; added plain-English explanations comparing **System Proxy Mode** vs **TUN Mode**.
+
 ## [v2.5.1] - 2026-11-21
 
 ### Fixed

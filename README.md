@@ -8,8 +8,8 @@ Download the latest release from [GitHub Releases](https://github.com/Metro-dens
 
 | File | Description |
 | :--- | :--- |
-| `Metrovpn_2.5.1_x64-setup.exe` | **Recommended Installer (NSIS)** — Installs Start Menu/Desktop shortcuts, WebView2 runtime check, and clean uninstaller. |
-| `Metrovpn_2.5.1_x64_en-US.msi` | **MSI Enterprise Installer (WiX)** — Standard Windows Installer package. |
+| `Metrovpn_2.6.0_x64-setup.exe` | **Recommended Installer (NSIS)** — Installs Start Menu/Desktop shortcuts, WebView2 runtime check, and clean uninstaller. |
+| `Metrovpn_2.6.0_x64_en-US.msi` | **MSI Enterprise Installer (WiX)** — Standard Windows Installer package. |
 | `Metrovpn-standalone-x64.exe` | **Single-File Portable EXE** — Zero-install executable that extracts `xray.exe`, `tun2socks.exe`, `wintun.dll`, `geoip.dat`, and `geosite.dat` to `%AppData%\site.metrodens.metrovpn\core\` on first launch. |
 | `Metrovpn-windows-x64-portable.zip` | **Portable Folder Archive** — Unzip anywhere and run `Metrovpn.exe`. |
 | `SHA256SUMS.txt` | **Checksums** — Verify file integrity with `Get-FileHash <file> -Algorithm SHA256`. |

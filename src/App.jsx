@@ -8,6 +8,7 @@ import React, {
   useCallback,
 } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
+import jsQR from 'jsqr';
 import {
   Home,
   Globe,
@@ -28,23 +29,19 @@ import {
   Search,
   Star,
   ChevronRight,
-  ChevronLeft,
   ChevronDown,
   Zap,
   Activity,
   Layers,
   Monitor,
   ClipboardPaste,
-  FileJson,
   Wifi,
   Sparkles,
   AlertCircle,
-  Upload,
   MoreVertical,
   Trash2,
   Edit3,
   Share2,
-  Link2,
   Terminal,
   Download,
   PanelRight,
@@ -55,11 +52,14 @@ import {
   ShieldAlert,
   FolderOpen,
   HelpCircle,
-  Lock,
   RotateCcw,
   Send,
   ExternalLink,
   Cpu,
+  Video,
+  Compass,
+  ScanLine,
+  Info,
 } from 'lucide-react';
 import {
   IN_TAURI,
@@ -247,21 +247,27 @@ function generateWaveLinePath(fillWidth, midY = 6, amplitude = 2.6, wavelength =
 
 function buildSparklinePath(values, width, height, padY = 4) {
   if (!values || values.length < 2) return '';
-  const maxVal = Math.max(0.5, ...values) * 1.15;
-  const usableH = height - padY * 2;
-  const stepX = width / (values.length - 1);
-  const pts = values.map((v, i) => ({
+  const clean = values.map((v) => (Number.isFinite(v) && v > 0 ? v : 0));
+  const peak = Math.max(...clean);
+  const baseY = height - padY;
+  if (peak <= 0.001) {
+    return `M 0 ${baseY.toFixed(1)} L ${width.toFixed(1)} ${baseY.toFixed(1)}`;
+  }
+  const maxVal = peak * 1.15;
+  const usableH = Math.max(4, height - padY * 2);
+  const stepX = width / (clean.length - 1);
+  const clampY = (y) => Math.max(padY, Math.min(baseY, y));
+  const pts = clean.map((v, i) => ({
     x: i * stepX,
-    y: height - padY - (Math.min(v, maxVal) / maxVal) * usableH,
+    y: clampY(baseY - (v / maxVal) * usableH),
   }));
   let d = `M ${pts[0].x.toFixed(1)} ${pts[0].y.toFixed(1)}`;
   for (let i = 0; i < pts.length - 1; i++) {
-    const midX = (pts[i].x + pts[i + 1].x) / 2;
-    const midY = (pts[i].y + pts[i + 1].y) / 2;
-    d += ` Q ${pts[i].x.toFixed(1)} ${pts[i].y.toFixed(1)}, ${midX.toFixed(1)} ${midY.toFixed(1)}`;
+    const p0 = pts[i];
+    const p1 = pts[i + 1];
+    const cx = ((p0.x + p1.x) / 2).toFixed(1);
+    d += ` C ${cx} ${p0.y.toFixed(1)}, ${cx} ${p1.y.toFixed(1)}, ${p1.x.toFixed(1)} ${p1.y.toFixed(1)}`;
   }
-  const last = pts[pts.length - 1];
-  d += ` T ${last.x.toFixed(1)} ${last.y.toFixed(1)}`;
   return d;
 }
 
@@ -269,35 +275,10 @@ function buildSparklinePath(values, width, height, padY = 4) {
 // INITIAL FALLBACK DATA (Replaced immediately by Tauri IPC on mount)
 // ============================================================================
 const INITIAL_NODES = [];
-
-const INITIAL_WINDOWS_APPS = [
-  { id: 'chrome', name: 'Google Chrome', exe: 'chrome.exe', category: 'Browser', bypassed: false },
-  { id: 'valorant', name: 'VALORANT', exe: 'VALORANT-Win64-Shipping.exe', category: 'Gaming', bypassed: true },
-  { id: 'steam', name: 'Steam Client', exe: 'steam.exe', category: 'Gaming', bypassed: true },
-  { id: 'discord', name: 'Discord', exe: 'Discord.exe', category: 'Comms', bypassed: false },
-  { id: 'vscode', name: 'Visual Studio Code', exe: 'Code.exe', category: 'Developer', bypassed: false },
-  { id: 'qbittorrent', name: 'qBittorrent', exe: 'qbittorrent.exe', category: 'Network', bypassed: false },
-  { id: 'onedrive', name: 'Microsoft OneDrive', exe: 'OneDrive.exe', category: 'System', bypassed: true },
-  { id: 'spotify', name: 'Spotify Desktop', exe: 'Spotify.exe', category: 'Media', bypassed: true },
-];
+const INITIAL_WINDOWS_APPS = [];
 
 const SAMPLE_VLESS_URI =
   'vless://f48e1a90-2b6c-4d19-9a77-81c450d912fa@sg04-slt.metrovpn.io:443?encryption=none&security=tls&sni=st2.zoom.us&vcn=vpn.metrodens.site&fp=chrome&type=tcp#SG-04%20%E2%80%A2%20SLT%20Ultra%20VCN';
-
-const SAMPLE_JSON_PROFILE = `{
-  "tag": "HK-02 • Hong Kong Express",
-  "isp": "Dialog",
-  "address": "hk02.metrovpn.io",
-  "port": 443,
-  "uuid": "7c2e19a0-5b44-41d8-9a77-62f109e3ab11",
-  "sni": "cdn.zoom.us",
-  "protocol": "vless",
-  "streamSettings": {
-    "network": "tcp",
-    "security": "tls",
-    "vcn": "strict"
-  }
-}`;
 
 const DNS_OPTIONS = ['Cloudflare 1.1.1.1', 'Cloudflare 1.1.1.2', 'Google 8.8.8.8', 'Quad9 9.9.9.9', 'Custom DoH'];
 const MTU_OPTIONS = [1500, 1420, 1360, 1280];
@@ -315,6 +296,14 @@ function formatThroughput(mbps) {
     return { value: (mbps * 125).toFixed(1), unit: 'KB/s' };
   }
   return { value: mbps.toFixed(1), unit: 'Mbps' };
+}
+
+function formatUsageData(usedGB) {
+  const bytes = Math.max(0, (usedGB || 0) * 1073741824);
+  if (bytes < 1024) return `${Math.round(bytes)} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(usedGB || 0).toFixed(2)} GB`;
 }
 
 function parsePreviewNode(raw, mode = 'uri') {
@@ -434,8 +423,11 @@ function MetroProvider({ children }) {
 
   const [addModalOpen, setAddModalOpen] = useState(false);
   const [addModalTab, setAddModalTab] = useState('uri');
+  const [qrModalOpen, setQrModalOpen] = useState(false);
+  const [settingsTab, setSettingsTab] = useState('general');
   const [onboardingOpen, setOnboardingOpen] = useState(false);
   const [appsModalOpen, setAppsModalOpen] = useState(false);
+  const [scanningApps, setScanningApps] = useState(false);
   const [logsDrawerOpen, setLogsDrawerOpen] = useState(false);
   const [adminModalOpen, setAdminModalOpen] = useState(false);
   const [pendingTunNodeId, setPendingTunNodeId] = useState(null);
@@ -533,6 +525,16 @@ function MetroProvider({ children }) {
           setTotalSessionBytes({ down: payload.totalDown || 0, up: payload.totalUp || 0 });
           setDownHistory((prev) => [...prev.slice(1), downMbps]);
           setUpHistory((prev) => [...prev.slice(1), upMbps]);
+          if (payload.activeNodeQuotaUsedGb != null) {
+            const targetId = settingsRef.current?.activeNodeId;
+            setNodes((prev) =>
+              prev.map((n, idx) =>
+                (targetId ? n.id === targetId : idx === 0)
+                  ? { ...n, quotaUsedGB: payload.activeNodeQuotaUsedGb }
+                  : n
+              )
+            );
+          }
         })
       );
 
@@ -908,6 +910,26 @@ function MetroProvider({ children }) {
     [persistSettingsPatch]
   );
 
+  const scanWindowsApps = useCallback(async () => {
+    if (!IN_TAURI) return;
+    setScanningApps(true);
+    try {
+      const scanned = await invokeCmd('scan_windows_apps');
+      if (Array.isArray(scanned)) {
+        applySettingsObject({ ...settingsRef.current, windowsApps: scanned });
+      }
+    } catch (err) {
+      pushToast(`App scan error: ${String(err)}`, 'amber');
+    } finally {
+      setScanningApps(false);
+    }
+  }, [applySettingsObject, pushToast]);
+
+  const setSystemMode = useCallback(
+    (mode) => persistSettingsPatch({ systemMode: mode }, { reconnect: connectionStatus === 'connected' }),
+    [persistSettingsPatch, connectionStatus]
+  );
+
   const value = {
     activeRoute,
     setActiveRoute,
@@ -954,15 +976,19 @@ function MetroProvider({ children }) {
     persistSettingsPatch,
     applySettingsObject,
 
-    // All Settings fields exposed ergonomically
+    // All Settings fields exposed ergonomically + settings object alias
+    settings: settingsState,
     ...settingsState,
     systemMode: settingsState.systemMode,
+    setSystemMode,
     toggleSystemMode,
     setTunnelProfile: (v) => persistSettingsPatch({ tunnelProfile: v }),
     setLanProxySharing: (v) => persistSettingsPatch({ lanProxySharing: v }),
     setSplitTunneling: (v) => persistSettingsPatch({ splitTunneling: v }),
     setWindowsApps: (apps) => persistSettingsPatch({ windowsApps: apps }),
     toggleWindowsAppBypass,
+    scanWindowsApps,
+    scanningApps,
     setBypassLan: (v) => persistSettingsPatch({ bypassLan: v }),
     setDnsResolver: (v) => persistSettingsPatch({ dnsResolver: v }),
     setCustomDohUrl: (v) => persistSettingsPatch({ customDohUrl: v }),
@@ -975,6 +1001,10 @@ function MetroProvider({ children }) {
     addModalTab,
     setAddModalTab,
     openAddModal,
+    qrModalOpen,
+    setQrModalOpen,
+    settingsTab,
+    setSettingsTab,
     onboardingOpen,
     setOnboardingOpen,
     completeOnboarding,
@@ -1078,8 +1108,7 @@ function ScallopedConnectButton({ size = 220, status, onClick }) {
     <motion.button
       type="button"
       onClick={onClick}
-      whileHover={{ scale: 1.03 }}
-      whileTap={{ scale: 0.94 }}
+      whileTap={{ scale: 0.96 }}
       transition={SPRING}
       aria-label={isConnected ? 'Disconnect VPN' : 'Connect VPN'}
       className="relative flex items-center justify-center cursor-pointer select-none focus:outline-none group"
@@ -1177,7 +1206,7 @@ function ScallopedConnectButton({ size = 220, status, onClick }) {
           <Shield className={iconSize} strokeWidth={1.85} style={{ color: COLORS.amber }} />
         ) : (
           <Power
-            className={size >= 180 ? 'w-12 h-12' : 'w-6 h-6'}
+            className={size >= 180 ? 'w-12 h-12' : size >= 130 ? 'w-9 h-9' : 'w-6 h-6'}
             strokeWidth={1.9}
             style={{ color: COLORS.coral }}
           />
@@ -1188,42 +1217,41 @@ function ScallopedConnectButton({ size = 220, status, onClick }) {
 }
 
 // ============================================================================
-// CUSTOM 44px WINDOWS 11 FRAMELESS TITLEBAR
+// CUSTOM 42px WINDOWS 11 FRAMELESS TITLEBAR (Compact NetMod-Inspired)
 // ============================================================================
 function Titlebar() {
   const {
     openAddModal,
+    setQrModalOpen,
     setOnboardingOpen,
-    trayFlyoutOpen,
-    setTrayFlyoutOpen,
     minimizeToTray,
   } = useMetro();
 
   return (
     <header
-      className="h-[44px] w-full flex items-center justify-between pl-4 pr-2 select-none shrink-0 border-b"
+      className="h-[42px] w-full flex items-center justify-between pl-3 pr-2 select-none shrink-0 border-b"
       style={{
         backgroundColor: COLORS.obsidian,
         borderColor: '#231D1E',
       }}
     >
-      <div data-tauri-drag-region="" className="flex-1 flex items-center gap-2.5 min-w-0 h-full">
+      <div data-tauri-drag-region="" className="flex-1 flex items-center gap-2 min-w-0 h-full">
         <div
-          className="w-7 h-7 rounded-[9px] flex items-center justify-center shrink-0 pointer-events-none overflow-hidden"
+          className="w-6 h-6 rounded-[8px] flex items-center justify-center shrink-0 pointer-events-none overflow-hidden"
           style={{
             backgroundColor: '#241B1C',
             border: '1px solid #3B2B2C',
           }}
         >
-          <img src={metrovpnApkIcon} alt="Metrovpn" className="w-5 h-5 object-contain" />
+          <img src={metrovpnApkIcon} alt="Metrovpn" className="w-4 h-4 object-contain" />
         </div>
         <img
           src={metrovpnWordmark}
           alt="Metrovpn"
-          className="h-[22px] w-auto object-contain pointer-events-none select-none"
+          className="h-[18px] w-auto object-contain pointer-events-none select-none"
         />
         <span
-          className="hidden sm:inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-medium pointer-events-none"
+          className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium pointer-events-none shrink-0"
           style={{
             backgroundColor: COLORS.surface,
             border: `1px solid ${COLORS.surfaceBorder}`,
@@ -1231,36 +1259,31 @@ function Titlebar() {
           }}
         >
           <span className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: COLORS.coral }} />
-          v2.5.1 • Xray
+          v2.6
         </span>
       </div>
 
-      <div className="flex items-center gap-1.5 shrink-0">
-        <motion.button
-          whileHover={{ scale: 1.02 }}
-          whileTap={{ scale: 0.96 }}
-          transition={SPRING}
+      <div className="flex items-center gap-1 shrink-0">
+        <button
+          type="button"
           onClick={() => openAddModal('uri')}
-          className="h-[29px] px-3 rounded-full flex items-center gap-1.5 text-[12px] font-semibold cursor-pointer transition-colors"
+          title="Paste VLESS / VMess Config"
+          className="h-[28px] px-2.5 rounded-full flex items-center gap-1 text-[11.5px] font-semibold cursor-pointer transition-colors duration-150 hover:bg-[#5C4341]"
           style={{
             backgroundColor: COLORS.taupe,
             color: COLORS.textPrimary,
             border: '1px solid #604645',
           }}
-          onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = COLORS.taupeHover)}
-          onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = COLORS.taupe)}
         >
           <Plus className="w-3.5 h-3.5" strokeWidth={2.5} />
-          <span>Add Config</span>
-        </motion.button>
+          <span>Add</span>
+        </button>
 
-        <motion.button
-          whileHover={{ scale: 1.04 }}
-          whileTap={{ scale: 0.95 }}
-          transition={SPRING}
-          onClick={() => openAddModal('qr')}
-          title="Scan QR / Clipboard Import"
-          className="w-[29px] h-[29px] rounded-full flex items-center justify-center cursor-pointer transition-colors"
+        <button
+          type="button"
+          onClick={() => setQrModalOpen(true)}
+          title="Scan QR (Screen Capture or Camera)"
+          className="w-[28px] h-[28px] rounded-full flex items-center justify-center cursor-pointer transition-colors duration-150 hover:bg-[#2A2324]"
           style={{
             backgroundColor: COLORS.surface,
             border: `1px solid ${COLORS.surfaceBorder}`,
@@ -1268,51 +1291,30 @@ function Titlebar() {
           }}
         >
           <QrCode className="w-3.5 h-3.5" />
-        </motion.button>
+        </button>
 
-        <motion.button
-          whileHover={{ scale: 1.04 }}
-          whileTap={{ scale: 0.95 }}
-          transition={SPRING}
+        <button
+          type="button"
           onClick={() => setOnboardingOpen(true)}
-          title="First-Run User Guide"
-          className="w-[29px] h-[29px] rounded-full flex items-center justify-center cursor-pointer transition-colors"
+          title="Step-by-Step Setup Guide"
+          className="w-[28px] h-[28px] rounded-full flex items-center justify-center cursor-pointer transition-colors duration-150 hover:bg-[#2A2324]"
           style={{
             backgroundColor: COLORS.surface,
             border: `1px solid ${COLORS.surfaceBorder}`,
-            color: COLORS.textMuted,
+            color: COLORS.amber,
           }}
         >
           <HelpCircle className="w-3.5 h-3.5" />
-        </motion.button>
+        </button>
 
-        {!IN_TAURI && (
-          <motion.button
-            whileHover={{ scale: 1.02 }}
-            whileTap={{ scale: 0.96 }}
-            transition={SPRING}
-            onClick={() => setTrayFlyoutOpen((v) => !v)}
-            title="Toggle 320x420 Windows System Tray Quick Flyout"
-            className="hidden md:inline-flex h-[29px] px-2.5 rounded-full items-center gap-1.5 text-[11.5px] font-medium cursor-pointer transition-colors"
-            style={{
-              backgroundColor: trayFlyoutOpen ? COLORS.surfaceActive : COLORS.surface,
-              border: `1px solid ${trayFlyoutOpen ? COLORS.surfaceActiveBorder : COLORS.surfaceBorder}`,
-              color: trayFlyoutOpen ? COLORS.textPrimary : COLORS.textMuted,
-            }}
-          >
-            <PanelRight className="w-3.5 h-3.5" style={{ color: trayFlyoutOpen ? COLORS.coral : COLORS.textMuted }} />
-            <span>Tray Preview</span>
-          </motion.button>
-        )}
-
-        <div className="w-px h-4 mx-1" style={{ backgroundColor: '#2E2627' }} />
+        <div className="w-px h-4 mx-0.5" style={{ backgroundColor: '#2E2627' }} />
 
         <div className="flex items-center gap-0.5">
           <button
             type="button"
             title="Minimize"
             onClick={() => windowMinimize()}
-            className="w-8 h-7 rounded-[7px] flex items-center justify-center cursor-pointer transition-colors hover:bg-[#251F20]"
+            className="w-7 h-7 rounded-[7px] flex items-center justify-center cursor-pointer transition-colors duration-150 hover:bg-[#251F20]"
             style={{ color: COLORS.textMuted }}
           >
             <Minus className="w-3.5 h-3.5" />
@@ -1320,9 +1322,9 @@ function Titlebar() {
 
           <button
             type="button"
-            title="Close to Windows System Tray"
+            title="Hide to System Tray"
             onClick={minimizeToTray}
-            className="w-8 h-7 rounded-[7px] flex items-center justify-center cursor-pointer transition-colors hover:bg-[#9B0A12] hover:text-[#F4ECEC]"
+            className="w-7 h-7 rounded-[7px] flex items-center justify-center cursor-pointer transition-colors duration-150 hover:bg-[#9B0A12] hover:text-[#F4ECEC]"
             style={{ color: COLORS.textMuted }}
           >
             <X className="w-3.5 h-3.5" />
@@ -1347,14 +1349,10 @@ function NavigationRail() {
   const {
     activeRoute,
     setActiveRoute,
-    railExpanded,
-    setRailExpanded,
     connectionStatus,
     systemMode,
     toggleSystemMode,
   } = useMetro();
-
-  const [hoveredId, setHoveredId] = useState(null);
 
   const statusColor =
     connectionStatus === 'connected'
@@ -1371,123 +1369,45 @@ function NavigationRail() {
       : 'Offline';
 
   return (
-    <motion.aside
-      initial={false}
-      animate={{ width: railExpanded ? 200 : 84 }}
-      transition={SPRING}
-      className="h-full rounded-[26px] flex flex-col justify-between py-3 px-3 shrink-0 relative z-20 select-none"
+    <aside
+      className="w-[62px] h-full rounded-[22px] flex flex-col justify-between py-2.5 px-2 shrink-0 relative z-20 select-none"
       style={{
         backgroundColor: COLORS.surface,
         border: `1px solid ${COLORS.surfaceBorder}`,
       }}
     >
-      <div className="flex flex-col gap-2">
-        <div className={`flex items-center ${railExpanded ? 'justify-between px-1.5' : 'justify-center'} pb-1`}>
-          {railExpanded && (
-            <motion.span
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              className="text-[10.5px] font-semibold uppercase tracking-[0.12em]"
-              style={{ color: COLORS.textMuted }}
+      <nav className="flex flex-col gap-1.5" aria-label="Main navigation">
+        {NAV_ROUTES.map((item) => {
+          const Icon = item.icon;
+          const active = activeRoute === item.id;
+          return (
+            <button
+              key={item.id}
+              type="button"
+              onClick={() => setActiveRoute(item.id)}
+              title={item.label}
+              aria-label={item.label}
+              className="relative w-full py-2 rounded-[14px] flex flex-col items-center justify-center gap-0.5 cursor-pointer transition-colors duration-150 hover:bg-[#262021]"
+              style={{
+                backgroundColor: active ? COLORS.crimson : 'transparent',
+                color: active ? COLORS.textPrimary : COLORS.textMuted,
+                border: `1px solid ${active ? '#BC1F27' : 'transparent'}`,
+              }}
             >
-              Navigation
-            </motion.span>
-          )}
-          <motion.button
-            whileHover={{ scale: 1.06 }}
-            whileTap={{ scale: 0.94 }}
-            transition={SPRING}
-            onClick={() => setRailExpanded((e) => !e)}
-            title={railExpanded ? 'Collapse Navigation Rail' : 'Expand Navigation Rail'}
-            className="w-7 h-7 rounded-full flex items-center justify-center cursor-pointer transition-colors hover:bg-[#2A2223]"
-            style={{ color: COLORS.textMuted, border: '1px solid #302728' }}
-          >
-            {railExpanded ? <ChevronLeft className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
-          </motion.button>
-        </div>
+              <Icon className="w-[17px] h-[17px] shrink-0" strokeWidth={active ? 2.25 : 1.9} />
+              <span className="text-[9.5px] font-semibold tracking-tight leading-none">
+                {item.label}
+              </span>
+            </button>
+          );
+        })}
+      </nav>
 
-        <nav className="flex flex-col gap-1.5 mt-1" aria-label="Main navigation">
-          {NAV_ROUTES.map((item) => {
-            const Icon = item.icon;
-            const active = activeRoute === item.id;
-            return (
-              <div
-                key={item.id}
-                className="relative"
-                onMouseEnter={() => setHoveredId(item.id)}
-                onMouseLeave={() => setHoveredId(null)}
-              >
-                <motion.button
-                  whileTap={{ scale: 0.96 }}
-                  transition={SPRING}
-                  onClick={() => setActiveRoute(item.id)}
-                  className={`relative w-full h-[48px] rounded-[18px] flex items-center cursor-pointer transition-colors ${
-                    railExpanded ? 'px-3.5 gap-3 justify-start' : 'justify-center'
-                  }`}
-                  style={{ color: active ? COLORS.textPrimary : COLORS.textMuted }}
-                >
-                  {active && (
-                    <motion.div
-                      layoutId="metroRailActivePill"
-                      transition={SPRING}
-                      className="absolute inset-0 rounded-[18px]"
-                      style={{ backgroundColor: COLORS.crimson, border: '1px solid #BC1F27' }}
-                    />
-                  )}
-                  {!active && hoveredId === item.id && (
-                    <motion.div
-                      initial={{ opacity: 0 }}
-                      animate={{ opacity: 1 }}
-                      exit={{ opacity: 0 }}
-                      className="absolute inset-0 rounded-[18px]"
-                      style={{ backgroundColor: '#262021' }}
-                    />
-                  )}
-
-                  <Icon className="w-[19px] h-[19px] relative z-10 shrink-0" strokeWidth={active ? 2.25 : 1.9} />
-                  {railExpanded && (
-                    <motion.span
-                      initial={{ opacity: 0, x: -4 }}
-                      animate={{ opacity: 1, x: 0 }}
-                      transition={{ duration: 0.14 }}
-                      className="relative z-10 font-jakarta font-semibold text-[13.5px] whitespace-nowrap"
-                    >
-                      {item.label}
-                    </motion.span>
-                  )}
-                </motion.button>
-
-                <AnimatePresence>
-                  {!railExpanded && hoveredId === item.id && (
-                    <motion.div
-                      initial={{ opacity: 0, x: -4, scale: 0.95 }}
-                      animate={{ opacity: 1, x: 0, scale: 1 }}
-                      exit={{ opacity: 0, x: -4, scale: 0.95 }}
-                      transition={{ duration: 0.12 }}
-                      className="absolute left-[calc(100%+12px)] top-1/2 -translate-y-1/2 px-2.5 py-1.5 rounded-[10px] text-[12px] font-semibold whitespace-nowrap pointer-events-none z-50 shadow-xl"
-                      style={{
-                        backgroundColor: '#261F20',
-                        border: '1px solid #3D3132',
-                        color: COLORS.textPrimary,
-                      }}
-                    >
-                      {item.label}
-                    </motion.div>
-                  )}
-                </AnimatePresence>
-              </div>
-            );
-          })}
-        </nav>
-      </div>
-
-      <div className="flex flex-col gap-2 pt-2.5 border-t" style={{ borderColor: '#2A2223' }}>
+      <div className="flex flex-col gap-2 pt-2 border-t" style={{ borderColor: '#2A2223' }}>
         <div
-          className={`flex items-center rounded-[14px] py-2 ${
-            railExpanded ? 'px-3 gap-2.5 justify-start' : 'justify-center'
-          }`}
+          className="flex flex-col items-center justify-center rounded-[12px] py-1.5 gap-1"
           style={{ backgroundColor: '#151213' }}
-          title={`Status: ${statusLabel}`}
+          title={`Tunnel Status: ${statusLabel}`}
         >
           <span className="relative flex h-2.5 w-2.5 shrink-0">
             {connectionStatus !== 'disconnected' && (
@@ -1498,63 +1418,40 @@ function NavigationRail() {
             )}
             <span className="relative inline-flex rounded-full h-2.5 w-2.5" style={{ backgroundColor: statusColor }} />
           </span>
-          {railExpanded && (
-            <div className="min-w-0">
-              <p className="text-[12px] font-semibold leading-tight truncate" style={{ color: COLORS.textPrimary }}>
-                {statusLabel}
-              </p>
-              <p className="text-[10.5px] leading-tight" style={{ color: COLORS.textMuted }}>
-                VLESS • Xray
-              </p>
-            </div>
-          )}
+          <span className="text-[8.5px] font-semibold uppercase tracking-wider" style={{ color: COLORS.textMuted }}>
+            {connectionStatus === 'connected' ? 'ON' : connectionStatus === 'connecting' ? '...' : 'OFF'}
+          </span>
         </div>
 
-        <motion.button
-          whileHover={{ scale: 1.02 }}
-          whileTap={{ scale: 0.96 }}
-          transition={SPRING}
+        <button
+          type="button"
           onClick={() => toggleSystemMode()}
-          title={`System Mode: ${systemMode === 'TUN' ? 'TUN Mode' : 'System Proxy'} (Click to switch)`}
-          className={`w-full rounded-[16px] py-2 flex items-center cursor-pointer transition-colors ${
-            railExpanded ? 'px-3 justify-between' : 'flex-col justify-center gap-0.5'
-          }`}
+          title={
+            systemMode === 'TUN'
+              ? 'TUN Mode Active (All PC apps & games • Requires Admin) — Click to switch to System Proxy'
+              : 'System Proxy Mode Active (Browsers & chat apps • No Admin) — Click to switch to TUN Mode'
+          }
+          className="w-full rounded-[14px] py-2 flex flex-col items-center justify-center gap-0.5 cursor-pointer transition-colors duration-150"
           style={{
             backgroundColor: systemMode === 'TUN' ? COLORS.surfaceActive : '#221C1D',
             border: `1px solid ${systemMode === 'TUN' ? COLORS.surfaceActiveBorder : COLORS.surfaceBorder}`,
           }}
         >
-          <div className="flex items-center gap-2">
-            <Layers className="w-3.5 h-3.5 shrink-0" style={{ color: systemMode === 'TUN' ? COLORS.coral : COLORS.amber }} />
-            {railExpanded && (
-              <span className="text-[12px] font-semibold whitespace-nowrap" style={{ color: COLORS.textPrimary }}>
-                {systemMode === 'TUN' ? 'TUN Mode' : 'Sys Proxy'}
-              </span>
-            )}
-          </div>
-          {!railExpanded ? (
-            <span
-              className="font-mono text-[9.5px] font-semibold tracking-wider"
-              style={{ color: systemMode === 'TUN' ? COLORS.textPrimary : COLORS.amber }}
-            >
-              {systemMode === 'TUN' ? 'TUN' : 'PRX'}
-            </span>
-          ) : (
-            <span
-              className="font-mono text-[10px] px-1.5 py-0.5 rounded-md font-semibold"
-              style={{ backgroundColor: COLORS.amberBg, color: COLORS.amber }}
-            >
-              {systemMode}
-            </span>
-          )}
-        </motion.button>
+          <Layers className="w-3.5 h-3.5 shrink-0" style={{ color: systemMode === 'TUN' ? COLORS.coral : COLORS.amber }} />
+          <span
+            className="font-mono text-[9.5px] font-semibold tracking-wider"
+            style={{ color: systemMode === 'TUN' ? COLORS.textPrimary : COLORS.amber }}
+          >
+            {systemMode === 'TUN' ? 'TUN' : 'PRX'}
+          </span>
+        </button>
       </div>
-    </motion.aside>
+    </aside>
   );
 }
 
 // ============================================================================
-// SCREEN 1: HOME DASHBOARD
+// SCREEN 1: HOME DASHBOARD (Compact NetMod-Inspired 520x620 Layout)
 // ============================================================================
 function HomeScreen() {
   const {
@@ -1570,6 +1467,7 @@ function HomeScreen() {
     socksPort,
     setActiveRoute,
     openAddModal,
+    setQrModalOpen,
     setOnboardingOpen,
     pushToast,
   } = useMetro();
@@ -1582,8 +1480,8 @@ function HomeScreen() {
   const downNow = formatThroughput(downHistory[downHistory.length - 1] || 0);
   const upNow = formatThroughput(upHistory[upHistory.length - 1] || 0);
 
-  const downSpark = useMemo(() => buildSparklinePath(downHistory, 180, 34, 4), [downHistory]);
-  const upSpark = useMemo(() => buildSparklinePath(upHistory, 180, 34, 4), [upHistory]);
+  const downSpark = useMemo(() => buildSparklinePath(downHistory, 180, 26, 3), [downHistory]);
+  const upSpark = useMemo(() => buildSparklinePath(upHistory, 180, 26, 3), [upHistory]);
 
   const handleCopyLocalProxy = async () => {
     const addr = `${localLanIp}:${socksPort || 10808}`;
@@ -1596,30 +1494,29 @@ function HomeScreen() {
   return (
     <motion.div
       key="screen-home"
-      initial={{ opacity: 0, y: 8 }}
-      animate={{ opacity: 1, y: 0 }}
-      exit={{ opacity: 0, y: -6 }}
-      transition={SPRING_SOFT}
-      className="h-full grid grid-cols-1 lg:grid-cols-[55%_45%] gap-4 items-stretch"
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      transition={{ duration: 0.14 }}
+      className="flex flex-col gap-2.5 pb-1"
     >
+      {/* Hero Orb Card */}
       <div
-        className="rounded-[28px] p-5 flex flex-col items-center justify-center relative overflow-hidden"
+        className="rounded-[22px] px-4 py-3.5 flex flex-col items-center justify-center relative overflow-hidden"
         style={{
           backgroundColor: COLORS.surface,
           border: `1px solid ${COLORS.surfaceBorder}`,
-          minHeight: 460,
         }}
       >
-        <motion.div
-          layout
-          className="inline-flex items-center gap-2.5 px-4 py-1.5 rounded-full text-[12.5px] font-semibold"
+        <div
+          className="inline-flex items-center gap-2 px-3 py-1 rounded-full text-[11.5px] font-semibold"
           style={{
             backgroundColor: '#241E1F',
             border: '1px solid #3A3031',
             color: COLORS.textPrimary,
           }}
         >
-          <span className="relative flex h-2.5 w-2.5">
+          <span className="relative flex h-2 w-2">
             {connectionStatus !== 'disconnected' && (
               <span
                 className="animate-ping absolute inline-flex h-full w-full rounded-full opacity-60"
@@ -1627,7 +1524,7 @@ function HomeScreen() {
               />
             )}
             <span
-              className="relative inline-flex rounded-full h-2.5 w-2.5"
+              className="relative inline-flex rounded-full h-2 w-2"
               style={{
                 backgroundColor: isConnected ? COLORS.mint : isConnecting ? COLORS.amber : '#7B6D6E',
               }}
@@ -1635,291 +1532,280 @@ function HomeScreen() {
           </span>
           <span>
             {isConnected
-              ? `Protected • VLESS • ${activeNode?.vcn ? 'VCN' : 'TLS'}`
+              ? `Protected • ${activeNode?.vcn ? 'VCN' : 'TLS'}`
               : isConnecting
               ? 'Connecting...'
               : activeNode
               ? 'Disconnected'
-              : 'Ready • Import Server'}
+              : 'Ready • Add Config'}
           </span>
-        </motion.div>
+        </div>
 
         <div
-          className="mt-3.5 mb-4 font-mono tabular-nums text-[42px] font-bold tracking-[-0.03em] leading-none"
+          className="mt-2 mb-2.5 font-mono tabular-nums text-[32px] font-bold tracking-[-0.03em] leading-none"
           style={{ color: isConnected ? COLORS.textPrimary : '#6E6162' }}
         >
           {isConnected ? formatTimer(sessionSeconds) : '00:00:00'}
         </div>
 
-        <ScallopedConnectButton size={208} status={connectionStatus} onClick={toggleConnection} />
+        <ScallopedConnectButton size={146} status={connectionStatus} onClick={toggleConnection} />
 
         <p
-          className="mt-4 text-[12.5px] font-medium text-center max-w-[300px]"
+          className="mt-2.5 text-[11.5px] font-medium text-center"
           style={{ color: isConnected ? '#CBBBBC' : COLORS.textMuted }}
         >
           {isConnected
-            ? 'Encrypted tunnel active • Click to disconnect'
+            ? 'Encrypted tunnel active • Click orb to disconnect'
             : isConnecting
             ? `Performing Xray ${tunnelProfile} handshake...`
             : activeNode
-            ? 'Tunnel inactive • Click orb to establish encrypted link'
-            : 'No config imported yet • Click orb or + Add Config to start'}
+            ? 'Click orb to connect'
+            : 'No server yet • Paste link or scan QR to start'}
         </p>
 
         {!activeNode && (
-          <div className="mt-3 flex items-center gap-2">
+          <div className="mt-2.5 flex flex-wrap items-center justify-center gap-1.5">
             <button
               type="button"
               onClick={() => openAddModal('uri')}
-              className="h-[32px] px-3.5 rounded-full text-[11.5px] font-semibold cursor-pointer"
+              className="h-[28px] px-3 rounded-full text-[11px] font-semibold cursor-pointer transition-colors duration-150 hover:bg-[#5C4341]"
               style={{ backgroundColor: COLORS.taupe, color: COLORS.textPrimary, border: '1px solid #634947' }}
             >
-              + Import Node
+              + Add Config
+            </button>
+            <button
+              type="button"
+              onClick={() => setQrModalOpen(true)}
+              className="h-[28px] px-3 rounded-full text-[11px] font-semibold cursor-pointer transition-colors duration-150 hover:bg-[#2A2324]"
+              style={{ backgroundColor: '#151213', color: COLORS.textPrimary, border: `1px solid ${COLORS.surfaceBorder}` }}
+            >
+              Scan QR
             </button>
             <button
               type="button"
               onClick={() => setOnboardingOpen(true)}
-              className="h-[32px] px-3.5 rounded-full text-[11.5px] font-semibold cursor-pointer"
+              className="h-[28px] px-3 rounded-full text-[11px] font-semibold cursor-pointer transition-colors duration-150 hover:bg-[#2A2324]"
               style={{ backgroundColor: '#151213', color: COLORS.amber, border: `1px solid ${COLORS.surfaceBorder}` }}
             >
-              Quick Setup Guide
+              Setup Guide
             </button>
           </div>
         )}
       </div>
 
-      <div className="flex flex-col justify-between gap-3.5 pr-0.5">
-        <div className="grid grid-cols-2 gap-3.5">
-          <motion.div
-            whileHover={{ borderColor: '#453536' }}
-            transition={SPRING}
-            className="rounded-[24px] pt-4 px-4 pb-0 flex flex-col justify-between overflow-hidden"
-            style={{
-              backgroundColor: COLORS.surface,
-              border: `1px solid ${COLORS.surfaceBorder}`,
-              minHeight: 152,
-            }}
-          >
-            <div>
-              <div className="flex items-center justify-between">
-                <span className="text-[12px] font-semibold" style={{ color: COLORS.textMuted }}>
-                  Download
-                </span>
-                <span
-                  className="w-8 h-8 rounded-full flex items-center justify-center"
-                  style={{ backgroundColor: '#3A181B', border: '1px solid #632429', color: COLORS.coral }}
-                >
-                  <ArrowDown className="w-4 h-4" strokeWidth={2.4} />
-                </span>
-              </div>
-              <div className="mt-2.5 flex items-baseline gap-1.5">
-                <span
-                  className="font-mono tabular-nums text-[25px] font-bold tracking-tight leading-none"
-                  style={{ color: COLORS.textPrimary }}
-                >
-                  {downNow.value}
-                </span>
-                <span className="font-mono text-[12px] font-medium" style={{ color: COLORS.coral }}>
-                  {downNow.unit}
-                </span>
-              </div>
-            </div>
-
-            <div className="w-full h-[36px] mt-2 -mx-4 px-0" style={{ width: 'calc(100% + 2rem)' }}>
-              <svg viewBox="0 0 180 34" preserveAspectRatio="none" className="w-full h-full block">
-                <defs>
-                  <linearGradient id="homeDownSpark" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor={COLORS.coral} stopOpacity="0.28" />
-                    <stop offset="100%" stopColor={COLORS.coral} stopOpacity="0" />
-                  </linearGradient>
-                </defs>
-                {downSpark && (
-                  <>
-                    <path d={`${downSpark} L 180 34 L 0 34 Z`} fill="url(#homeDownSpark)" />
-                    <path d={downSpark} fill="none" stroke={COLORS.coral} strokeWidth="2.1" strokeLinecap="round" />
-                  </>
-                )}
-              </svg>
-            </div>
-          </motion.div>
-
-          <motion.div
-            whileHover={{ borderColor: '#453536' }}
-            transition={SPRING}
-            className="rounded-[24px] pt-4 px-4 pb-0 flex flex-col justify-between overflow-hidden"
-            style={{
-              backgroundColor: COLORS.surface,
-              border: `1px solid ${COLORS.surfaceBorder}`,
-              minHeight: 152,
-            }}
-          >
-            <div>
-              <div className="flex items-center justify-between">
-                <span className="text-[12px] font-semibold" style={{ color: COLORS.textMuted }}>
-                  Upload
-                </span>
-                <span
-                  className="w-8 h-8 rounded-full flex items-center justify-center"
-                  style={{ backgroundColor: COLORS.amberBg, border: '1px solid #594729', color: COLORS.amber }}
-                >
-                  <ArrowUp className="w-4 h-4" strokeWidth={2.4} />
-                </span>
-              </div>
-              <div className="mt-2.5 flex items-baseline gap-1.5">
-                <span
-                  className="font-mono tabular-nums text-[25px] font-bold tracking-tight leading-none"
-                  style={{ color: COLORS.textPrimary }}
-                >
-                  {upNow.value}
-                </span>
-                <span className="font-mono text-[12px] font-medium" style={{ color: COLORS.amber }}>
-                  {upNow.unit}
-                </span>
-              </div>
-            </div>
-
-            <div className="w-full h-[36px] mt-2 -mx-4 px-0" style={{ width: 'calc(100% + 2rem)' }}>
-              <svg viewBox="0 0 180 34" preserveAspectRatio="none" className="w-full h-full block">
-                <defs>
-                  <linearGradient id="homeUpSpark" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor={COLORS.amber} stopOpacity="0.26" />
-                    <stop offset="100%" stopColor={COLORS.amber} stopOpacity="0" />
-                  </linearGradient>
-                </defs>
-                {upSpark && (
-                  <>
-                    <path d={`${upSpark} L 180 34 L 0 34 Z`} fill="url(#homeUpSpark)" />
-                    <path d={upSpark} fill="none" stroke={COLORS.amber} strokeWidth="2.1" strokeLinecap="round" />
-                  </>
-                )}
-              </svg>
-            </div>
-          </motion.div>
-        </div>
-
-        <motion.div
-          whileHover={{ y: -1.5, borderColor: '#734C4A' }}
-          whileTap={{ scale: 0.99 }}
-          transition={SPRING}
-          onClick={() => (activeNode ? setActiveRoute('servers') : openAddModal('uri'))}
-          className="rounded-[24px] p-5 cursor-pointer flex flex-col justify-between flex-1"
-          style={{ backgroundColor: COLORS.surfaceActive, border: `1px solid ${COLORS.surfaceActiveBorder}` }}
+      {/* Live Speed Pair */}
+      <div className="grid grid-cols-2 gap-2.5">
+        <div
+          className="rounded-[18px] pt-3 px-3.5 pb-0 flex flex-col justify-between overflow-hidden"
+          style={{
+            backgroundColor: COLORS.surface,
+            border: `1px solid ${COLORS.surfaceBorder}`,
+            minHeight: 88,
+          }}
         >
-          <div className="flex items-center justify-between">
-            <span className="text-[10.5px] font-bold uppercase tracking-[0.12em]" style={{ color: '#D7B7B5' }}>
-              Active Secure Exit
-            </span>
-            <span
-              className="inline-flex items-center px-2.5 py-0.5 rounded-full font-mono tabular-nums text-[12px] font-semibold"
-              style={{ backgroundColor: COLORS.amberBg, color: COLORS.amber }}
-            >
-              {activeNode?.ping != null ? `${activeNode.ping} ms` : activeNode ? 'Unmeasured' : 'Setup Needed'}
-            </span>
-          </div>
-
-          <div className="flex items-center justify-between gap-3 my-3.5">
-            <div className="flex items-center gap-3.5 min-w-0">
-              <IspBadge node={activeNode} size={46} isActive={Boolean(activeNode)} />
-              <div className="min-w-0">
-                <div className="flex items-center gap-2">
-                  <h2 className="font-jakarta font-bold text-[15.5px] leading-snug truncate" style={{ color: COLORS.textPrimary }}>
-                    {activeNode?.name || 'No Exit Server Selected'}
-                  </h2>
-                  {activeNode?.vcn && (
-                    <span
-                      className="px-1.5 py-0.5 rounded-[6px] font-mono text-[10px] font-bold shrink-0"
-                      style={{ backgroundColor: COLORS.amberBg, color: COLORS.amber }}
-                    >
-                      VCN
-                    </span>
-                  )}
-                </div>
-                <p className="text-[12px] mt-0.5 truncate" style={{ color: '#CEB4B3' }}>
-                  {activeNode
-                    ? `${activeNode.protocol} • ${activeNode.isp}`
-                    : 'Click to import VLESS, VMess, JSON, or Subscription'}
-                </p>
-              </div>
+          <div>
+            <div className="flex items-center justify-between">
+              <span className="text-[11px] font-semibold" style={{ color: COLORS.textMuted }}>
+                Download
+              </span>
+              <span
+                className="w-6 h-6 rounded-full flex items-center justify-center"
+                style={{ backgroundColor: '#3A181B', border: '1px solid #632429', color: COLORS.coral }}
+              >
+                <ArrowDown className="w-3.5 h-3.5" strokeWidth={2.4} />
+              </span>
             </div>
-
-            <div
-              className="w-8 h-8 rounded-full flex items-center justify-center shrink-0"
-              style={{ backgroundColor: '#2B1C1C', color: COLORS.textPrimary }}
-            >
-              <ChevronRight className="w-4 h-4" />
+            <div className="mt-1 flex items-baseline gap-1">
+              <span
+                className="font-mono tabular-nums text-[20px] font-bold tracking-tight leading-none"
+                style={{ color: COLORS.textPrimary }}
+              >
+                {downNow.value}
+              </span>
+              <span className="font-mono text-[11px] font-medium" style={{ color: COLORS.coral }}>
+                {downNow.unit}
+              </span>
             </div>
           </div>
 
-          <div
-            className="pt-3 border-t flex items-center justify-between text-[11.5px]"
-            style={{ borderColor: '#523736', color: '#D3BABA' }}
-          >
-            <span className="truncate font-mono">{activeNode?.sni || 'vless:// / vmess:// / .json'}</span>
-            <span className="font-mono tabular-nums shrink-0 ml-2">{activeNode?.ip || '—'}</span>
+          <div className="h-[26px] mt-1 -mx-3.5" style={{ width: 'calc(100% + 1.75rem)' }}>
+            <svg viewBox="0 0 180 26" preserveAspectRatio="none" className="w-full h-full block">
+              <defs>
+                <linearGradient id="homeDownSpark" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor={COLORS.coral} stopOpacity="0.28" />
+                  <stop offset="100%" stopColor={COLORS.coral} stopOpacity="0" />
+                </linearGradient>
+              </defs>
+              {downSpark && (
+                <>
+                  <path d={`${downSpark} L 180 26 L 0 26 Z`} fill="url(#homeDownSpark)" />
+                  <path d={downSpark} fill="none" stroke={COLORS.coral} strokeWidth="1.9" strokeLinecap="round" />
+                </>
+              )}
+            </svg>
           </div>
-        </motion.div>
+        </div>
 
         <div
-          className="rounded-[22px] p-4 flex flex-col gap-3"
-          style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}
+          className="rounded-[18px] pt-3 px-3.5 pb-0 flex flex-col justify-between overflow-hidden"
+          style={{
+            backgroundColor: COLORS.surface,
+            border: `1px solid ${COLORS.surfaceBorder}`,
+            minHeight: 88,
+          }}
         >
-          <div className="flex items-center justify-between gap-2">
-            <div className="flex items-center gap-4">
-              <div>
-                <span className="text-[10.5px] uppercase tracking-wider block" style={{ color: COLORS.textMuted }}>
-                  Tunneling Mode
-                </span>
-                <span className="font-jakarta font-semibold text-[13px]" style={{ color: COLORS.textPrimary }}>
-                  {tunnelProfile}
-                </span>
-              </div>
-              <div className="w-px h-7" style={{ backgroundColor: '#2E2627' }} />
-              <div>
-                <span className="text-[10.5px] uppercase tracking-wider block" style={{ color: COLORS.textMuted }}>
-                  Local {systemMode}
-                </span>
-                <span
-                  className="inline-flex items-center gap-1.5 font-jakarta font-semibold text-[13px]"
-                  style={{ color: isConnected ? COLORS.mint : COLORS.textMuted }}
-                >
-                  <span
-                    className="w-1.5 h-1.5 rounded-full"
-                    style={{ backgroundColor: isConnected ? COLORS.mint : COLORS.textMuted }}
-                  />
-                  {isConnected ? 'Active' : 'Standby'}
-                </span>
-              </div>
+          <div>
+            <div className="flex items-center justify-between">
+              <span className="text-[11px] font-semibold" style={{ color: COLORS.textMuted }}>
+                Upload
+              </span>
+              <span
+                className="w-6 h-6 rounded-full flex items-center justify-center"
+                style={{ backgroundColor: COLORS.amberBg, border: '1px solid #594729', color: COLORS.amber }}
+              >
+                <ArrowUp className="w-3.5 h-3.5" strokeWidth={2.4} />
+              </span>
             </div>
+            <div className="mt-1 flex items-baseline gap-1">
+              <span
+                className="font-mono tabular-nums text-[20px] font-bold tracking-tight leading-none"
+                style={{ color: COLORS.textPrimary }}
+              >
+                {upNow.value}
+              </span>
+              <span className="font-mono text-[11px] font-medium" style={{ color: COLORS.amber }}>
+                {upNow.unit}
+              </span>
+            </div>
+          </div>
 
-            <motion.button
-              whileHover={{ scale: 1.02 }}
-              whileTap={{ scale: 0.96 }}
-              transition={SPRING}
-              onClick={handleCopyLocalProxy}
-              className="h-[34px] px-3.5 rounded-full text-[12px] font-semibold flex items-center gap-1.5 cursor-pointer transition-colors shrink-0"
-              style={{ backgroundColor: COLORS.taupe, color: COLORS.textPrimary, border: '1px solid #634947' }}
-            >
-              {copiedProxy ? <Check className="w-3.5 h-3.5" style={{ color: COLORS.mint }} /> : <Copy className="w-3.5 h-3.5" />}
-              <span>{copiedProxy ? 'Copied' : `:${socksPort || 10808}`}</span>
-            </motion.button>
+          <div className="h-[26px] mt-1 -mx-3.5" style={{ width: 'calc(100% + 1.75rem)' }}>
+            <svg viewBox="0 0 180 26" preserveAspectRatio="none" className="w-full h-full block">
+              <defs>
+                <linearGradient id="homeUpSpark" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor={COLORS.amber} stopOpacity="0.26" />
+                  <stop offset="100%" stopColor={COLORS.amber} stopOpacity="0" />
+                </linearGradient>
+              </defs>
+              {upSpark && (
+                <>
+                  <path d={`${upSpark} L 180 26 L 0 26 Z`} fill="url(#homeUpSpark)" />
+                  <path d={upSpark} fill="none" stroke={COLORS.amber} strokeWidth="1.9" strokeLinecap="round" />
+                </>
+              )}
+            </svg>
           </div>
         </div>
+      </div>
+
+      {/* Active Server Card */}
+      <div
+        role="button"
+        tabIndex={0}
+        onClick={() => (activeNode ? setActiveRoute('servers') : openAddModal('uri'))}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            activeNode ? setActiveRoute('servers') : openAddModal('uri');
+          }
+        }}
+        className="rounded-[18px] p-3.5 cursor-pointer flex flex-col gap-2 transition-colors duration-150 hover:border-[#734C4A]"
+        style={{ backgroundColor: COLORS.surfaceActive, border: `1px solid ${COLORS.surfaceActiveBorder}` }}
+      >
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2.5 min-w-0">
+            <IspBadge node={activeNode} size={36} isActive={Boolean(activeNode)} />
+            <div className="min-w-0">
+              <div className="flex items-center gap-1.5">
+                <h2 className="font-jakarta font-bold text-[13.5px] leading-tight truncate" style={{ color: COLORS.textPrimary }}>
+                  {activeNode?.name || 'No Exit Server Selected'}
+                </h2>
+                {activeNode?.vcn && (
+                  <span
+                    className="px-1.5 py-0.5 rounded-[5px] font-mono text-[9.5px] font-bold shrink-0"
+                    style={{ backgroundColor: COLORS.amberBg, color: COLORS.amber }}
+                  >
+                    VCN
+                  </span>
+                )}
+              </div>
+              <p className="text-[11px] mt-0.5 truncate" style={{ color: '#CEB4B3' }}>
+                {activeNode
+                  ? `${activeNode.protocol} • Used: ${formatUsageData(activeNode.quotaUsedGB || 0)}`
+                  : 'Click to paste VLESS / VMess URI'}
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-1.5 shrink-0">
+            <span
+              className="px-2 py-0.5 rounded-full font-mono tabular-nums text-[11px] font-semibold"
+              style={{ backgroundColor: COLORS.amberBg, color: COLORS.amber }}
+            >
+              {activeNode?.ping != null ? `${activeNode.ping}ms` : activeNode ? 'Ping' : 'Setup'}
+            </span>
+            <ChevronRight className="w-4 h-4" style={{ color: COLORS.textMuted }} />
+          </div>
+        </div>
+      </div>
+
+      {/* Compact Tunneling Mode & Local Proxy Footer */}
+      <div
+        className="rounded-[16px] px-3.5 py-2.5 flex items-center justify-between gap-2"
+        style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}
+      >
+        <div className="flex items-center gap-3 min-w-0">
+          <div className="min-w-0">
+            <span className="text-[9.5px] uppercase tracking-wider block" style={{ color: COLORS.textMuted }}>
+              Profile
+            </span>
+            <span className="font-jakarta font-semibold text-[12px] truncate block" style={{ color: COLORS.textPrimary }}>
+              {tunnelProfile}
+            </span>
+          </div>
+          <div className="w-px h-6 shrink-0" style={{ backgroundColor: '#2E2627' }} />
+          <div>
+            <span className="text-[9.5px] uppercase tracking-wider block" style={{ color: COLORS.textMuted }}>
+              Mode
+            </span>
+            <span
+              className="inline-flex items-center gap-1 font-jakarta font-semibold text-[12px]"
+              style={{ color: isConnected ? COLORS.mint : COLORS.textMuted }}
+            >
+              <span
+                className="w-1.5 h-1.5 rounded-full"
+                style={{ backgroundColor: isConnected ? COLORS.mint : COLORS.textMuted }}
+              />
+              {systemMode === 'TUN' ? 'TUN' : 'Proxy'}
+            </span>
+          </div>
+        </div>
+
+        <button
+          type="button"
+          onClick={handleCopyLocalProxy}
+          className="h-[30px] px-3 rounded-full text-[11.5px] font-semibold flex items-center gap-1.5 cursor-pointer transition-colors duration-150 hover:bg-[#5C4341] shrink-0"
+          style={{ backgroundColor: COLORS.taupe, color: COLORS.textPrimary, border: '1px solid #634947' }}
+        >
+          {copiedProxy ? <Check className="w-3.5 h-3.5" style={{ color: COLORS.mint }} /> : <Copy className="w-3.5 h-3.5" />}
+          <span>{copiedProxy ? 'Copied' : `:${socksPort || 10808}`}</span>
+        </button>
       </div>
     </motion.div>
   );
 }
 
 // ============================================================================
-// WAVY QUOTA BAR
+// SMOOTH DATA USAGE / QUOTA PROGRESS BAR (No Crazy Zigzag!)
 // ============================================================================
 function WavyQuotaBar({ usedGB, totalGB, isConnectedCard }) {
   const [hovered, setHovered] = useState(false);
-  const ratio = Math.max(0.04, Math.min(1, usedGB / Math.max(1, totalGB)));
-  const remainingGB = Math.max(0, totalGB - usedGB);
-
-  const totalW = 280;
-  const fillW = Math.round(totalW * ratio);
-  const wavePath = useMemo(() => generateWaveLinePath(fillW, 6, 2.5, 13), [fillW]);
+  const hasLimit = totalGB > 0;
+  const pct = hasLimit
+    ? Math.max(usedGB > 0 ? 3 : 0, Math.min(100, (usedGB / totalGB) * 100))
+    : usedGB > 0
+    ? Math.min(100, Math.max(8, ((usedGB * 1024) % 100)))
+    : 0;
+  const remainingGB = hasLimit ? Math.max(0, totalGB - usedGB) : 0;
 
   return (
     <div
@@ -1928,43 +1814,34 @@ function WavyQuotaBar({ usedGB, totalGB, isConnectedCard }) {
       onMouseLeave={() => setHovered(false)}
       onClick={(e) => e.stopPropagation()}
     >
-      <svg viewBox={`0 0 ${totalW} 12`} preserveAspectRatio="none" className="w-full h-[12px] overflow-visible block">
-        <line
-          x1={fillW}
-          y1="6"
-          x2={totalW}
-          y2="6"
-          stroke={isConnectedCard ? '#563D3B' : '#32292A'}
-          strokeWidth="2.2"
-          strokeLinecap="round"
+      <div
+        className="w-full h-[5px] rounded-full overflow-hidden"
+        style={{ backgroundColor: isConnectedCard ? '#563D3B' : '#2E2627' }}
+      >
+        <div
+          className="h-full rounded-full transition-all duration-300"
+          style={{
+            width: `${pct}%`,
+            backgroundColor: hasLimit && pct > 85 ? COLORS.amber : COLORS.coral,
+          }}
         />
-        {wavePath && (
-          <path
-            d={wavePath}
-            fill="none"
-            stroke={COLORS.coral}
-            strokeWidth="2.4"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-          />
-        )}
-      </svg>
+      </div>
 
-      <AnimatePresence>
-        {hovered && (
-          <motion.div
-            initial={{ opacity: 0, y: 4, scale: 0.96 }}
-            animate={{ opacity: 1, y: 0, scale: 1 }}
-            exit={{ opacity: 0, y: 4, scale: 0.96 }}
-            transition={{ duration: 0.14 }}
-            className="absolute -top-9 left-1/2 -translate-x-1/2 px-3 py-1.5 rounded-[10px] font-mono tabular-nums text-[11px] font-medium whitespace-nowrap z-30 shadow-xl pointer-events-none"
-            style={{ backgroundColor: '#231C1D', border: '1px solid #493839', color: COLORS.textPrimary }}
-          >
-            <span style={{ color: COLORS.coral }}>{usedGB.toFixed(1)} GB</span> used •{' '}
-            <span style={{ color: COLORS.mint }}>{remainingGB.toFixed(1)} GB</span> remaining
-          </motion.div>
-        )}
-      </AnimatePresence>
+      {hovered && (
+        <div
+          className="absolute -top-8 left-1/2 -translate-x-1/2 px-2.5 py-1 rounded-[8px] font-mono tabular-nums text-[10.5px] font-medium whitespace-nowrap z-30 shadow-xl pointer-events-none"
+          style={{ backgroundColor: '#231C1D', border: '1px solid #493839', color: COLORS.textPrimary }}
+        >
+          <span style={{ color: COLORS.coral }}>{formatUsageData(usedGB)}</span> used
+          {hasLimit ? (
+            <>
+              {' '}• <span style={{ color: COLORS.mint }}>{remainingGB.toFixed(1)} GB</span> left
+            </>
+          ) : (
+            ' • Live Xray counter'
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -2153,31 +2030,27 @@ function ServersScreen() {
           </div>
 
           <div className="flex items-center gap-2">
-            <motion.button
-              whileHover={{ scale: 1.02 }}
-              whileTap={{ scale: 0.96 }}
-              transition={SPRING}
+            <button
+              type="button"
               onClick={testAllPings}
               disabled={testingAllPings}
-              className="h-[40px] px-4 rounded-full text-[12.5px] font-semibold flex items-center gap-2 cursor-pointer transition-colors disabled:opacity-70"
+              className="h-[34px] px-3 rounded-full text-[11.5px] font-semibold flex items-center gap-1.5 cursor-pointer transition-colors duration-150 hover:bg-[#5C4341] disabled:opacity-70"
               style={{ backgroundColor: COLORS.taupe, color: COLORS.textPrimary, border: '1px solid #634947' }}
             >
               <Zap className={`w-3.5 h-3.5 ${testingAllPings ? 'animate-pulse' : ''}`} style={{ color: COLORS.amber }} />
-              <span>{testingAllPings ? 'Testing...' : 'Test All Pings'}</span>
-            </motion.button>
+              <span>{testingAllPings ? 'Testing...' : 'Test Pings'}</span>
+            </button>
 
-            <motion.button
-              whileHover={{ scale: 1.02 }}
-              whileTap={{ scale: 0.96 }}
-              transition={SPRING}
+            <button
+              type="button"
               onClick={testAllPings}
-              className="h-[40px] px-3.5 rounded-full text-[12px] font-semibold flex items-center gap-2 cursor-pointer"
+              className="h-[34px] px-3 rounded-full text-[11.5px] font-semibold flex items-center gap-1.5 cursor-pointer transition-colors duration-150 hover:bg-[#1E1A1B]"
               style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}`, color: COLORS.textPrimary }}
             >
               <span className="w-2 h-2 rounded-full" style={{ backgroundColor: COLORS.mint }} />
               <span className="font-mono tabular-nums">{onlineCount} Online</span>
-              <RefreshCw className={`w-3.5 h-3.5 ${testingAllPings ? 'animate-spin' : ''}`} style={{ color: COLORS.textMuted }} />
-            </motion.button>
+              <RefreshCw className={`w-3 h-3 ${testingAllPings ? 'animate-spin' : ''}`} style={{ color: COLORS.textMuted }} />
+            </button>
           </div>
         </div>
 
@@ -2185,12 +2058,11 @@ function ServersScreen() {
           {filterChips.map((chip) => {
             const isActive = selectedFilter === chip.id;
             return (
-              <motion.button
+              <button
                 key={chip.id}
-                whileTap={{ scale: 0.95 }}
-                transition={SPRING}
+                type="button"
                 onClick={() => setSelectedFilter(chip.id)}
-                className="h-[31px] px-3 rounded-full text-[12px] font-semibold inline-flex items-center gap-1.5 cursor-pointer transition-colors"
+                className="h-[28px] px-2.5 rounded-full text-[11px] font-semibold inline-flex items-center gap-1.5 cursor-pointer transition-colors duration-150"
                 style={{
                   backgroundColor: isActive ? COLORS.taupe : '#151213',
                   color: isActive ? COLORS.textPrimary : COLORS.textMuted,
@@ -2199,16 +2071,16 @@ function ServersScreen() {
               >
                 {chip.brand ? (
                   <span
-                    className="w-4 h-4 rounded-full overflow-hidden flex items-center justify-center shrink-0"
-                    style={{ backgroundColor: chip.brand.bg, padding: 1.5 }}
+                    className="w-3.5 h-3.5 rounded-full overflow-hidden flex items-center justify-center shrink-0"
+                    style={{ backgroundColor: chip.brand.bg, padding: 1 }}
                   >
                     <img src={chip.brand.img} alt={chip.label} className="w-full h-full object-cover rounded-full" />
                   </span>
                 ) : (
-                  isActive && <Check className="w-3.5 h-3.5" strokeWidth={2.6} />
+                  isActive && <Check className="w-3 h-3" strokeWidth={2.6} />
                 )}
                 <span>{chip.label}</span>
-              </motion.button>
+              </button>
             );
           })}
         </div>
@@ -2216,53 +2088,55 @@ function ServersScreen() {
 
       {filteredNodes.length === 0 ? (
         <div
-          className="rounded-[24px] p-10 text-center flex flex-col items-center gap-3"
+          className="rounded-[22px] p-8 text-center flex flex-col items-center gap-2.5"
           style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}
         >
-          <Globe className="w-8 h-8" style={{ color: COLORS.textMuted }} />
-          <p className="font-jakarta font-semibold text-[15px]" style={{ color: COLORS.textPrimary }}>
-            No tunnel nodes match your filter
+          <Globe className="w-7 h-7" style={{ color: COLORS.textMuted }} />
+          <p className="font-jakarta font-semibold text-[14px]" style={{ color: COLORS.textPrimary }}>
+            No servers match your filter
           </p>
           <button
             type="button"
             onClick={() => openAddModal('uri')}
-            className="px-4 py-2 rounded-full text-[12.5px] font-semibold cursor-pointer"
+            className="px-4 py-1.5 rounded-full text-[12px] font-semibold cursor-pointer transition-colors duration-150 hover:bg-[#5C4341]"
             style={{ backgroundColor: COLORS.taupe, color: COLORS.textPrimary }}
           >
             + Add Tunnel Node
           </button>
         </div>
       ) : (
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5">
+        <div className="flex flex-col gap-2.5">
           {filteredNodes.map((node) => {
             const isActiveNode = node.id === activeNodeId;
             const isConnectedCard = isActiveNode && connectionStatus === 'connected';
             const isConnectingCard = isActiveNode && connectionStatus === 'connecting';
 
             return (
-              <motion.div
+              <div
                 key={node.id}
-                layout
-                whileHover={{ y: -1.5, borderColor: isActiveNode ? '#78504E' : '#453839' }}
-                transition={SPRING}
+                role="button"
+                tabIndex={0}
                 onClick={() => connectToNode(node.id)}
-                className="rounded-[24px] p-4 cursor-pointer flex flex-col justify-between gap-3 relative"
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') connectToNode(node.id);
+                }}
+                className="rounded-[20px] p-3.5 cursor-pointer flex flex-col justify-between gap-2.5 relative transition-colors duration-150 hover:border-[#684C4A]"
                 style={{
                   backgroundColor: isActiveNode ? COLORS.surfaceActive : COLORS.surface,
                   border: `1px solid ${isActiveNode ? COLORS.surfaceActiveBorder : COLORS.surfaceBorder}`,
                 }}
               >
                 <div className="flex items-start justify-between gap-2">
-                  <div className="flex items-center gap-3 min-w-0">
-                    <IspBadge node={node} size={40} isActive={isActiveNode} />
+                  <div className="flex items-center gap-2.5 min-w-0">
+                    <IspBadge node={node} size={36} isActive={isActiveNode} />
                     <div className="min-w-0">
-                      <div className="flex items-center gap-2 flex-wrap">
-                        <h3 className="font-jakarta font-bold text-[14.5px] truncate" style={{ color: COLORS.textPrimary }}>
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        <h3 className="font-jakarta font-bold text-[13.5px] truncate" style={{ color: COLORS.textPrimary }}>
                           {node.name}
                         </h3>
                         {isConnectedCard && (
                           <span
-                            className="px-2 py-0.5 rounded-full text-[9.5px] font-bold tracking-wider uppercase shrink-0"
+                            className="px-1.5 py-0.5 rounded-full text-[9px] font-bold tracking-wider uppercase shrink-0"
                             style={{ backgroundColor: COLORS.crimson, color: '#FFF1F1' }}
                           >
                             CONNECTED
@@ -2270,15 +2144,15 @@ function ServersScreen() {
                         )}
                         {isConnectingCard && (
                           <span
-                            className="px-2 py-0.5 rounded-full text-[9.5px] font-bold tracking-wider uppercase shrink-0"
+                            className="px-1.5 py-0.5 rounded-full text-[9px] font-bold tracking-wider uppercase shrink-0"
                             style={{ backgroundColor: COLORS.amberBg, color: COLORS.amber }}
                           >
                             CONNECTING
                           </span>
                         )}
                       </div>
-                      <p className="text-[12px] truncate mt-0.5" style={{ color: isActiveNode ? '#D2B7B6' : COLORS.textMuted }}>
-                        {node.isp} — <span className="font-mono text-[11.5px]">{node.sni}</span>
+                      <p className="text-[11px] truncate mt-0.5" style={{ color: isActiveNode ? '#D2B7B6' : COLORS.textMuted }}>
+                        {node.isp} — <span className="font-mono text-[10.5px]">{node.sni}</span>
                       </p>
                     </div>
                   </div>
@@ -2288,10 +2162,10 @@ function ServersScreen() {
                       type="button"
                       onClick={() => toggleStarNode(node.id)}
                       title={node.starred ? 'Unstar node' : 'Star node'}
-                      className="w-8 h-8 rounded-full flex items-center justify-center cursor-pointer transition-colors hover:bg-black/20"
+                      className="w-7 h-7 rounded-full flex items-center justify-center cursor-pointer transition-colors hover:bg-black/20"
                     >
                       <Star
-                        className="w-4 h-4"
+                        className="w-3.5 h-3.5"
                         fill={node.starred ? COLORS.amber : 'none'}
                         style={{ color: node.starred ? COLORS.amber : COLORS.textMuted }}
                       />
@@ -2301,20 +2175,20 @@ function ServersScreen() {
                       type="button"
                       onClick={() => setOpenMenuId(openMenuId === node.id ? null : node.id)}
                       title="Node options"
-                      className="w-8 h-8 rounded-full flex items-center justify-center cursor-pointer transition-colors hover:bg-black/20"
+                      className="w-7 h-7 rounded-full flex items-center justify-center cursor-pointer transition-colors hover:bg-black/20"
                       style={{ color: COLORS.textMuted }}
                     >
-                      <MoreVertical className="w-4 h-4" />
+                      <MoreVertical className="w-3.5 h-3.5" />
                     </button>
 
                     <AnimatePresence>
                       {openMenuId === node.id && (
                         <motion.div
-                          initial={{ opacity: 0, scale: 0.94, y: -4 }}
+                          initial={{ opacity: 0, scale: 0.96, y: -4 }}
                           animate={{ opacity: 1, scale: 1, y: 0 }}
-                          exit={{ opacity: 0, scale: 0.94, y: -4 }}
-                          transition={{ duration: 0.14 }}
-                          className="absolute right-0 top-9 w-[154px] rounded-[16px] p-1.5 z-40 shadow-2xl"
+                          exit={{ opacity: 0, scale: 0.96, y: -4 }}
+                          transition={{ duration: 0.12 }}
+                          className="absolute right-0 top-8 w-[148px] rounded-[14px] p-1 z-40 shadow-2xl"
                           style={{ backgroundColor: '#231D1E', border: '1px solid #3D3132' }}
                         >
                           <button
@@ -2323,7 +2197,7 @@ function ServersScreen() {
                               setOpenMenuId(null);
                               setEditNodeModal(node);
                             }}
-                            className="w-full px-2.5 py-2 rounded-[10px] text-[12px] font-medium flex items-center gap-2.5 cursor-pointer hover:bg-[#312829]"
+                            className="w-full px-2.5 py-1.5 rounded-[9px] text-[11.5px] font-medium flex items-center gap-2 cursor-pointer hover:bg-[#312829]"
                             style={{ color: COLORS.textPrimary }}
                           >
                             <Edit3 className="w-3.5 h-3.5" style={{ color: COLORS.textMuted }} />
@@ -2335,7 +2209,7 @@ function ServersScreen() {
                               setOpenMenuId(null);
                               setShareNodeModal(node);
                             }}
-                            className="w-full px-2.5 py-2 rounded-[10px] text-[12px] font-medium flex items-center gap-2.5 cursor-pointer hover:bg-[#312829]"
+                            className="w-full px-2.5 py-1.5 rounded-[9px] text-[11.5px] font-medium flex items-center gap-2 cursor-pointer hover:bg-[#312829]"
                             style={{ color: COLORS.textPrimary }}
                           >
                             <Share2 className="w-3.5 h-3.5" style={{ color: COLORS.amber }} />
@@ -2348,7 +2222,7 @@ function ServersScreen() {
                               await copyClipboard(node.uri);
                               pushToast(`Copied URI for ${node.name}`, 'success');
                             }}
-                            className="w-full px-2.5 py-2 rounded-[10px] text-[12px] font-medium flex items-center gap-2.5 cursor-pointer hover:bg-[#312829]"
+                            className="w-full px-2.5 py-1.5 rounded-[9px] text-[11.5px] font-medium flex items-center gap-2 cursor-pointer hover:bg-[#312829]"
                             style={{ color: COLORS.textPrimary }}
                           >
                             <Copy className="w-3.5 h-3.5" style={{ color: COLORS.textMuted }} />
@@ -2361,7 +2235,7 @@ function ServersScreen() {
                               setOpenMenuId(null);
                               deleteNode(node.id);
                             }}
-                            className="w-full px-2.5 py-2 rounded-[10px] text-[12px] font-medium flex items-center gap-2.5 cursor-pointer hover:bg-[#3F1B1D]"
+                            className="w-full px-2.5 py-1.5 rounded-[9px] text-[11.5px] font-medium flex items-center gap-2 cursor-pointer hover:bg-[#3F1B1D]"
                             style={{ color: COLORS.coral }}
                           >
                             <Trash2 className="w-3.5 h-3.5" />
@@ -2374,13 +2248,11 @@ function ServersScreen() {
                 </div>
 
                 <div className="flex flex-wrap items-center gap-1.5">
-                  <motion.button
+                  <button
                     type="button"
                     onClick={(e) => handleSinglePing(e, node.id)}
-                    animate={testingAllPings ? { opacity: [0.45, 1, 0.45] } : { opacity: 1 }}
-                    transition={testingAllPings ? { repeat: Infinity, duration: 0.7 } : {}}
-                    title="Click to test node latency"
-                    className="px-2.5 py-0.5 rounded-[8px] font-mono tabular-nums text-[11.5px] font-semibold cursor-pointer"
+                    title="Click to test real node latency"
+                    className="px-2 py-0.5 rounded-[7px] font-mono tabular-nums text-[11px] font-semibold cursor-pointer transition-colors duration-150 hover:opacity-90"
                     style={{
                       backgroundColor: COLORS.amberBg,
                       color: node.online || node.ping != null ? COLORS.amber : COLORS.textMuted,
@@ -2392,10 +2264,10 @@ function ServersScreen() {
                       ? `${node.ping}ms`
                       : node.online
                       ? 'Online'
-                      : 'Timeout / Ping'}
-                  </motion.button>
+                      : 'Ping'}
+                  </button>
                   <span
-                    className="px-2.5 py-0.5 rounded-[8px] text-[11px] font-medium"
+                    className="px-2 py-0.5 rounded-[7px] text-[10.5px] font-medium"
                     style={{
                       backgroundColor: isActiveNode ? '#2A1C1C' : '#151213',
                       border: `1px solid ${isActiveNode ? '#523837' : '#2A2324'}`,
@@ -2406,7 +2278,7 @@ function ServersScreen() {
                   </span>
                   {node.vcn && (
                     <span
-                      className="px-2 py-0.5 rounded-[8px] font-mono text-[10.5px] font-bold"
+                      className="px-2 py-0.5 rounded-[7px] font-mono text-[10px] font-bold"
                       style={{ backgroundColor: COLORS.amberBg, color: COLORS.amber }}
                     >
                       VCN
@@ -2415,19 +2287,23 @@ function ServersScreen() {
                 </div>
 
                 <div>
-                  <div className="flex items-center justify-between text-[10.5px] font-mono tabular-nums mb-0.5">
-                    <span style={{ color: isActiveNode ? '#CCB1B0' : COLORS.textMuted }}>Quota Usage</span>
+                  <div className="flex items-center justify-between text-[10px] font-mono tabular-nums mb-0.5">
+                    <span style={{ color: isActiveNode ? '#CCB1B0' : COLORS.textMuted }}>
+                      {node.quotaTotalGB > 0 ? 'Quota Usage' : 'Traffic Used'}
+                    </span>
                     <span style={{ color: COLORS.textPrimary }}>
-                      {(node.quotaUsedGB || 0).toFixed(1)} / {node.quotaTotalGB || 100} GB
+                      {node.quotaTotalGB > 0
+                        ? `${formatUsageData(node.quotaUsedGB || 0)} / ${node.quotaTotalGB.toFixed(1)} GB`
+                        : `${formatUsageData(node.quotaUsedGB || 0)} • Unmetered`}
                     </span>
                   </div>
                   <WavyQuotaBar
                     usedGB={node.quotaUsedGB || 0}
-                    totalGB={node.quotaTotalGB || 100}
+                    totalGB={node.quotaTotalGB || 0}
                     isConnectedCard={isActiveNode}
                   />
                 </div>
-              </motion.div>
+              </div>
             );
           })}
         </div>
@@ -2451,6 +2327,7 @@ function SpeedScreen() {
     speedTestProgress,
     downHistory,
     upHistory,
+    totalSessionBytes,
     connectionStatus,
     pushToast,
   } = useMetro();
@@ -2465,7 +2342,7 @@ function SpeedScreen() {
 
   const [phase, setPhase] = useState('ready');
   const [gaugeSpeed, setGaugeSpeed] = useState(0);
-  const [gaugeFraction, setGaugeFraction] = useState(0);
+  const [gaugeFraction, setGaugeFraction] = useState(0.06);
   const [metrics, setMetrics] = useState({
     ping: testNode?.ping ?? 0,
     jitter: 0,
@@ -2473,9 +2350,8 @@ function SpeedScreen() {
     upload: 0,
   });
 
-  const [bars, setBars] = useState(() => Array.from({ length: 22 }, (_, i) => 16 + ((i * 11) % 30)));
+  const [bars, setBars] = useState(() => Array(22).fill(12));
 
-  // Drive Speed screen directly from live backend speedtest://progress events
   useEffect(() => {
     if (!speedTestProgress) return;
     setPhase(speedTestProgress.phase);
@@ -2492,24 +2368,40 @@ function SpeedScreen() {
     }));
   }, [speedTestProgress]);
 
-  // Drive 22 telemetry equalizer bars from real throughput + speed test activity
+  const latestDownMbps = downHistory[downHistory.length - 1] || 0;
+  const latestUpMbps = upHistory[upHistory.length - 1] || 0;
+  const liveThroughputRef = useRef({ mbps: 0, active: false });
   useEffect(() => {
-    const latestMbps = Math.max(
-      downHistory[downHistory.length - 1] || 0,
-      upHistory[upHistory.length - 1] || 0,
-      speedTestActive ? gaugeSpeed : 0
-    );
-    const scale = Math.min(1, latestMbps / 50);
-    setBars((prev) =>
-      prev.map((_, idx) => {
-        if (connectionStatus !== 'connected' && !speedTestActive) {
-          return 12 + ((idx * 5) % 10);
+    liveThroughputRef.current = {
+      mbps: speedTestActive ? gaugeSpeed : latestDownMbps + latestUpMbps,
+      active: connectionStatus === 'connected' || speedTestActive,
+    };
+  }, [latestDownMbps, latestUpMbps, speedTestActive, gaugeSpeed, connectionStatus]);
+
+  // Rolling 22-bar live telemetry ring fed every 350ms from real Xray throughput
+  useEffect(() => {
+    const tick = () => {
+      const { mbps, active } = liveThroughputRef.current;
+      let nextHeight = 10;
+      if (active) {
+        if (mbps > 0.002) {
+          // Logarithmic scaling so KB/s browsing AND 100+ Mbps speed tests both read clearly
+          const norm = Math.log10(1 + mbps * 25) / Math.log10(1 + 100 * 25);
+          nextHeight = Math.max(20, Math.min(96, Math.round(18 + norm * 78)));
+        } else {
+          nextHeight = 16;
         }
-        const wave = Math.abs(Math.sin(Date.now() / 240 + idx * 0.45));
-        return Math.max(14, Math.min(96, Math.round(18 + scale * 58 + wave * 22)));
-      })
-    );
-  }, [downHistory, upHistory, speedTestActive, gaugeSpeed, connectionStatus]);
+      }
+      setBars((prev) => [...prev.slice(1), nextHeight]);
+    };
+    tick();
+    const id = setInterval(tick, 350);
+    return () => clearInterval(id);
+  }, []);
+
+  const downReadout = formatThroughput(latestDownMbps);
+  const upReadout = formatThroughput(latestUpMbps);
+  const totalBytesGB = ((totalSessionBytes?.down || 0) + (totalSessionBytes?.up || 0)) / 1073741824;
 
   const startSpeedTest = async () => {
     if (speedTestActive || !testNode) return;
@@ -2558,69 +2450,72 @@ function SpeedScreen() {
 
   const trackArcPath = useMemo(() => generateSmoothArcPath(130, 130, 102, 135, 270), []);
   const wavyArcPath = useMemo(
-    () => generateWavyArcPath(130, 130, 102, gaugeFraction, 135, 270, 3.2, 22),
+    () => generateWavyArcPath(130, 130, 102, gaugeFraction, 135, 270, 3.0, 20),
     [gaugeFraction]
   );
 
   return (
     <motion.div
       key="screen-speed"
-      initial={{ opacity: 0, y: 8 }}
-      animate={{ opacity: 1, y: 0 }}
-      exit={{ opacity: 0, y: -6 }}
-      transition={SPRING_SOFT}
-      className="grid grid-cols-1 lg:grid-cols-12 gap-4 h-full items-start pb-2"
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      transition={{ duration: 0.14 }}
+      className="flex flex-col gap-2.5 pb-2"
     >
-      <div className="lg:col-span-6 flex flex-col gap-3.5">
-        <div
-          className="rounded-[22px] p-3.5 flex items-center justify-between gap-3 relative"
-          style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}
-        >
-          <div className="flex items-center gap-3 min-w-0">
-            <IspBadge node={testNode} size={42} isActive={Boolean(testNode)} />
-            <div className="min-w-0">
-              <div className="text-[10px] font-bold uppercase tracking-[0.12em]" style={{ color: COLORS.textMuted }}>
-                SELECTED TEST SERVER
-              </div>
-              <div className="font-jakarta font-bold text-[14px] truncate" style={{ color: COLORS.textPrimary }}>
-                {testNode?.name || 'No Server Selected'}
-              </div>
-              <div className="text-[11.5px] font-mono tabular-nums" style={{ color: COLORS.textMuted }}>
-                {testNode ? (
-                  <>
-                    {testNode.isp} • <span style={{ color: COLORS.amber }}>{testNode.ping != null ? `${testNode.ping} ms` : '— ms'}</span>
-                  </>
-                ) : (
-                  'Import a server to run speed test'
-                )}
-              </div>
+      {/* Server selector */}
+      <div
+        className="rounded-[18px] p-3 flex items-center justify-between gap-2 relative"
+        style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}
+      >
+        <div className="flex items-center gap-2.5 min-w-0">
+          <IspBadge node={testNode} size={36} isActive={Boolean(testNode)} />
+          <div className="min-w-0">
+            <div className="text-[9.5px] font-bold uppercase tracking-[0.1em]" style={{ color: COLORS.textMuted }}>
+              Test Server
+            </div>
+            <div className="font-jakarta font-bold text-[13px] truncate" style={{ color: COLORS.textPrimary }}>
+              {testNode?.name || 'No Server Selected'}
+            </div>
+            <div className="text-[11px] font-mono tabular-nums truncate" style={{ color: COLORS.textMuted }}>
+              {testNode ? (
+                <>
+                  {testNode.isp} • <span style={{ color: COLORS.amber }}>{testNode.ping != null ? `${testNode.ping} ms` : '— ms'}</span>
+                </>
+              ) : (
+                'Add a server to test speed'
+              )}
             </div>
           </div>
+        </div>
 
-          <div className="relative shrink-0">
-            <motion.button
-              whileHover={{ scale: 1.02 }}
-              whileTap={{ scale: 0.96 }}
-              transition={SPRING}
-              onClick={() => setServerDropdownOpen((o) => !o)}
-              className="h-[34px] px-3.5 rounded-full text-[12px] font-semibold flex items-center gap-1 cursor-pointer"
-              style={{ backgroundColor: COLORS.taupe, color: COLORS.textPrimary, border: '1px solid #634947' }}
-            >
-              <span>Change</span>
-              <ChevronRight className="w-3.5 h-3.5" />
-            </motion.button>
+        <div className="relative shrink-0">
+          <button
+            type="button"
+            onClick={() => setServerDropdownOpen((o) => !o)}
+            className="h-[30px] px-3 rounded-full text-[11.5px] font-semibold flex items-center gap-1 cursor-pointer transition-colors duration-150 hover:bg-[#5C4341]"
+            style={{ backgroundColor: COLORS.taupe, color: COLORS.textPrimary, border: '1px solid #634947' }}
+          >
+            <span>Change</span>
+            <ChevronRight className="w-3.5 h-3.5" />
+          </button>
 
-            <AnimatePresence>
-              {serverDropdownOpen && (
-                <motion.div
-                  initial={{ opacity: 0, y: -4, scale: 0.96 }}
-                  animate={{ opacity: 1, y: 0, scale: 1 }}
-                  exit={{ opacity: 0, y: -4, scale: 0.96 }}
-                  transition={{ duration: 0.14 }}
-                  className="absolute right-0 top-11 w-[250px] rounded-[18px] p-1.5 z-40 shadow-2xl"
-                  style={{ backgroundColor: '#231D1E', border: '1px solid #3D3132' }}
-                >
-                  {nodes.map((n) => (
+          <AnimatePresence>
+            {serverDropdownOpen && (
+              <motion.div
+                initial={{ opacity: 0, y: -4, scale: 0.96 }}
+                animate={{ opacity: 1, y: 0, scale: 1 }}
+                exit={{ opacity: 0, y: -4, scale: 0.96 }}
+                transition={{ duration: 0.12 }}
+                className="absolute right-0 top-9 w-[230px] max-h-[200px] overflow-y-auto custom-scrollbar rounded-[16px] p-1.5 z-40 shadow-2xl"
+                style={{ backgroundColor: '#231D1E', border: '1px solid #3D3132' }}
+              >
+                {nodes.length === 0 ? (
+                  <div className="px-3 py-2 text-[11px]" style={{ color: COLORS.textMuted }}>
+                    No servers imported yet
+                  </div>
+                ) : (
+                  nodes.map((n) => (
                     <button
                       key={n.id}
                       type="button"
@@ -2628,264 +2523,246 @@ function SpeedScreen() {
                         setSelectedTestNodeId(n.id);
                         setServerDropdownOpen(false);
                       }}
-                      className="w-full px-3 py-2 rounded-[12px] flex items-center justify-between text-left text-[12px] cursor-pointer hover:bg-[#312728]"
+                      className="w-full px-2.5 py-1.5 rounded-[10px] flex items-center justify-between text-left text-[11.5px] cursor-pointer hover:bg-[#312728]"
                       style={{
                         backgroundColor: n.id === testNode?.id ? COLORS.surfaceActive : 'transparent',
                         color: COLORS.textPrimary,
                       }}
                     >
                       <span className="truncate font-medium pr-2">{n.name}</span>
-                      <span className="font-mono tabular-nums text-[11px]" style={{ color: COLORS.amber }}>
+                      <span className="font-mono tabular-nums text-[10.5px]" style={{ color: COLORS.amber }}>
                         {n.ping != null ? `${n.ping}ms` : '—'}
                       </span>
                     </button>
-                  ))}
-                </motion.div>
-              )}
-            </AnimatePresence>
+                  ))
+                )}
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </div>
+      </div>
+
+      {/* Gauge + Test Button */}
+      <div
+        className="rounded-[22px] px-4 py-3.5 flex flex-col items-center justify-center relative"
+        style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}
+      >
+        <div className="relative w-[196px] h-[178px] flex items-center justify-center">
+          <svg viewBox="0 0 260 245" className="w-full h-full overflow-visible">
+            <path d={trackArcPath} fill="none" stroke="#2A2223" strokeWidth="8" strokeLinecap="round" />
+            {wavyArcPath && (
+              <path
+                d={wavyArcPath}
+                fill="none"
+                stroke={phase === 'upload' ? COLORS.amber : COLORS.coral}
+                strokeWidth="4.5"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+            )}
+          </svg>
+
+          <div className="absolute inset-0 flex flex-col items-center justify-center pt-3">
+            <span
+              className="px-2 py-0.5 rounded-full text-[9px] font-bold tracking-[0.1em] uppercase"
+              style={{
+                backgroundColor: speedTestActive ? COLORS.surfaceActive : '#262021',
+                border: `1px solid ${speedTestActive ? COLORS.surfaceActiveBorder : '#3A2F30'}`,
+                color: phase === 'upload' ? COLORS.amber : speedTestActive ? COLORS.coral : COLORS.textMuted,
+              }}
+            >
+              {statusPillLabel}
+            </span>
+            <div
+              className="mt-1.5 font-mono tabular-nums text-[38px] font-bold leading-none tracking-[-0.03em]"
+              style={{ color: COLORS.textPrimary }}
+            >
+              {gaugeSpeed.toFixed(1)}
+            </div>
+            <span className="mt-0.5 font-mono text-[11.5px] font-medium" style={{ color: COLORS.textMuted }}>
+              Mbps
+            </span>
           </div>
         </div>
 
-        <div
-          className="rounded-[28px] px-5 py-5 flex flex-col items-center justify-center relative"
-          style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}
+        <button
+          type="button"
+          onClick={startSpeedTest}
+          disabled={speedTestActive || !testNode}
+          className="-mt-1 h-[34px] px-5 rounded-full font-jakarta font-semibold text-[12.5px] flex items-center gap-2 cursor-pointer transition-colors duration-150 hover:bg-[#5C4341] disabled:opacity-60"
+          style={{ backgroundColor: COLORS.taupe, color: COLORS.textPrimary, border: '1px solid #674B49' }}
         >
-          <div className="relative w-[250px] h-[230px] flex items-center justify-center">
-            <svg viewBox="0 0 260 245" className="w-full h-full overflow-visible">
-              <path d={trackArcPath} fill="none" stroke="#2A2223" strokeWidth="8" strokeLinecap="round" />
-              {wavyArcPath && (
-                <motion.path
-                  d={wavyArcPath}
-                  fill="none"
-                  stroke={phase === 'upload' ? COLORS.amber : COLORS.coral}
-                  strokeWidth="4.5"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  initial={false}
-                />
-              )}
-            </svg>
+          <RefreshCw className={`w-3.5 h-3.5 ${speedTestActive ? 'animate-spin' : ''}`} />
+          <span>{speedTestActive ? 'Running Test...' : 'Run Speed Test'}</span>
+        </button>
+      </div>
 
-            <div className="absolute inset-0 flex flex-col items-center justify-center pt-4">
-              <span
-                className="px-2.5 py-0.5 rounded-full text-[10px] font-bold tracking-[0.11em] uppercase"
-                style={{
-                  backgroundColor: speedTestActive ? COLORS.surfaceActive : '#262021',
-                  border: `1px solid ${speedTestActive ? COLORS.surfaceActiveBorder : '#3A2F30'}`,
-                  color: phase === 'upload' ? COLORS.amber : speedTestActive ? COLORS.coral : COLORS.textMuted,
-                }}
-              >
-                {statusPillLabel}
-              </span>
-              <div
-                className="mt-2 font-mono tabular-nums text-[48px] font-bold leading-none tracking-[-0.03em]"
-                style={{ color: COLORS.textPrimary }}
-              >
-                {gaugeSpeed.toFixed(1)}
-              </div>
-              <span className="mt-1 font-mono text-[13px] font-medium" style={{ color: COLORS.textMuted }}>
-                Mbps
-              </span>
-            </div>
+      {/* 4 Compact Stat Cards */}
+      <div className="grid grid-cols-4 gap-2">
+        <div className="rounded-[14px] p-2.5" style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}>
+          <span className="text-[9px] font-bold uppercase tracking-wider block" style={{ color: COLORS.textMuted }}>
+            Ping
+          </span>
+          <div className="mt-1 font-mono tabular-nums text-[15px] font-bold leading-none" style={{ color: COLORS.textPrimary }}>
+            {metrics.ping}
+            <span className="text-[10px] font-medium ml-0.5" style={{ color: COLORS.amber }}>
+              ms
+            </span>
           </div>
-
-          <motion.button
-            whileHover={{ scale: 1.03 }}
-            whileTap={{ scale: 0.96 }}
-            transition={SPRING}
-            onClick={startSpeedTest}
-            disabled={speedTestActive}
-            className="-mt-2 h-[38px] px-6 rounded-full font-jakarta font-semibold text-[13px] flex items-center gap-2 cursor-pointer transition-colors disabled:opacity-70"
-            style={{ backgroundColor: COLORS.taupe, color: COLORS.textPrimary, border: '1px solid #674B49' }}
-            onMouseEnter={(e) => {
-              if (!speedTestActive) e.currentTarget.style.backgroundColor = COLORS.taupeHover;
-            }}
-            onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = COLORS.taupe)}
-          >
-            <RefreshCw className={`w-3.5 h-3.5 ${speedTestActive ? 'animate-spin' : ''}`} />
-            <span>{speedTestActive ? 'Running Test...' : 'Re-test'}</span>
-          </motion.button>
         </div>
 
-        <div className="grid grid-cols-2 gap-3">
-          <div className="rounded-[20px] p-3.5" style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}>
-            <span className="text-[10.5px] font-bold uppercase tracking-[0.1em]" style={{ color: COLORS.textMuted }}>
-              PING (ms)
+        <div className="rounded-[14px] p-2.5" style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}>
+          <span className="text-[9px] font-bold uppercase tracking-wider block" style={{ color: COLORS.textMuted }}>
+            Jitter
+          </span>
+          <div className="mt-1 font-mono tabular-nums text-[15px] font-bold leading-none" style={{ color: COLORS.textPrimary }}>
+            {metrics.jitter.toFixed(1)}
+            <span className="text-[10px] font-medium ml-0.5" style={{ color: COLORS.textMuted }}>
+              ms
             </span>
-            <div className="mt-1.5 font-mono tabular-nums text-[22px] font-bold leading-none" style={{ color: COLORS.textPrimary }}>
-              {metrics.ping}
-              <span className="text-[11.5px] font-medium ml-1" style={{ color: COLORS.amber }}>
-                ms
-              </span>
-            </div>
           </div>
+        </div>
 
-          <div className="rounded-[20px] p-3.5" style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}>
-            <span className="text-[10.5px] font-bold uppercase tracking-[0.1em]" style={{ color: COLORS.textMuted }}>
-              JITTER (ms)
-            </span>
-            <div className="mt-1.5 font-mono tabular-nums text-[22px] font-bold leading-none" style={{ color: COLORS.textPrimary }}>
-              {metrics.jitter.toFixed(1)}
-              <span className="text-[11.5px] font-medium ml-1" style={{ color: COLORS.textMuted }}>
-                ms
-              </span>
-            </div>
+        <div className="rounded-[14px] p-2.5" style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}>
+          <span className="text-[9px] font-bold uppercase tracking-wider block" style={{ color: COLORS.coral }}>
+            Down
+          </span>
+          <div className="mt-1 font-mono tabular-nums text-[15px] font-bold leading-none" style={{ color: COLORS.textPrimary }}>
+            {metrics.download.toFixed(1)}
           </div>
+        </div>
 
-          <div className="rounded-[20px] p-3.5" style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}>
-            <div className="flex items-center gap-1.5">
-              <span className="w-2 h-2 rounded-full" style={{ backgroundColor: COLORS.coral }} />
-              <span className="text-[10.5px] font-bold uppercase tracking-[0.1em]" style={{ color: COLORS.textMuted }}>
-                DOWNLOAD (Mbps)
-              </span>
-            </div>
-            <div className="mt-1.5 font-mono tabular-nums text-[22px] font-bold leading-none" style={{ color: COLORS.textPrimary }}>
-              {metrics.download.toFixed(1)}
-            </div>
-          </div>
-
-          <div className="rounded-[20px] p-3.5" style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}>
-            <div className="flex items-center gap-1.5">
-              <span className="w-2 h-2 rounded-full" style={{ backgroundColor: COLORS.amber }} />
-              <span className="text-[10.5px] font-bold uppercase tracking-[0.1em]" style={{ color: COLORS.textMuted }}>
-                UPLOAD (Mbps)
-              </span>
-            </div>
-            <div className="mt-1.5 font-mono tabular-nums text-[22px] font-bold leading-none" style={{ color: COLORS.textPrimary }}>
-              {metrics.upload.toFixed(1)}
-            </div>
+        <div className="rounded-[14px] p-2.5" style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}>
+          <span className="text-[9px] font-bold uppercase tracking-wider block" style={{ color: COLORS.amber }}>
+            Up
+          </span>
+          <div className="mt-1 font-mono tabular-nums text-[15px] font-bold leading-none" style={{ color: COLORS.textPrimary }}>
+            {metrics.upload.toFixed(1)}
           </div>
         </div>
       </div>
 
-      <div className="lg:col-span-6 flex flex-col gap-3.5 h-full">
-        <div className="rounded-[24px] p-5 flex flex-col gap-4" style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}>
-          <div className="flex items-center justify-between gap-2">
-            <div className="flex items-center gap-2.5">
-              <motion.div
-                animate={{ scale: speedTestActive ? [1, 1.14, 1] : [1, 1.05, 1] }}
-                transition={{ repeat: Infinity, duration: speedTestActive ? 0.65 : 2.0 }}
-                className="w-8 h-8 rounded-[10px] flex items-center justify-center"
-                style={{ backgroundColor: '#361A1C', color: COLORS.coral }}
-              >
-                <Activity className="w-4 h-4" />
-              </motion.div>
-              <div>
-                <h3 className="font-jakarta font-bold text-[14.5px]" style={{ color: COLORS.textPrimary }}>
-                  Realtime Telemetry Stream
-                </h3>
-                <p className="text-[11px]" style={{ color: COLORS.textMuted }}>
-                  {speedTestActive ? 'High-frequency packet burst capture' : 'Live Xray socket cadence'}
-                </p>
-              </div>
-            </div>
-
-            <span
-              className="px-2.5 py-1 rounded-full font-mono text-[11px] font-semibold"
-              style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}`, color: COLORS.amber }}
+      {/* Live Rolling Telemetry Stream */}
+      <div className="rounded-[20px] p-3.5 flex flex-col gap-2.5" style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}>
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2 min-w-0">
+            <div
+              className="w-7 h-7 rounded-[9px] flex items-center justify-center shrink-0"
+              style={{ backgroundColor: '#361A1C', color: COLORS.coral }}
             >
-              TCP / Xray
-            </span>
+              <Activity className="w-3.5 h-3.5" />
+            </div>
+            <div className="min-w-0">
+              <h3 className="font-jakarta font-bold text-[13px] truncate" style={{ color: COLORS.textPrimary }}>
+                Realtime Telemetry Stream
+              </h3>
+              <p className="text-[10.5px] font-mono tabular-nums truncate" style={{ color: COLORS.textMuted }}>
+                ↓ {downReadout.value} {downReadout.unit} • ↑ {upReadout.value} {upReadout.unit} • Session {formatUsageData(totalBytesGB)}
+              </p>
+            </div>
           </div>
 
-          <div
-            className="h-[104px] rounded-[18px] px-4 py-3 flex items-center justify-between gap-1.5"
-            style={{ backgroundColor: COLORS.obsidian, border: '1px solid #262021' }}
+          <span
+            className="px-2 py-0.5 rounded-full font-mono text-[10px] font-semibold shrink-0 inline-flex items-center gap-1"
+            style={{
+              backgroundColor: COLORS.obsidian,
+              border: `1px solid ${COLORS.surfaceBorder}`,
+              color: connectionStatus === 'connected' || speedTestActive ? COLORS.mint : COLORS.textMuted,
+            }}
           >
-            {bars.map((pct, idx) => {
-              const isCoral = idx % 2 === 0;
-              return (
-                <motion.div
-                  key={idx}
-                  animate={{ height: `${pct}%` }}
-                  transition={{ type: 'spring', stiffness: 280, damping: 22 }}
-                  className="flex-1 max-w-[9px] rounded-full"
-                  style={{
-                    backgroundColor: isCoral ? COLORS.coral : COLORS.amber,
-                    opacity: speedTestActive ? 0.96 : 0.84,
-                  }}
-                />
-              );
-            })}
-          </div>
+            <span
+              className="w-1.5 h-1.5 rounded-full"
+              style={{ backgroundColor: connectionStatus === 'connected' || speedTestActive ? COLORS.mint : '#7B6D6E' }}
+            />
+            {speedTestActive ? 'Benchmark' : connectionStatus === 'connected' ? 'Live' : 'Idle'}
+          </span>
         </div>
 
         <div
-          className="rounded-[24px] p-5 flex flex-col flex-1 min-h-[296px]"
-          style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}
+          className="h-[64px] rounded-[14px] px-3 py-2 flex items-end justify-between gap-1"
+          style={{ backgroundColor: COLORS.obsidian, border: '1px solid #262021' }}
         >
-          <div className="flex items-center justify-between gap-2 mb-3.5">
-            <div className="flex items-center gap-2">
-              <h3 className="font-jakarta font-bold text-[14.5px]" style={{ color: COLORS.textPrimary }}>
-                Recent Test History
-              </h3>
-              <span
-                className="px-2 py-0.5 rounded-full text-[10.5px] font-semibold"
-                style={{ backgroundColor: '#272122', color: COLORS.textMuted }}
-              >
-                Last 10 Tests
-              </span>
-            </div>
-            {speedHistory.length > 0 && (
-              <button
-                type="button"
-                onClick={clearSpeedHistory}
-                className="text-[12px] font-semibold cursor-pointer hover:underline"
-                style={{ color: COLORS.coral }}
-              >
-                Clear
-              </button>
-            )}
+          {bars.map((pct, idx) => {
+            const isCoral = idx % 2 === 0;
+            return (
+              <div
+                key={idx}
+                className="flex-1 rounded-full transition-all duration-200"
+                style={{
+                  height: `${pct}%`,
+                  backgroundColor: isCoral ? COLORS.coral : COLORS.amber,
+                  opacity: connectionStatus === 'connected' || speedTestActive ? 0.92 : 0.35,
+                }}
+              />
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Recent History */}
+      <div
+        className="rounded-[20px] p-3.5 flex flex-col"
+        style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}
+      >
+        <div className="flex items-center justify-between gap-2 mb-2.5">
+          <div className="flex items-center gap-2">
+            <h3 className="font-jakarta font-bold text-[13px]" style={{ color: COLORS.textPrimary }}>
+              Recent Tests
+            </h3>
+            <span
+              className="px-2 py-0.5 rounded-full text-[10px] font-semibold"
+              style={{ backgroundColor: '#272122', color: COLORS.textMuted }}
+            >
+              {speedHistory.length}
+            </span>
           </div>
-
-          {speedHistory.length === 0 ? (
-            <div className="flex-1 flex flex-col items-center justify-center text-center py-8 gap-2">
-              <Gauge className="w-7 h-7" style={{ color: COLORS.textMuted }} />
-              <p className="text-[13px] font-medium" style={{ color: COLORS.textMuted }}>
-                No speed tests recorded yet. Click Re-test to benchmark via Cloudflare.
-              </p>
-            </div>
-          ) : (
-            <div className="flex flex-col gap-2.5 overflow-y-auto max-h-[280px] pr-1 custom-scrollbar">
-              {speedHistory.map((item) => (
-                <motion.div
-                  key={item.id}
-                  layout
-                  initial={{ opacity: 0, y: -6 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  className="rounded-[18px] px-3.5 py-3 flex items-center justify-between gap-3"
-                  style={{ backgroundColor: '#161314', border: '1px solid #282122' }}
-                >
-                  <div className="flex items-center gap-3 min-w-0">
-                    <div
-                      className="w-8 h-8 rounded-[10px] flex items-center justify-center shrink-0"
-                      style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}`, color: COLORS.textMuted }}
-                    >
-                      <Gauge className="w-4 h-4" />
-                    </div>
-                    <div className="min-w-0">
-                      <div className="text-[13px] font-semibold truncate" style={{ color: COLORS.textPrimary }}>
-                        {item.serverName}
-                      </div>
-                      <div className="text-[11px] font-mono tabular-nums mt-0.5" style={{ color: COLORS.textMuted }}>
-                        {item.timestamp} • <span style={{ color: COLORS.amber }}>{item.ping}ms</span>
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="text-right font-mono tabular-nums shrink-0">
-                    <div className="text-[12.5px] font-bold" style={{ color: COLORS.coral }}>
-                      ↓ {item.download.toFixed(1)}
-                    </div>
-                    <div className="text-[11.5px] font-semibold" style={{ color: COLORS.amber }}>
-                      ↑ {item.upload.toFixed(1)} Mbps
-                    </div>
-                  </div>
-                </motion.div>
-              ))}
-            </div>
+          {speedHistory.length > 0 && (
+            <button
+              type="button"
+              onClick={clearSpeedHistory}
+              className="text-[11px] font-semibold cursor-pointer hover:underline"
+              style={{ color: COLORS.coral }}
+            >
+              Clear
+            </button>
           )}
         </div>
+
+        {speedHistory.length === 0 ? (
+          <div className="text-center py-4">
+            <p className="text-[11.5px]" style={{ color: COLORS.textMuted }}>
+              No speed tests recorded yet.
+            </p>
+          </div>
+        ) : (
+          <div className="flex flex-col gap-2">
+            {speedHistory.slice(0, 5).map((item) => (
+              <div
+                key={item.id}
+                className="rounded-[14px] px-3 py-2 flex items-center justify-between gap-2"
+                style={{ backgroundColor: '#161314', border: '1px solid #282122' }}
+              >
+                <div className="min-w-0">
+                  <div className="text-[12px] font-semibold truncate" style={{ color: COLORS.textPrimary }}>
+                    {item.serverName}
+                  </div>
+                  <div className="text-[10.5px] font-mono tabular-nums" style={{ color: COLORS.textMuted }}>
+                    {item.timestamp} • <span style={{ color: COLORS.amber }}>{item.ping}ms</span>
+                  </div>
+                </div>
+
+                <div className="text-right font-mono tabular-nums shrink-0 text-[11px]">
+                  <div className="font-bold" style={{ color: COLORS.coral }}>
+                    ↓ {item.download.toFixed(1)} Mbps
+                  </div>
+                  <div className="font-semibold" style={{ color: COLORS.amber }}>
+                    ↑ {item.upload.toFixed(1)} Mbps
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
     </motion.div>
   );
@@ -2917,21 +2794,10 @@ function SectionHeader({ title, badge }) {
 }
 
 const SETTINGS_TABS = [
-  { id: 'general', label: 'General & Proxy', badge: 'INBOUND' },
-  { id: 'tun', label: 'TUN & Routing', badge: 'TRAFFIC' },
-  { id: 'security', label: 'DNS & Security', badge: 'CORE' },
-  { id: 'subs', label: 'Subs & Speed', badge: 'TOOLS' },
-  { id: 'about', label: 'About & Guide', badge: 'v2.5' },
+  { id: 'general', label: 'General' },
+  { id: 'tun', label: 'TUN & DNS' },
+  { id: 'about', label: 'About & Guide' },
 ];
-
-const ROUTING_MODES = [
-  { id: 'rule', label: 'Rule-Based', desc: 'Bypass LAN & private CIDRs' },
-  { id: 'global', label: 'Global Proxy', desc: 'Tunnel all IPv4 traffic' },
-  { id: 'direct', label: 'Direct', desc: 'Bypass tunnel cleanly' },
-];
-
-const UTLS_FINGERPRINTS = ['chrome', 'firefox', 'safari', 'ios', 'edge', 'randomized'];
-const LOG_LEVELS = ['warning', 'info', 'debug', 'error'];
 
 function SettingsScreen() {
   const {
@@ -2940,69 +2806,48 @@ function SettingsScreen() {
     applySettingsAndReconnect,
     resetSettingsToDefault,
     persistSettingsPatch,
+    systemMode,
+    setSystemMode,
     lanProxySharing,
     setLanProxySharing,
     localLanIp,
     setLocalLanIp,
     socksPort,
     httpPort,
-    udpEnabled,
-    sniffingEnabled,
-    sniffingRouteOnly,
-    systemProxyExceptions,
     autoConnectOnLaunch,
     closeToTray,
-    routingMode,
     tunnelProfile,
     setTunnelProfile,
-    fragmentPackets,
-    fragmentLength,
-    fragmentInterval,
     splitTunneling,
     setSplitTunneling,
     windowsApps,
     setAppsModalOpen,
     bypassLan,
     setBypassLan,
-    ipv6Enabled,
-    tunStrictRoute,
-    tunExcludeCidrs,
     dnsResolver,
     setDnsResolver,
     customDohUrl,
     setCustomDohUrl,
-    bootstrapDns,
     mtu,
     setMtu,
     certPinning,
     setCertPinning,
-    allowInsecureFallback,
-    defaultFingerprint,
-    muxEnabled,
-    muxConcurrency,
-    logLevel,
     startWithWindows,
     setStartWithWindows,
-    savedSubscriptions,
-    subUseProxy,
-    subClearBeforeUpdate,
-    syncAllSubscriptions,
-    latencyMode,
-    latencyTestUrl,
     checkForUpdates,
     checkingUpdate,
     updateInfo,
     setLogsDrawerOpen,
     setOnboardingOpen,
-    openAddModal,
+    settingsTab,
+    setSettingsTab,
     appendLog,
     pushToast,
   } = useMetro();
 
-  const [activeTab, setActiveTab] = useState('general');
   const [refreshingIp, setRefreshingIp] = useState(false);
-  const [syncingSubs, setSyncingSubs] = useState(false);
   const bypassedCount = windowsApps.filter((a) => a.bypassed).length;
+  const activeTab = SETTINGS_TABS.some((t) => t.id === settingsTab) ? settingsTab : 'general';
 
   const handleRefreshIp = async () => {
     if (refreshingIp) return;
@@ -3022,31 +2867,21 @@ function SettingsScreen() {
   const handleCopyProxy = async (port) => {
     const proxy = `${localLanIp}:${port}`;
     await copyClipboard(proxy);
-    pushToast(`Copied LAN proxy address ${proxy}`, 'success');
-  };
-
-  const handleSyncAllSubs = async () => {
-    if (syncingSubs) return;
-    setSyncingSubs(true);
-    try {
-      await syncAllSubscriptions();
-    } finally {
-      setSyncingSubs(false);
-    }
+    pushToast(`Copied LAN proxy ${proxy}`, 'success');
   };
 
   return (
     <motion.div
       key="screen-settings"
-      initial={{ opacity: 0, y: 8 }}
-      animate={{ opacity: 1, y: 0 }}
-      exit={{ opacity: 0, y: -6 }}
-      transition={SPRING_SOFT}
-      className="max-w-[900px] mx-auto flex flex-col gap-4 pb-6"
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      transition={{ duration: 0.14 }}
+      className="flex flex-col gap-3 pb-4"
     >
-      {/* Tab Bar (Inspired by v2rayN OptionSettingWindow & nekoray BasicSettings) */}
+      {/* Clean 3-Tab Switcher */}
       <div
-        className="rounded-[20px] p-1.5 grid grid-cols-2 sm:grid-cols-5 gap-1.5 sticky top-0 z-20"
+        className="rounded-[16px] p-1 grid grid-cols-3 gap-1 sticky top-0 z-20"
         style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}
       >
         {SETTINGS_TABS.map((t) => {
@@ -3055,8 +2890,8 @@ function SettingsScreen() {
             <button
               key={t.id}
               type="button"
-              onClick={() => setActiveTab(t.id)}
-              className="py-2 px-2.5 rounded-[14px] text-[12px] font-semibold flex items-center justify-center gap-1.5 cursor-pointer transition-colors"
+              onClick={() => setSettingsTab(t.id)}
+              className="py-1.5 px-2 rounded-[12px] text-[12px] font-semibold flex items-center justify-center cursor-pointer transition-colors duration-150"
               style={{
                 backgroundColor: active ? COLORS.crimson : 'transparent',
                 color: active ? COLORS.textPrimary : COLORS.textMuted,
@@ -3069,991 +2904,510 @@ function SettingsScreen() {
         })}
       </div>
 
-      {/* Pending Reconnect Banner when connected & tunnel settings changed */}
-      <AnimatePresence>
-        {settingsNeedsReconnect && connectionStatus === 'connected' && (
-          <motion.div
-            initial={{ opacity: 0, y: -6 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: -6 }}
-            className="rounded-[18px] px-4 py-3 flex flex-wrap items-center justify-between gap-3"
-            style={{ backgroundColor: '#3A2F1B', border: '1px solid #6E562C' }}
+      {/* Pending Reconnect Banner */}
+      {settingsNeedsReconnect && connectionStatus === 'connected' && (
+        <div
+          className="rounded-[16px] px-3.5 py-2.5 flex items-center justify-between gap-2"
+          style={{ backgroundColor: '#3A2F1B', border: '1px solid #6E562C' }}
+        >
+          <div className="flex items-center gap-2 min-w-0">
+            <AlertCircle className="w-4 h-4 shrink-0" style={{ color: COLORS.amber }} />
+            <span className="text-[11.5px] font-medium truncate" style={{ color: COLORS.textPrimary }}>
+              Reconnect tunnel to apply changes
+            </span>
+          </div>
+          <button
+            type="button"
+            onClick={applySettingsAndReconnect}
+            className="h-[28px] px-3 rounded-full text-[11px] font-semibold cursor-pointer shrink-0"
+            style={{ backgroundColor: COLORS.crimson, color: COLORS.textPrimary, border: '1px solid #BC1F27' }}
           >
-            <div className="flex items-center gap-2.5 min-w-0">
-              <AlertCircle className="w-4 h-4 shrink-0" style={{ color: COLORS.amber }} />
-              <span className="text-[12.5px] font-medium" style={{ color: COLORS.textPrimary }}>
-                Settings saved. Reconnect active tunnel to apply new Xray / routing configuration.
+            Reconnect
+          </button>
+        </div>
+      )}
+
+      {/* TAB 1: GENERAL */}
+      {activeTab === 'general' && (
+        <div className="flex flex-col gap-3">
+          {/* Tunneling Profile */}
+          <div className="rounded-[20px] p-3.5 flex flex-col gap-2.5" style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}>
+            <div className="flex items-center justify-between">
+              <span className="font-jakarta font-bold text-[13.5px]" style={{ color: COLORS.textPrimary }}>
+                Tunneling Profile
+              </span>
+              <span className="text-[10px] font-bold uppercase px-2 py-0.5 rounded-full" style={{ backgroundColor: COLORS.amberBg, color: COLORS.amber }}>
+                DPI Bypass
               </span>
             </div>
-            <button
-              type="button"
-              onClick={applySettingsAndReconnect}
-              className="h-[32px] px-4 rounded-full text-[12px] font-semibold cursor-pointer shrink-0"
-              style={{ backgroundColor: COLORS.crimson, color: COLORS.textPrimary, border: '1px solid #BC1F27' }}
-            >
-              Apply &amp; Reconnect
-            </button>
-          </motion.div>
-        )}
-      </AnimatePresence>
-
-      {/* TAB 1: GENERAL & PROXY */}
-      {activeTab === 'general' && (
-        <div className="flex flex-col gap-5">
-          <section>
-            <SectionHeader title="Local Inbound & System Proxy" badge="v2rayN / nekoray" />
-            <div className="rounded-[24px] p-5 flex flex-col gap-4" style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}>
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                <label className="flex flex-col gap-1.5">
-                  <span className="text-[12px] font-semibold" style={{ color: COLORS.textPrimary }}>
-                    Local SOCKS5 Listen Port
-                  </span>
-                  <input
-                    type="number"
-                    min={1024}
-                    max={65535}
-                    value={socksPort}
-                    onChange={(e) => {
-                      const v = Number(e.target.value);
-                      if (v >= 1024 && v <= 65535) persistSettingsPatch({ socksPort: v });
-                    }}
-                    className="h-[38px] rounded-[12px] px-3 font-mono text-[12.5px] focus:outline-none"
-                    style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}`, color: COLORS.textPrimary }}
-                  />
-                </label>
-
-                <label className="flex flex-col gap-1.5">
-                  <span className="text-[12px] font-semibold" style={{ color: COLORS.textPrimary }}>
-                    Local HTTP Listen Port
-                  </span>
-                  <input
-                    type="number"
-                    min={1024}
-                    max={65535}
-                    value={httpPort}
-                    onChange={(e) => {
-                      const v = Number(e.target.value);
-                      if (v >= 1024 && v <= 65535) persistSettingsPatch({ httpPort: v });
-                    }}
-                    className="h-[38px] rounded-[12px] px-3 font-mono text-[12.5px] focus:outline-none"
-                    style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}`, color: COLORS.textPrimary }}
-                  />
-                </label>
-              </div>
-
-              <div className="flex items-center justify-between gap-4 pt-2 border-t" style={{ borderColor: '#292223' }}>
-                <div>
-                  <div className="font-jakarta font-semibold text-[13.5px]" style={{ color: COLORS.textPrimary }}>
-                    Enable UDP Relay on SOCKS5
-                  </div>
-                  <div className="text-[11.5px]" style={{ color: COLORS.textMuted }}>
-                    Required for QUIC, gaming, VoIP, and full-cone UDP tunneling
-                  </div>
-                </div>
-                <M3ExpressiveSwitch
-                  checked={udpEnabled}
-                  onChange={(v) => persistSettingsPatch({ udpEnabled: v })}
-                  ariaLabel="Toggle UDP Relay"
-                />
-              </div>
-
-              <div className="flex items-center justify-between gap-4 pt-2 border-t" style={{ borderColor: '#292223' }}>
-                <div>
-                  <div className="font-jakarta font-semibold text-[13.5px]" style={{ color: COLORS.textPrimary }}>
-                    Traffic Sniffing (HTTP / TLS / QUIC)
-                  </div>
-                  <div className="text-[11.5px]" style={{ color: COLORS.textMuted }}>
-                    Inspect SNI/Host headers so domain routing &amp; VCN matching stay accurate
-                  </div>
-                </div>
-                <M3ExpressiveSwitch
-                  checked={sniffingEnabled}
-                  onChange={(v) => persistSettingsPatch({ sniffingEnabled: v })}
-                  ariaLabel="Toggle Traffic Sniffing"
-                />
-              </div>
-
-              {sniffingEnabled && (
-                <div className="flex items-center justify-between gap-4 pt-2 border-t" style={{ borderColor: '#292223' }}>
-                  <div>
-                    <div className="font-jakarta font-semibold text-[13.5px]" style={{ color: COLORS.textPrimary }}>
-                      Sniffing Route Only
-                    </div>
-                    <div className="text-[11.5px]" style={{ color: COLORS.textMuted }}>
-                      Use sniffed domain strictly for routing without overriding dial target address
-                    </div>
-                  </div>
-                  <M3ExpressiveSwitch
-                    checked={sniffingRouteOnly}
-                    onChange={(v) => persistSettingsPatch({ sniffingRouteOnly: v })}
-                    ariaLabel="Toggle Route Only"
-                  />
-                </div>
-              )}
-
-              <div className="pt-2 border-t flex flex-col gap-1.5" style={{ borderColor: '#292223' }}>
-                <span className="text-[12px] font-semibold" style={{ color: COLORS.textPrimary }}>
-                  Windows System Proxy Bypass Exceptions (ProxyOverride)
-                </span>
-                <textarea
-                  rows={2}
-                  value={systemProxyExceptions}
-                  onChange={(e) => persistSettingsPatch({ systemProxyExceptions: e.target.value })}
-                  className="w-full rounded-[12px] p-2.5 font-mono text-[11px] resize-none focus:outline-none"
-                  style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}`, color: COLORS.textPrimary }}
-                />
-              </div>
-            </div>
-          </section>
-
-          <section>
-            <SectionHeader title="LAN & Hotspot Proxy Share" badge="NO ADMIN" />
-            <div className="rounded-[24px] p-5 flex flex-col gap-4" style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}>
-              <div className="flex items-center justify-between gap-4">
-                <div className="flex items-center gap-3.5 min-w-0">
-                  <div
-                    className="w-10 h-10 rounded-[14px] flex items-center justify-center shrink-0"
-                    style={{ backgroundColor: COLORS.surfaceActive, border: `1px solid ${COLORS.surfaceActiveBorder}`, color: COLORS.coral }}
-                  >
-                    <Wifi className="w-5 h-5" />
-                  </div>
-                  <div className="min-w-0">
-                    <div className="font-jakarta font-semibold text-[14px]" style={{ color: COLORS.textPrimary }}>
-                      LAN Proxy Sharing (Bind 0.0.0.0)
-                    </div>
-                    <div className="font-mono tabular-nums text-[12px] mt-0.5 truncate" style={{ color: lanProxySharing ? COLORS.mint : COLORS.textMuted }}>
-                      {localLanIp}:{socksPort || 10808} (SOCKS5) / :{httpPort || 10809} (HTTP)
-                    </div>
-                  </div>
-                </div>
-                <M3ExpressiveSwitch
-                  checked={lanProxySharing}
-                  onChange={(v) => {
-                    setLanProxySharing(v);
-                    pushToast(v ? `LAN Proxy enabled (${localLanIp}:${socksPort})` : 'LAN Proxy bound to localhost only', 'neutral');
-                  }}
-                  ariaLabel="Toggle LAN Proxy Sharing"
-                />
-              </div>
-
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
-                <button
-                  type="button"
-                  onClick={handleRefreshIp}
-                  className="h-[38px] rounded-[14px] text-[12px] font-semibold flex items-center justify-center gap-2 cursor-pointer hover:bg-[#262021]"
-                  style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}`, color: COLORS.textPrimary }}
-                >
-                  <RefreshCw className={`w-3.5 h-3.5 ${refreshingIp ? 'animate-spin' : ''}`} />
-                  <span>{refreshingIp ? 'Scanning...' : 'Scan LAN IP'}</span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => handleCopyProxy(socksPort || 10808)}
-                  className="h-[38px] rounded-[14px] text-[12px] font-semibold flex items-center justify-center gap-2 cursor-pointer"
-                  style={{ backgroundColor: COLORS.taupe, border: '1px solid #634947', color: COLORS.textPrimary }}
-                >
-                  <Copy className="w-3.5 h-3.5" />
-                  <span>Copy SOCKS5 :{socksPort || 10808}</span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => handleCopyProxy(httpPort || 10809)}
-                  className="h-[38px] rounded-[14px] text-[12px] font-semibold flex items-center justify-center gap-2 cursor-pointer"
-                  style={{ backgroundColor: COLORS.taupe, border: '1px solid #634947', color: COLORS.textPrimary }}
-                >
-                  <Copy className="w-3.5 h-3.5" />
-                  <span>Copy HTTP :{httpPort || 10809}</span>
-                </button>
-              </div>
-            </div>
-          </section>
-
-          <section>
-            <SectionHeader title="Startup & Window Behavior" badge="WINDOWS 11" />
-            <div className="rounded-[24px] px-5 py-2" style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}>
-              <div className="py-3.5 flex items-center justify-between gap-4 border-b" style={{ borderColor: '#292223' }}>
-                <div>
-                  <div className="font-jakarta font-semibold text-[13.5px]" style={{ color: COLORS.textPrimary }}>
-                    Start with Windows (Minimized to Tray)
-                  </div>
-                  <div className="text-[11.5px]" style={{ color: COLORS.textMuted }}>
-                    Launch silently in the Windows notification area at sign-in
-                  </div>
-                </div>
-                <M3ExpressiveSwitch checked={startWithWindows} onChange={setStartWithWindows} ariaLabel="Toggle Start with Windows" />
-              </div>
-
-              <div className="py-3.5 flex items-center justify-between gap-4 border-b" style={{ borderColor: '#292223' }}>
-                <div>
-                  <div className="font-jakarta font-semibold text-[13.5px]" style={{ color: COLORS.textPrimary }}>
-                    Auto-Connect Last Server on Launch
-                  </div>
-                  <div className="text-[11.5px]" style={{ color: COLORS.textMuted }}>
-                    Automatically dial the selected tunnel node when Metrovpn opens
-                  </div>
-                </div>
-                <M3ExpressiveSwitch
-                  checked={autoConnectOnLaunch}
-                  onChange={(v) => persistSettingsPatch({ autoConnectOnLaunch: v }, { affectsTunnel: false })}
-                  ariaLabel="Toggle Auto-Connect"
-                />
-              </div>
-
-              <div className="py-3.5 flex items-center justify-between gap-4">
-                <div>
-                  <div className="font-jakarta font-semibold text-[13.5px]" style={{ color: COLORS.textPrimary }}>
-                    Close Button Minimizes to System Tray
-                  </div>
-                  <div className="text-[11.5px]" style={{ color: COLORS.textMuted }}>
-                    Keep tunnel alive in background when closing window (use Tray Quit to exit)
-                  </div>
-                </div>
-                <M3ExpressiveSwitch
-                  checked={closeToTray}
-                  onChange={(v) => persistSettingsPatch({ closeToTray: v }, { affectsTunnel: false })}
-                  ariaLabel="Toggle Close to Tray"
-                />
-              </div>
-            </div>
-          </section>
-        </div>
-      )}
-
-      {/* TAB 2: TUN & ROUTING */}
-      {activeTab === 'tun' && (
-        <div className="flex flex-col gap-5">
-          <section>
-            <SectionHeader title="Routing Mode & Tunneling Profile" badge="XRAY + DPI" />
-            <div className="flex flex-col gap-3.5">
-              <div className="rounded-[24px] p-5" style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}>
-                <div className="mb-3">
-                  <div className="font-jakarta font-semibold text-[14px]" style={{ color: COLORS.textPrimary }}>
-                    Routing Mode
-                  </div>
-                  <div className="text-[11.5px]" style={{ color: COLORS.textMuted }}>
-                    Control whether LAN subnets, bypassed apps, or all traffic enter the proxy outbound
-                  </div>
-                </div>
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
-                  {ROUTING_MODES.map((rm) => {
-                    const selected = routingMode === rm.id;
-                    return (
-                      <button
-                        key={rm.id}
-                        type="button"
-                        onClick={() => persistSettingsPatch({ routingMode: rm.id })}
-                        className="rounded-[16px] p-3 text-left cursor-pointer transition-colors"
-                        style={{
-                          backgroundColor: selected ? COLORS.taupe : '#151213',
-                          border: `1px solid ${selected ? '#755452' : COLORS.surfaceBorder}`,
-                        }}
-                      >
-                        <div className="font-jakarta font-bold text-[13px]" style={{ color: COLORS.textPrimary }}>
-                          {rm.label}
-                        </div>
-                        <div className="text-[11px] mt-0.5" style={{ color: selected ? '#E5D3D2' : COLORS.textMuted }}>
-                          {rm.desc}
-                        </div>
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-
-              <div className="rounded-[24px] p-5" style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}>
-                <div className="flex flex-wrap items-center justify-between gap-2 mb-3.5">
-                  <div>
-                    <div className="font-jakarta font-semibold text-[14.5px]" style={{ color: COLORS.textPrimary }}>
-                      Tunneling Profile
-                    </div>
-                    <div className="text-[12px] mt-0.5" style={{ color: COLORS.textMuted }}>
-                      Select underlying Xray TLS &amp; DPI fragmentation strategy
-                    </div>
-                  </div>
-                  <span className="px-3 py-1 rounded-full text-[11.5px] font-semibold" style={{ backgroundColor: COLORS.amberBg, color: COLORS.amber }}>
-                    {tunnelProfile} Active
-                  </span>
-                </div>
-
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
-                  {TUNNEL_PROFILES.map((prof) => {
-                    const selected = tunnelProfile === prof.id;
-                    return (
-                      <motion.button
-                        key={prof.id}
-                        type="button"
-                        whileHover={{ y: -1 }}
-                        whileTap={{ scale: 0.98 }}
-                        transition={SPRING}
-                        onClick={() => {
-                          setTunnelProfile(prof.id);
-                          pushToast(`Switched tunneling profile to ${prof.id}`, 'success');
-                        }}
-                        className="rounded-[18px] p-3.5 text-left cursor-pointer transition-colors flex flex-col justify-between"
-                        style={{
-                          backgroundColor: selected ? COLORS.crimson : '#151213',
-                          border: `1px solid ${selected ? '#C4232B' : COLORS.surfaceBorder}`,
-                        }}
-                      >
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="font-jakarta font-bold text-[13.5px]" style={{ color: COLORS.textPrimary }}>
-                            {prof.id}
-                          </span>
-                          <span
-                            className="text-[10px] font-semibold px-2 py-0.5 rounded-full"
-                            style={{
-                              backgroundColor: selected ? 'rgba(20, 17, 18, 0.36)' : '#251F20',
-                              color: selected ? '#FFE2E2' : COLORS.amber,
-                            }}
-                          >
-                            {prof.subtitle}
-                          </span>
-                        </div>
-                        <p className="text-[11.5px] mt-2" style={{ color: selected ? '#F2D2D2' : COLORS.textMuted }}>
-                          {prof.detail}
-                        </p>
-                      </motion.button>
-                    );
-                  })}
-                </div>
-
-                {tunnelProfile === 'TLS Frag' && (
-                  <div className="mt-4 pt-4 border-t grid grid-cols-1 sm:grid-cols-3 gap-3" style={{ borderColor: '#292223' }}>
-                    <label className="flex flex-col gap-1">
-                      <span className="text-[11px] font-semibold" style={{ color: COLORS.textMuted }}>
-                        Fragment Packets
-                      </span>
-                      <input
-                        type="text"
-                        value={fragmentPackets}
-                        onChange={(e) => persistSettingsPatch({ fragmentPackets: e.target.value })}
-                        placeholder="tlshello"
-                        className="h-[34px] rounded-[10px] px-2.5 font-mono text-[12px] focus:outline-none"
-                        style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}`, color: COLORS.textPrimary }}
-                      />
-                    </label>
-                    <label className="flex flex-col gap-1">
-                      <span className="text-[11px] font-semibold" style={{ color: COLORS.textMuted }}>
-                        Chunk Length (bytes)
-                      </span>
-                      <input
-                        type="text"
-                        value={fragmentLength}
-                        onChange={(e) => persistSettingsPatch({ fragmentLength: e.target.value })}
-                        placeholder="10-50"
-                        className="h-[34px] rounded-[10px] px-2.5 font-mono text-[12px] focus:outline-none"
-                        style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}`, color: COLORS.textPrimary }}
-                      />
-                    </label>
-                    <label className="flex flex-col gap-1">
-                      <span className="text-[11px] font-semibold" style={{ color: COLORS.textMuted }}>
-                        Interval (ms)
-                      </span>
-                      <input
-                        type="text"
-                        value={fragmentInterval}
-                        onChange={(e) => persistSettingsPatch({ fragmentInterval: e.target.value })}
-                        placeholder="10-20"
-                        className="h-[34px] rounded-[10px] px-2.5 font-mono text-[12px] focus:outline-none"
-                        style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}`, color: COLORS.textPrimary }}
-                      />
-                    </label>
-                  </div>
-                )}
-              </div>
-            </div>
-          </section>
-
-          <section>
-            <SectionHeader title="Wintun TUN & Split Tunneling" badge="ADAPTER" />
-            <div className="rounded-[24px] px-5 py-2" style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}>
-              <div className="py-4 flex flex-wrap items-center justify-between gap-3 border-b" style={{ borderColor: '#292223' }}>
-                <div className="min-w-0">
-                  <div className="font-jakarta font-semibold text-[14px]" style={{ color: COLORS.textPrimary }}>
-                    Split Tunneling (Local Apps)
-                  </div>
-                  <div className="text-[12px] mt-0.5" style={{ color: COLORS.textMuted }}>
-                    Exclude selected Windows executables from routing through Xray
-                  </div>
-                </div>
-                <div className="flex items-center gap-2.5">
+            <div className="grid grid-cols-3 gap-2">
+              {TUNNEL_PROFILES.map((prof) => {
+                const active = tunnelProfile === prof.id;
+                return (
                   <button
+                    key={prof.id}
                     type="button"
-                    onClick={() => setAppsModalOpen(true)}
-                    className="h-[34px] px-3 rounded-full text-[12px] font-semibold flex items-center gap-1.5 cursor-pointer"
-                    style={{ backgroundColor: COLORS.taupe, border: '1px solid #634947', color: COLORS.textPrimary }}
+                    onClick={() => setTunnelProfile(prof.id)}
+                    className="rounded-[14px] p-2.5 text-left cursor-pointer transition-colors duration-150"
+                    style={{
+                      backgroundColor: active ? COLORS.surfaceActive : COLORS.obsidian,
+                      border: `1px solid ${active ? COLORS.surfaceActiveBorder : COLORS.surfaceBorder}`,
+                    }}
                   >
-                    <AppWindow className="w-3.5 h-3.5" />
-                    <span>Select Windows Apps (.exe)</span>
-                    <span className="px-1.5 py-0.5 rounded-full font-mono text-[10px]" style={{ backgroundColor: '#2A1D1D', color: COLORS.amber }}>
-                      {bypassedCount}
-                    </span>
+                    <div className="font-jakarta font-bold text-[12px] truncate" style={{ color: COLORS.textPrimary }}>
+                      {prof.id}
+                    </div>
+                    <div className="text-[10px] mt-0.5 leading-tight" style={{ color: active ? COLORS.amber : COLORS.textMuted }}>
+                      {prof.subtitle}
+                    </div>
                   </button>
-                  <M3ExpressiveSwitch checked={splitTunneling} onChange={setSplitTunneling} ariaLabel="Toggle Split Tunneling" />
-                </div>
-              </div>
+                );
+              })}
+            </div>
+          </div>
 
-              <div className="py-4 flex items-center justify-between gap-4 border-b" style={{ borderColor: '#292223' }}>
-                <div>
-                  <div className="font-jakarta font-semibold text-[14px]" style={{ color: COLORS.textPrimary }}>
-                    Bypass LAN &amp; Private Subnets
-                  </div>
-                  <div className="text-[12px] mt-0.5" style={{ color: COLORS.textMuted }}>
-                    Keep 192.168.x.x, 10.x.x.x &amp; 172.16.x.x direct without tunnel
-                  </div>
+          {/* Startup & Tray Behavior */}
+          <div className="rounded-[20px] p-3.5 flex flex-col gap-3" style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}>
+            <div className="flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <div className="text-[12.5px] font-semibold" style={{ color: COLORS.textPrimary }}>
+                  Auto-Connect on Launch
                 </div>
-                <M3ExpressiveSwitch checked={bypassLan} onChange={setBypassLan} ariaLabel="Toggle Bypass LAN" />
+                <p className="text-[11px]" style={{ color: COLORS.textMuted }}>
+                  Connect last selected server automatically
+                </p>
               </div>
+              <M3ExpressiveSwitch
+                checked={autoConnectOnLaunch}
+                onChange={(v) => persistSettingsPatch({ autoConnectOnLaunch: v }, { affectsTunnel: false })}
+                ariaLabel="Auto-Connect on Launch"
+              />
+            </div>
 
-              <div className="py-4 flex items-center justify-between gap-4 border-b" style={{ borderColor: '#292223' }}>
-                <div>
-                  <div className="font-jakarta font-semibold text-[14px]" style={{ color: COLORS.textPrimary }}>
-                    IPv6 Dual-Stack Routing
-                  </div>
-                  <div className="text-[12px] mt-0.5" style={{ color: COLORS.textMuted }}>
-                    Disable to block IPv6 packets inside Xray &amp; prevent IPv6 leaks
-                  </div>
+            <div className="flex items-center justify-between gap-3 pt-2.5 border-t" style={{ borderColor: '#292223' }}>
+              <div className="min-w-0">
+                <div className="text-[12.5px] font-semibold" style={{ color: COLORS.textPrimary }}>
+                  Start with Windows
                 </div>
-                <M3ExpressiveSwitch
-                  checked={ipv6Enabled}
-                  onChange={(v) => persistSettingsPatch({ ipv6Enabled: v })}
-                  ariaLabel="Toggle IPv6"
-                />
+                <p className="text-[11px]" style={{ color: COLORS.textMuted }}>
+                  Launch silently in system tray at sign-in
+                </p>
               </div>
+              <M3ExpressiveSwitch
+                checked={startWithWindows}
+                onChange={setStartWithWindows}
+                ariaLabel="Start with Windows"
+              />
+            </div>
 
-              <div className="py-4 flex flex-wrap items-center justify-between gap-3 border-b" style={{ borderColor: '#292223' }}>
-                <div>
-                  <div className="font-jakarta font-semibold text-[14px]" style={{ color: COLORS.textPrimary }}>
-                    TUN Interface MTU (Metrovpn-TUN)
-                  </div>
-                  <div className="text-[12px] mt-0.5" style={{ color: COLORS.textMuted }}>
-                    Packet size for Wintun virtual adapter
-                  </div>
+            <div className="flex items-center justify-between gap-3 pt-2.5 border-t" style={{ borderColor: '#292223' }}>
+              <div className="min-w-0">
+                <div className="text-[12.5px] font-semibold" style={{ color: COLORS.textPrimary }}>
+                  Minimize to Tray on Close
                 </div>
-                <div className="inline-flex items-center p-1 rounded-[14px] gap-1" style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}` }}>
-                  {MTU_OPTIONS.map((val) => {
-                    const active = mtu === val;
-                    return (
-                      <button
-                        key={val}
-                        type="button"
-                        onClick={() => setMtu(val)}
-                        className="px-2.5 py-1 rounded-[10px] font-mono tabular-nums text-[11.5px] font-semibold cursor-pointer transition-colors"
-                        style={{
-                          backgroundColor: active ? COLORS.taupe : 'transparent',
-                          color: active ? COLORS.textPrimary : COLORS.textMuted,
-                        }}
-                      >
-                        {val} B
-                      </button>
-                    );
-                  })}
-                </div>
+                <p className="text-[11px]" style={{ color: COLORS.textMuted }}>
+                  Keep VPN running when clicking X
+                </p>
               </div>
+              <M3ExpressiveSwitch
+                checked={closeToTray}
+                onChange={(v) => persistSettingsPatch({ closeToTray: v }, { affectsTunnel: false })}
+                ariaLabel="Minimize to Tray on Close"
+              />
+            </div>
 
-              <div className="py-4 flex flex-col gap-1.5">
-                <span className="font-jakarta font-semibold text-[13.5px]" style={{ color: COLORS.textPrimary }}>
-                  Exclude Direct CIDRs (Comma / Newline Separated)
+            <div className="flex items-center justify-between gap-3 pt-2.5 border-t" style={{ borderColor: '#292223' }}>
+              <div className="min-w-0">
+                <div className="text-[12.5px] font-semibold" style={{ color: COLORS.textPrimary }}>
+                  Bypass LAN &amp; Local IPs
+                </div>
+                <p className="text-[11px]" style={{ color: COLORS.textMuted }}>
+                  Keep router &amp; printer traffic direct
+                </p>
+              </div>
+              <M3ExpressiveSwitch checked={bypassLan} onChange={setBypassLan} ariaLabel="Bypass LAN" />
+            </div>
+          </div>
+
+          {/* Local Ports & LAN Sharing */}
+          <div className="rounded-[20px] p-3.5 flex flex-col gap-3" style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}>
+            <div className="grid grid-cols-2 gap-2.5">
+              <label className="flex flex-col gap-1">
+                <span className="text-[11px] font-semibold" style={{ color: COLORS.textMuted }}>
+                  SOCKS5 Port
                 </span>
                 <input
-                  type="text"
-                  value={tunExcludeCidrs}
-                  onChange={(e) => persistSettingsPatch({ tunExcludeCidrs: e.target.value })}
-                  placeholder="e.g. 100.64.0.0/10, 192.0.2.0/24"
-                  className="h-[36px] rounded-[12px] px-3 font-mono text-[12px] focus:outline-none"
+                  type="number"
+                  min={1024}
+                  max={65535}
+                  value={socksPort}
+                  onChange={(e) => {
+                    const v = Number(e.target.value);
+                    if (v >= 1024 && v <= 65535) persistSettingsPatch({ socksPort: v });
+                  }}
+                  className="h-[34px] rounded-[10px] px-2.5 font-mono text-[12px] focus:outline-none"
                   style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}`, color: COLORS.textPrimary }}
                 />
-              </div>
+              </label>
+
+              <label className="flex flex-col gap-1">
+                <span className="text-[11px] font-semibold" style={{ color: COLORS.textMuted }}>
+                  HTTP Port
+                </span>
+                <input
+                  type="number"
+                  min={1024}
+                  max={65535}
+                  value={httpPort}
+                  onChange={(e) => {
+                    const v = Number(e.target.value);
+                    if (v >= 1024 && v <= 65535) persistSettingsPatch({ httpPort: v });
+                  }}
+                  className="h-[34px] rounded-[10px] px-2.5 font-mono text-[12px] focus:outline-none"
+                  style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}`, color: COLORS.textPrimary }}
+                />
+              </label>
             </div>
-          </section>
+
+            <div className="flex items-center justify-between gap-2 pt-2 border-t" style={{ borderColor: '#292223' }}>
+              <div className="min-w-0">
+                <div className="text-[12.5px] font-semibold" style={{ color: COLORS.textPrimary }}>
+                  Share VPN on LAN / Wi-Fi
+                </div>
+                <p className="text-[11px]" style={{ color: COLORS.textMuted }}>
+                  Allow phone/PS5 on same Wi-Fi to connect
+                </p>
+              </div>
+              <M3ExpressiveSwitch checked={lanProxySharing} onChange={setLanProxySharing} ariaLabel="LAN Proxy Sharing" />
+            </div>
+
+            {lanProxySharing && (
+              <div className="rounded-[12px] p-2.5 flex items-center justify-between gap-2" style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}` }}>
+                <span className="font-mono text-[11px] truncate" style={{ color: COLORS.amber }}>
+                  {localLanIp}:{socksPort || 10808}
+                </span>
+                <div className="flex items-center gap-1 shrink-0">
+                  <button
+                    type="button"
+                    onClick={handleRefreshIp}
+                    className="p-1.5 rounded-full cursor-pointer hover:bg-[#241E1F]"
+                    style={{ color: COLORS.textMuted }}
+                    title="Refresh LAN IP"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${refreshingIp ? 'animate-spin' : ''}`} />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleCopyProxy(socksPort || 10808)}
+                    className="px-2.5 py-1 rounded-full text-[10.5px] font-semibold cursor-pointer"
+                    style={{ backgroundColor: COLORS.taupe, color: COLORS.textPrimary }}
+                  >
+                    Copy
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Core Tools */}
+          <div className="flex items-center justify-between gap-2">
+            <button
+              type="button"
+              onClick={() => setLogsDrawerOpen(true)}
+              className="flex-1 h-[34px] px-3 rounded-full text-[11.5px] font-semibold flex items-center justify-center gap-1.5 cursor-pointer transition-colors duration-150 hover:bg-[#5C4341]"
+              style={{ backgroundColor: COLORS.taupe, border: '1px solid #634947', color: COLORS.textPrimary }}
+            >
+              <Terminal className="w-3.5 h-3.5" style={{ color: COLORS.amber }} />
+              <span>Xray Core Logs</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={resetSettingsToDefault}
+              className="h-[34px] px-3.5 rounded-full text-[11.5px] font-semibold flex items-center gap-1.5 cursor-pointer transition-colors duration-150 hover:bg-[#241E1F]"
+              style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}`, color: COLORS.coral }}
+            >
+              <RotateCcw className="w-3.5 h-3.5" />
+              <span>Reset</span>
+            </button>
+          </div>
         </div>
       )}
 
-      {/* TAB 3: DNS & SECURITY */}
-      {activeTab === 'security' && (
-        <div className="flex flex-col gap-5">
-          <section>
-            <SectionHeader title="DNS & Leak Protection" badge="DoH ENCRYPTED" />
-            <div className="rounded-[24px] p-5 flex flex-col gap-4" style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}>
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <div>
-                  <div className="font-jakarta font-semibold text-[14px]" style={{ color: COLORS.textPrimary }}>
-                    Custom DoH Upstream Resolvers
-                  </div>
-                  <div className="text-[12px] mt-0.5" style={{ color: COLORS.textMuted }}>
-                    Encrypted DNS-over-HTTPS inside Xray core
-                  </div>
-                </div>
-                <div className="flex flex-wrap items-center gap-1.5">
-                  {DNS_OPTIONS.map((opt) => {
-                    const active = dnsResolver === opt;
-                    return (
-                      <button
-                        key={opt}
-                        type="button"
-                        onClick={() => setDnsResolver(opt)}
-                        className="px-3 py-1.5 rounded-full text-[11.5px] font-semibold cursor-pointer transition-colors"
-                        style={{
-                          backgroundColor: active ? COLORS.taupe : '#151213',
-                          color: active ? COLORS.textPrimary : COLORS.textMuted,
-                          border: `1px solid ${active ? '#664B49' : COLORS.surfaceBorder}`,
-                        }}
-                      >
-                        {opt}
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
+      {/* TAB 2: TUN & DNS (With Simple Plain-English Proxy vs TUN Knowledge) */}
+      {activeTab === 'tun' && (
+        <div className="flex flex-col gap-3">
+          {/* Plain-English Guide: System Proxy vs TUN Mode */}
+          <div className="rounded-[20px] p-3.5 flex flex-col gap-2.5" style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}>
+            <div className="flex items-center gap-2">
+              <Info className="w-4 h-4 shrink-0" style={{ color: COLORS.amber }} />
+              <span className="font-jakarta font-bold text-[13px]" style={{ color: COLORS.textPrimary }}>
+                Which Windows Mode Should You Use?
+              </span>
+            </div>
 
+            <div className="grid grid-cols-1 gap-2">
+              <button
+                type="button"
+                onClick={() => setSystemMode('PROXY')}
+                className="rounded-[14px] p-3 text-left cursor-pointer transition-colors duration-150"
+                style={{
+                  backgroundColor: systemMode === 'PROXY' ? COLORS.surfaceActive : COLORS.obsidian,
+                  border: `1px solid ${systemMode === 'PROXY' ? COLORS.surfaceActiveBorder : COLORS.surfaceBorder}`,
+                }}
+              >
+                <div className="flex items-center justify-between mb-1">
+                  <span className="font-jakarta font-bold text-[12.5px]" style={{ color: COLORS.textPrimary }}>
+                    System Proxy Mode
+                  </span>
+                  <span className="px-2 py-0.5 rounded-full text-[9.5px] font-bold" style={{ backgroundColor: '#1E332B', color: COLORS.mint }}>
+                    NO ADMIN NEEDED
+                  </span>
+                </div>
+                <p className="text-[11px] leading-relaxed" style={{ color: systemMode === 'PROXY' ? '#DFC7C6' : COLORS.textMuted }}>
+                  Best for everyday browsing. Routes Chrome, Edge, Telegram &amp; Discord instantly. Some games or CLI tools may ignore system proxy.
+                </p>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setSystemMode('TUN')}
+                className="rounded-[14px] p-3 text-left cursor-pointer transition-colors duration-150"
+                style={{
+                  backgroundColor: systemMode === 'TUN' ? COLORS.surfaceActive : COLORS.obsidian,
+                  border: `1px solid ${systemMode === 'TUN' ? COLORS.surfaceActiveBorder : COLORS.surfaceBorder}`,
+                }}
+              >
+                <div className="flex items-center justify-between mb-1">
+                  <span className="font-jakarta font-bold text-[12.5px]" style={{ color: COLORS.textPrimary }}>
+                    TUN Mode (Full PC Tunnel)
+                  </span>
+                  <span className="px-2 py-0.5 rounded-full text-[9.5px] font-bold" style={{ backgroundColor: COLORS.amberBg, color: COLORS.amber }}>
+                    ADMIN ONCE • WINTUN
+                  </span>
+                </div>
+                <p className="text-[11px] leading-relaxed" style={{ color: systemMode === 'TUN' ? '#DFC7C6' : COLORS.textMuted }}>
+                  Creates a virtual network adapter (<span className="font-mono">Metrovpn-TUN</span>) so 100% of apps, games &amp; UDP traffic go through the VPN.
+                </p>
+              </button>
+            </div>
+          </div>
+
+          {/* MTU & Split Tunneling */}
+          <div className="rounded-[20px] p-3.5 flex flex-col gap-3" style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}>
+            <div className="flex items-center justify-between gap-2">
+              <div className="min-w-0">
+                <div className="text-[12.5px] font-semibold" style={{ color: COLORS.textPrimary }}>
+                  Split Tunneling (Bypass Apps)
+                </div>
+                <p className="text-[11px]" style={{ color: COLORS.textMuted }}>
+                  Let selected games/apps use direct Wi-Fi
+                </p>
+              </div>
+              <M3ExpressiveSwitch checked={splitTunneling} onChange={setSplitTunneling} ariaLabel="Split Tunneling" />
+            </div>
+
+            {splitTunneling && (
+              <button
+                type="button"
+                onClick={() => setAppsModalOpen(true)}
+                className="w-full h-[36px] px-3.5 rounded-[12px] flex items-center justify-between cursor-pointer transition-colors duration-150 hover:bg-[#2A2223]"
+                style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}` }}
+              >
+                <div className="flex items-center gap-2">
+                  <AppWindow className="w-4 h-4" style={{ color: COLORS.coral }} />
+                  <span className="text-[12px] font-semibold" style={{ color: COLORS.textPrimary }}>
+                    Scan PC &amp; Select Apps (.exe)
+                  </span>
+                </div>
+                <span className="font-mono text-[11px] px-2 py-0.5 rounded-full" style={{ backgroundColor: COLORS.amberBg, color: COLORS.amber }}>
+                  {bypassedCount} Bypassed
+                </span>
+              </button>
+            )}
+
+            <div className="pt-2 border-t flex items-center justify-between gap-2" style={{ borderColor: '#292223' }}>
+              <span className="text-[12px] font-semibold" style={{ color: COLORS.textPrimary }}>
+                TUN Adapter MTU
+              </span>
+              <div className="flex items-center gap-1">
+                {MTU_OPTIONS.map((m) => (
+                  <button
+                    key={m}
+                    type="button"
+                    onClick={() => setMtu(m)}
+                    className="px-2 py-1 rounded-full font-mono text-[11px] font-semibold cursor-pointer transition-colors duration-150"
+                    style={{
+                      backgroundColor: mtu === m ? COLORS.crimson : COLORS.obsidian,
+                      color: mtu === m ? COLORS.textPrimary : COLORS.textMuted,
+                      border: `1px solid ${mtu === m ? '#BC1F27' : COLORS.surfaceBorder}`,
+                    }}
+                  >
+                    {m}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          {/* DNS & VCN Security */}
+          <div className="rounded-[20px] p-3.5 flex flex-col gap-3" style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}>
+            <div>
+              <div className="text-[12.5px] font-semibold mb-2" style={{ color: COLORS.textPrimary }}>
+                Encrypted DNS (DoH)
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                {DNS_OPTIONS.map((opt) => {
+                  const active = dnsResolver === opt;
+                  return (
+                    <button
+                      key={opt}
+                      type="button"
+                      onClick={() => setDnsResolver(opt)}
+                      className="px-2.5 py-1 rounded-full text-[11px] font-semibold cursor-pointer transition-colors duration-150"
+                      style={{
+                        backgroundColor: active ? COLORS.taupe : COLORS.obsidian,
+                        color: active ? COLORS.textPrimary : COLORS.textMuted,
+                        border: `1px solid ${active ? '#684C4A' : COLORS.surfaceBorder}`,
+                      }}
+                    >
+                      {opt}
+                    </button>
+                  );
+                })}
+              </div>
               {dnsResolver === 'Custom DoH' && (
                 <input
                   type="url"
                   value={customDohUrl}
                   onChange={(e) => setCustomDohUrl(e.target.value)}
                   placeholder="https://dns.quad9.net/dns-query"
-                  className="w-full h-[36px] rounded-[12px] px-3 font-mono text-[12px] focus:outline-none"
+                  className="mt-2 w-full h-[34px] rounded-[10px] px-2.5 font-mono text-[11.5px] focus:outline-none"
                   style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}`, color: COLORS.textPrimary }}
                 />
               )}
-
-              <div className="pt-3 border-t grid grid-cols-1 sm:grid-cols-2 gap-3 items-center" style={{ borderColor: '#292223' }}>
-                <div>
-                  <div className="font-jakarta font-semibold text-[13.5px]" style={{ color: COLORS.textPrimary }}>
-                    Bootstrap DNS Fallback
-                  </div>
-                  <div className="text-[11.5px]" style={{ color: COLORS.textMuted }}>
-                    Resolves initial proxy server domain before DoH dial
-                  </div>
-                </div>
-                <input
-                  type="text"
-                  value={bootstrapDns}
-                  onChange={(e) => persistSettingsPatch({ bootstrapDns: e.target.value })}
-                  placeholder="1.1.1.1"
-                  className="h-[36px] rounded-[12px] px-3 font-mono text-[12px] focus:outline-none"
-                  style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}`, color: COLORS.textPrimary }}
-                />
-              </div>
-
-              <div className="pt-3 border-t flex items-center justify-between gap-4" style={{ borderColor: '#292223' }}>
-                <div>
-                  <div className="font-jakarta font-semibold text-[13.5px]" style={{ color: COLORS.textPrimary }}>
-                    DNS Leak Protection
-                  </div>
-                  <div className="text-[11.5px]" style={{ color: COLORS.textMuted }}>
-                    Forces all DNS queries through Xray Core tunnel resolvers
-                  </div>
-                </div>
-                <span
-                  className="inline-flex items-center gap-1.5 px-3 py-1 rounded-[10px] font-mono text-[11px] font-bold"
-                  style={{ backgroundColor: '#1E332B', color: COLORS.mint, border: '1px solid #2C4F42' }}
-                >
-                  <Lock className="w-3 h-3" />
-                  LOCKED ON
-                </span>
-              </div>
             </div>
-          </section>
 
-          <section>
-            <SectionHeader title="TLS Security & Xray Core Engine" badge="VCN + uTLS" />
-            <div className="rounded-[24px] px-5 py-2" style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}>
-              <div className="py-3.5 flex items-center justify-between gap-4 border-b" style={{ borderColor: '#292223' }}>
-                <div>
-                  <div className="font-jakarta font-semibold text-[13.5px]" style={{ color: COLORS.textPrimary }}>
-                    Strict VCN Cert Pinning
-                  </div>
-                  <div className="text-[11.5px]" style={{ color: COLORS.textMuted }}>
-                    Verify leaf certificate against VCN authority even with spoofed ISP SNI
-                  </div>
+            <div className="flex items-center justify-between gap-3 pt-2 border-t" style={{ borderColor: '#292223' }}>
+              <div className="min-w-0">
+                <div className="text-[12.5px] font-semibold" style={{ color: COLORS.textPrimary }}>
+                  Strict VCN Cert Pinning
                 </div>
-                <M3ExpressiveSwitch checked={certPinning} onChange={setCertPinning} ariaLabel="Toggle Strict VCN Cert Pinning" />
+                <p className="text-[11px]" style={{ color: COLORS.textMuted }}>
+                  Verify SNI &amp; peer certificate hostname
+                </p>
               </div>
-
-              <div className="py-3.5 flex items-center justify-between gap-4 border-b" style={{ borderColor: '#292223' }}>
-                <div>
-                  <div className="font-jakarta font-semibold text-[13.5px]" style={{ color: COLORS.textPrimary }}>
-                    AllowInsecure TLS Fallback
-                  </div>
-                  <div className="text-[11.5px]" style={{ color: COLORS.textMuted }}>
-                    Allow self-signed / mismatched certs only when Strict VCN is off
-                  </div>
-                </div>
-                <M3ExpressiveSwitch
-                  checked={allowInsecureFallback}
-                  onChange={(v) => persistSettingsPatch({ allowInsecureFallback: v })}
-                  ariaLabel="Toggle AllowInsecure"
-                />
-              </div>
-
-              <div className="py-3.5 flex flex-wrap items-center justify-between gap-3 border-b" style={{ borderColor: '#292223' }}>
-                <div>
-                  <div className="font-jakarta font-semibold text-[13.5px]" style={{ color: COLORS.textPrimary }}>
-                    Default uTLS Browser Fingerprint
-                  </div>
-                  <div className="text-[11.5px]" style={{ color: COLORS.textMuted }}>
-                    Applied when URI omits fp= parameter
-                  </div>
-                </div>
-                <div className="flex flex-wrap gap-1.5">
-                  {UTLS_FINGERPRINTS.map((fp) => {
-                    const active = defaultFingerprint === fp;
-                    return (
-                      <button
-                        key={fp}
-                        type="button"
-                        onClick={() => persistSettingsPatch({ defaultFingerprint: fp })}
-                        className="px-2.5 py-1 rounded-full font-mono text-[11px] font-semibold cursor-pointer"
-                        style={{
-                          backgroundColor: active ? COLORS.taupe : '#151213',
-                          color: active ? COLORS.textPrimary : COLORS.textMuted,
-                          border: `1px solid ${active ? '#664B49' : COLORS.surfaceBorder}`,
-                        }}
-                      >
-                        {fp}
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-
-              <div className="py-3.5 flex flex-wrap items-center justify-between gap-4 border-b" style={{ borderColor: '#292223' }}>
-                <div>
-                  <div className="font-jakarta font-semibold text-[13.5px]" style={{ color: COLORS.textPrimary }}>
-                    Xray Multiplex (Mux)
-                  </div>
-                  <div className="text-[11.5px]" style={{ color: COLORS.textMuted }}>
-                    Reuse TCP connections across streams (auto-skipped for xtls-rprx-vision)
-                  </div>
-                </div>
-                <div className="flex items-center gap-3">
-                  {muxEnabled && (
-                    <input
-                      type="number"
-                      min={1}
-                      max={32}
-                      value={muxConcurrency}
-                      onChange={(e) => {
-                        const v = Number(e.target.value);
-                        if (v >= 1 && v <= 32) persistSettingsPatch({ muxConcurrency: v });
-                      }}
-                      className="w-16 h-[32px] rounded-[10px] px-2 font-mono text-[12px] text-center focus:outline-none"
-                      style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}`, color: COLORS.textPrimary }}
-                    />
-                  )}
-                  <M3ExpressiveSwitch
-                    checked={muxEnabled}
-                    onChange={(v) => persistSettingsPatch({ muxEnabled: v })}
-                    ariaLabel="Toggle Mux"
-                  />
-                </div>
-              </div>
-
-              <div className="py-3.5 flex flex-wrap items-center justify-between gap-3">
-                <div>
-                  <div className="font-jakarta font-semibold text-[13.5px]" style={{ color: COLORS.textPrimary }}>
-                    Xray Core Log Level
-                  </div>
-                  <div className="text-[11.5px]" style={{ color: COLORS.textMuted }}>
-                    Controls diagnostic verbosity in the Logs Drawer
-                  </div>
-                </div>
-                <div className="flex gap-1.5">
-                  {LOG_LEVELS.map((lvl) => {
-                    const active = logLevel === lvl;
-                    return (
-                      <button
-                        key={lvl}
-                        type="button"
-                        onClick={() => persistSettingsPatch({ logLevel: lvl })}
-                        className="px-2.5 py-1 rounded-full font-mono text-[11px] font-semibold cursor-pointer uppercase"
-                        style={{
-                          backgroundColor: active ? COLORS.taupe : '#151213',
-                          color: active ? COLORS.textPrimary : COLORS.textMuted,
-                          border: `1px solid ${active ? '#664B49' : COLORS.surfaceBorder}`,
-                        }}
-                      >
-                        {lvl}
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
+              <M3ExpressiveSwitch checked={certPinning} onChange={setCertPinning} ariaLabel="Strict VCN Cert Pinning" />
             </div>
-          </section>
+          </div>
         </div>
       )}
 
-      {/* TAB 4: SUBSCRIPTIONS, PING & DIAGNOSTICS */}
-      {activeTab === 'subs' && (
-        <div className="flex flex-col gap-5">
-          <section>
-            <SectionHeader title="Subscriptions" badge={`${savedSubscriptions.length} SAVED`} />
-            <div className="rounded-[24px] p-5 flex flex-col gap-3.5" style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}>
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <div className="text-[12.5px]" style={{ color: COLORS.textMuted }}>
-                  Saved remote 3x-ui / VLESS subscription endpoints
-                </div>
-                <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={() => openAddModal('sub')}
-                    className="h-[34px] px-3.5 rounded-full text-[12px] font-semibold cursor-pointer"
-                    style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}`, color: COLORS.textPrimary }}
-                  >
-                    + Add URL
-                  </button>
-                  <button
-                    type="button"
-                    onClick={handleSyncAllSubs}
-                    disabled={syncingSubs || savedSubscriptions.length === 0}
-                    className="h-[34px] px-3.5 rounded-full text-[12px] font-semibold flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
-                    style={{ backgroundColor: COLORS.taupe, border: '1px solid #634947', color: COLORS.textPrimary }}
-                  >
-                    <RefreshCw className={`w-3.5 h-3.5 ${syncingSubs ? 'animate-spin' : ''}`} />
-                    <span>{syncingSubs ? 'Syncing...' : 'Sync All'}</span>
-                  </button>
-                </div>
-              </div>
-
-              {savedSubscriptions.length === 0 ? (
-                <div className="rounded-[14px] p-3 text-[12px] font-mono" style={{ backgroundColor: COLORS.obsidian, color: COLORS.textMuted }}>
-                  No saved subscriptions yet. Click &quot;+ Add URL&quot; to import a panel subscription.
-                </div>
-              ) : (
-                <div className="flex flex-col gap-1.5">
-                  {savedSubscriptions.map((url) => (
-                    <div
-                      key={url}
-                      className="rounded-[12px] px-3 py-2 flex items-center justify-between gap-2 font-mono text-[11.5px]"
-                      style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}`, color: COLORS.textPrimary }}
-                    >
-                      <span className="truncate">{url}</span>
-                      <button
-                        type="button"
-                        onClick={() =>
-                          persistSettingsPatch(
-                            { savedSubscriptions: savedSubscriptions.filter((u) => u !== url) },
-                            { affectsTunnel: false }
-                          )
-                        }
-                        className="text-[11px] cursor-pointer shrink-0"
-                        style={{ color: COLORS.coral }}
-                      >
-                        Remove
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              <div className="pt-2 border-t flex items-center justify-between gap-4" style={{ borderColor: '#292223' }}>
-                <div>
-                  <div className="font-jakarta font-semibold text-[13.5px]" style={{ color: COLORS.textPrimary }}>
-                    Replace Existing Servers Before Update
-                  </div>
-                  <div className="text-[11.5px]" style={{ color: COLORS.textMuted }}>
-                    Clear stale servers before importing updated subscription list
-                  </div>
-                </div>
-                <M3ExpressiveSwitch
-                  checked={subClearBeforeUpdate}
-                  onChange={(v) => persistSettingsPatch({ subClearBeforeUpdate: v }, { affectsTunnel: false })}
-                  ariaLabel="Toggle Clear Before Sub Update"
-                />
-              </div>
-            </div>
-          </section>
-
-          <section>
-            <SectionHeader title="Latency Probe & Maintenance" badge="BENCHMARK" />
-            <div className="rounded-[24px] p-5 flex flex-col gap-4" style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}>
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <div>
-                  <div className="font-jakarta font-semibold text-[13.5px]" style={{ color: COLORS.textPrimary }}>
-                    Server Ping Method
-                  </div>
-                  <div className="text-[11.5px]" style={{ color: COLORS.textMuted }}>
-                    Real HTTP 204 tests actual encrypted proxy roundtrip through Xray
-                  </div>
-                </div>
-                <div className="flex gap-1.5">
-                  {[
-                    { id: 'http_204', label: 'Real HTTP 204 Delay' },
-                    { id: 'tcp_tls', label: 'TCP/TLS Ping' },
-                  ].map((m) => {
-                    const active = latencyMode === m.id;
-                    return (
-                      <button
-                        key={m.id}
-                        type="button"
-                        onClick={() => persistSettingsPatch({ latencyMode: m.id }, { affectsTunnel: false })}
-                        className="px-3 py-1.5 rounded-full text-[11.5px] font-semibold cursor-pointer"
-                        style={{
-                          backgroundColor: active ? COLORS.taupe : '#151213',
-                          color: active ? COLORS.textPrimary : COLORS.textMuted,
-                          border: `1px solid ${active ? '#664B49' : COLORS.surfaceBorder}`,
-                        }}
-                      >
-                        {m.label}
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-
-              <label className="flex flex-col gap-1.5">
-                <span className="text-[12px] font-semibold" style={{ color: COLORS.textPrimary }}>
-                  HTTP 204 Latency Test URL
-                </span>
-                <input
-                  type="url"
-                  value={latencyTestUrl}
-                  onChange={(e) => persistSettingsPatch({ latencyTestUrl: e.target.value }, { affectsTunnel: false })}
-                  className="h-[36px] rounded-[12px] px-3 font-mono text-[12px] focus:outline-none"
-                  style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}`, color: COLORS.textPrimary }}
-                />
-              </label>
-
-              <div className="pt-2 border-t flex flex-wrap items-center justify-between gap-3" style={{ borderColor: '#292223' }}>
-                <button
-                  type="button"
-                  onClick={() => setLogsDrawerOpen(true)}
-                  className="h-[36px] px-4 rounded-full text-[12px] font-semibold flex items-center gap-2 cursor-pointer"
-                  style={{ backgroundColor: COLORS.taupe, border: '1px solid #634947', color: COLORS.textPrimary }}
-                >
-                  <Terminal className="w-3.5 h-3.5" style={{ color: COLORS.amber }} />
-                  <span>Open Live Xray Core Logs</span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={resetSettingsToDefault}
-                  className="h-[36px] px-4 rounded-full text-[12px] font-semibold flex items-center gap-2 cursor-pointer"
-                  style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}`, color: COLORS.coral }}
-                >
-                  <RotateCcw className="w-3.5 h-3.5" />
-                  <span>Reset Settings to Defaults</span>
-                </button>
-              </div>
-            </div>
-          </section>
-        </div>
-      )}
-
-      {/* TAB 5: ABOUT, TELEGRAM & SETUP GUIDE (Matches MetroVpn Android) */}
+      {/* TAB 3: ABOUT & GUIDE */}
       {activeTab === 'about' && (
-        <div className="flex flex-col gap-5">
-          <section>
-            <SectionHeader title="Metrovpn Desktop" badge="v2.5.0" />
-            <div className="rounded-[24px] p-5 flex flex-col gap-4" style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}>
-              <div className="flex flex-wrap items-center justify-between gap-4">
-                <div className="flex items-center gap-3.5">
-                  <div
-                    className="w-12 h-12 rounded-[16px] flex items-center justify-center overflow-hidden"
-                    style={{ backgroundColor: '#241B1C', border: '1px solid #443132' }}
-                  >
-                    <img src={metrovpnApkIcon} alt="Metrovpn" className="w-8 h-8 object-contain" />
-                  </div>
-                  <div>
-                    <img src={metrovpnWordmark} alt="Metrovpn" className="h-[22px] w-auto object-contain mb-1" />
-                    <div className="font-mono text-[11.5px]" style={{ color: COLORS.textMuted }}>
-                      Xray-core v26.11.9 • tun2socks v2.7.0 • Wintun
-                    </div>
-                  </div>
-                </div>
-
-                <div className="flex flex-wrap items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={() => setOnboardingOpen(true)}
-                    className="h-[36px] px-4 rounded-full text-[12px] font-semibold flex items-center gap-1.5 cursor-pointer"
-                    style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}`, color: COLORS.amber }}
-                  >
-                    <HelpCircle className="w-3.5 h-3.5" />
-                    <span>First-Time Setup Guide</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={checkForUpdates}
-                    disabled={checkingUpdate}
-                    className="h-[36px] px-4 rounded-full text-[12px] font-semibold flex items-center gap-1.5 cursor-pointer"
-                    style={{ backgroundColor: COLORS.crimson, color: COLORS.textPrimary, border: '1px solid #BC1F27' }}
-                  >
-                    <RefreshCw className={`w-3.5 h-3.5 ${checkingUpdate ? 'animate-spin' : ''}`} />
-                    <span>{checkingUpdate ? 'Checking...' : 'Check Updates'}</span>
-                  </button>
-                </div>
+        <div className="flex flex-col gap-3">
+          <div className="rounded-[20px] p-4 flex flex-col gap-3.5" style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}>
+            <div className="flex items-center gap-3">
+              <div
+                className="w-11 h-11 rounded-[14px] flex items-center justify-center overflow-hidden shrink-0"
+                style={{ backgroundColor: '#241B1C', border: '1px solid #443132' }}
+              >
+                <img src={metrovpnApkIcon} alt="Metrovpn" className="w-7 h-7 object-contain" />
               </div>
-
-              {updateInfo && (
-                <div
-                  className="rounded-[16px] p-3.5 flex flex-wrap items-center justify-between gap-2"
-                  style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}` }}
-                >
-                  <span className="text-[12.5px]" style={{ color: updateInfo.updateAvailable ? COLORS.amber : COLORS.mint }}>
-                    {updateInfo.updateAvailable
-                      ? `Update available: v${updateInfo.latestVersion} (Current: v${updateInfo.currentVersion})`
-                      : `Up to date on v${updateInfo.currentVersion}`}
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => openExternalUrl(updateInfo.releaseUrl)}
-                    className="text-[12px] font-semibold inline-flex items-center gap-1 cursor-pointer hover:underline"
-                    style={{ color: COLORS.coral }}
-                  >
-                    <span>Open GitHub Release</span>
-                    <ExternalLink className="w-3.5 h-3.5" />
-                  </button>
+              <div className="min-w-0">
+                <img src={metrovpnWordmark} alt="Metrovpn" className="h-[20px] w-auto object-contain mb-0.5" />
+                <div className="font-mono text-[11px] truncate" style={{ color: COLORS.textMuted }}>
+                  v2.6.0 • Xray v26.11.9 • Wintun
                 </div>
-              )}
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-2 border-t" style={{ borderColor: '#292223' }}>
-                <button
-                  type="button"
-                  onClick={() => openExternalUrl('https://t.me/MetroVpnPaidProof')}
-                  className="rounded-[16px] p-3.5 flex items-center justify-between cursor-pointer transition-colors hover:bg-[#241E1F]"
-                  style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}` }}
-                >
-                  <div className="flex items-center gap-3 text-left">
-                    <Send className="w-4 h-4 shrink-0" style={{ color: COLORS.coral }} />
-                    <div>
-                      <div className="font-jakarta font-semibold text-[13px]" style={{ color: COLORS.textPrimary }}>
-                        Telegram Channel
-                      </div>
-                      <div className="font-mono text-[11.5px]" style={{ color: COLORS.textMuted }}>
-                        @MetroVpnPaidProof
-                      </div>
-                    </div>
-                  </div>
-                  <ExternalLink className="w-3.5 h-3.5" style={{ color: COLORS.textMuted }} />
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => openExternalUrl('https://t.me/Metrodens_bot')}
-                  className="rounded-[16px] p-3.5 flex items-center justify-between cursor-pointer transition-colors hover:bg-[#241E1F]"
-                  style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}` }}
-                >
-                  <div className="flex items-center gap-3 text-left">
-                    <Cpu className="w-4 h-4 shrink-0" style={{ color: COLORS.amber }} />
-                    <div>
-                      <div className="font-jakarta font-semibold text-[13px]" style={{ color: COLORS.textPrimary }}>
-                        Telegram Bot
-                      </div>
-                      <div className="font-mono text-[11.5px]" style={{ color: COLORS.textMuted }}>
-                        @Metrodens_bot
-                      </div>
-                    </div>
-                  </div>
-                  <ExternalLink className="w-3.5 h-3.5" style={{ color: COLORS.textMuted }} />
-                </button>
               </div>
             </div>
-          </section>
+
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                onClick={() => setOnboardingOpen(true)}
+                className="h-[36px] px-3 rounded-full text-[11.5px] font-semibold flex items-center justify-center gap-1.5 cursor-pointer transition-colors duration-150 hover:bg-[#241E1F]"
+                style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}`, color: COLORS.amber }}
+              >
+                <Compass className="w-3.5 h-3.5" />
+                <span>Step-by-Step Tour</span>
+              </button>
+              <button
+                type="button"
+                onClick={checkForUpdates}
+                disabled={checkingUpdate}
+                className="h-[36px] px-3 rounded-full text-[11.5px] font-semibold flex items-center justify-center gap-1.5 cursor-pointer transition-colors duration-150 hover:bg-[#B50D17]"
+                style={{ backgroundColor: COLORS.crimson, color: COLORS.textPrimary, border: '1px solid #BC1F27' }}
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${checkingUpdate ? 'animate-spin' : ''}`} />
+                <span>{checkingUpdate ? 'Checking...' : 'Check Updates'}</span>
+              </button>
+            </div>
+
+            {updateInfo && (
+              <div
+                className="rounded-[12px] p-2.5 flex items-center justify-between gap-2"
+                style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}` }}
+              >
+                <span className="text-[11.5px]" style={{ color: updateInfo.updateAvailable ? COLORS.amber : COLORS.mint }}>
+                  {updateInfo.updateAvailable
+                    ? `v${updateInfo.latestVersion} available!`
+                    : `Up to date (v${updateInfo.currentVersion})`}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => openExternalUrl(updateInfo.releaseUrl)}
+                  className="text-[11px] font-semibold inline-flex items-center gap-1 cursor-pointer hover:underline"
+                  style={{ color: COLORS.coral }}
+                >
+                  <span>Releases</span>
+                  <ExternalLink className="w-3 h-3" />
+                </button>
+              </div>
+            )}
+
+            <div className="flex flex-col gap-2 pt-2 border-t" style={{ borderColor: '#292223' }}>
+              <button
+                type="button"
+                onClick={() => openExternalUrl('https://t.me/MetroVpnPaidProof')}
+                className="rounded-[14px] p-3 flex items-center justify-between cursor-pointer transition-colors duration-150 hover:bg-[#241E1F]"
+                style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}` }}
+              >
+                <div className="flex items-center gap-2.5 text-left">
+                  <Send className="w-4 h-4 shrink-0" style={{ color: COLORS.coral }} />
+                  <div>
+                    <div className="font-jakarta font-semibold text-[12.5px]" style={{ color: COLORS.textPrimary }}>
+                      Telegram Channel
+                    </div>
+                    <div className="font-mono text-[11px]" style={{ color: COLORS.textMuted }}>
+                      @MetroVpnPaidProof
+                    </div>
+                  </div>
+                </div>
+                <ExternalLink className="w-3.5 h-3.5" style={{ color: COLORS.textMuted }} />
+              </button>
+
+              <button
+                type="button"
+                onClick={() => openExternalUrl('https://t.me/Metrodens_bot')}
+                className="rounded-[14px] p-3 flex items-center justify-between cursor-pointer transition-colors duration-150 hover:bg-[#241E1F]"
+                style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}` }}
+              >
+                <div className="flex items-center gap-2.5 text-left">
+                  <Cpu className="w-4 h-4 shrink-0" style={{ color: COLORS.amber }} />
+                  <div>
+                    <div className="font-jakarta font-semibold text-[12.5px]" style={{ color: COLORS.textPrimary }}>
+                      Telegram Bot
+                    </div>
+                    <div className="font-mono text-[11px]" style={{ color: COLORS.textMuted }}>
+                      @Metrodens_bot
+                    </div>
+                  </div>
+                </div>
+                <ExternalLink className="w-3.5 h-3.5" style={{ color: COLORS.textMuted }} />
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </motion.div>
@@ -4061,14 +3415,12 @@ function SettingsScreen() {
 }
 
 // ============================================================================
-// ADD / IMPORT CONFIG MODAL
+// ADD CONFIG MODAL (VLESS / VMess URI Only — Clean Single Purpose)
 // ============================================================================
 function AddConfigModal() {
   const {
     addModalOpen,
     setAddModalOpen,
-    addModalTab,
-    setAddModalTab,
     setNodes,
     connectToNode,
     setActiveRoute,
@@ -4076,117 +3428,40 @@ function AddConfigModal() {
   } = useMetro();
 
   const [uriText, setUriText] = useState('');
-  const [jsonText, setJsonText] = useState('');
-  const [subUrl, setSubUrl] = useState('');
-  const [qrScanning, setQrScanning] = useState(false);
-  const [qrUri, setQrUri] = useState('');
   const [errorMsg, setErrorMsg] = useState('');
-  const [isDragging, setIsDragging] = useState(false);
 
   const parsedUri = useMemo(() => parsePreviewNode(uriText, 'uri'), [uriText]);
-  const parsedQr = useMemo(() => parsePreviewNode(qrUri, 'uri'), [qrUri]);
 
   const handleClipboardPaste = async () => {
     setErrorMsg('');
     const text = await readClipboard();
     if (text && (text.toLowerCase().includes('vless://') || text.toLowerCase().includes('vmess://'))) {
-      setUriText(text);
-      pushToast('Pasted VLESS/VMess URI from clipboard', 'success');
+      setUriText(text.trim());
+      pushToast('Pasted link from clipboard', 'success');
     } else {
       setErrorMsg('Clipboard does not contain a vless:// or vmess:// link.');
-    }
-  };
-
-  const handleFileRead = (file) => {
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = (ev) => {
-      setJsonText(String(ev.target?.result || ''));
-      setErrorMsg('');
-    };
-    reader.readAsText(file);
-  };
-
-  const handleQrImageUpload = async (file) => {
-    if (!file) return;
-    setQrScanning(true);
-    setErrorMsg('');
-    try {
-      const buf = await file.arrayBuffer();
-      if (IN_TAURI) {
-        const decoded = await invokeCmd('decode_qr_image', { bytes: Array.from(new Uint8Array(buf)) });
-        setQrUri(decoded);
-        pushToast('Decoded QR code from image', 'success');
-      } else {
-        setErrorMsg('QR image decoding requires desktop Tauri backend');
-      }
-    } catch (err) {
-      setErrorMsg(String(err));
-    } finally {
-      setQrScanning(false);
     }
   };
 
   const handleConfirm = async () => {
     setErrorMsg('');
     try {
-      if (addModalTab === 'uri') {
-        if (!uriText.trim()) {
-          setErrorMsg('Enter a valid vless:// or vmess:// link.');
-          return;
-        }
-        const imported = await invokeCmd('import_uri', { input: uriText, mode: 'uri' });
-        const all = await invokeCmd('list_servers');
-        setNodes(all);
-        if (imported[0]) await connectToNode(imported[0].id);
-        pushToast(`Imported ${imported.length} node(s)`, 'success');
-      } else if (addModalTab === 'file') {
-        if (!jsonText.trim()) {
-          setErrorMsg('Drop a valid .json / .conf profile first.');
-          return;
-        }
-        const imported = await invokeCmd('import_uri', { input: jsonText, mode: 'json' });
-        const all = await invokeCmd('list_servers');
-        setNodes(all);
-        if (imported[0]) await connectToNode(imported[0].id);
-        pushToast(`Imported JSON profile ${imported[0]?.name || ''}`, 'success');
-      } else if (addModalTab === 'sub') {
-        if (!subUrl.trim()) {
-          setErrorMsg('Please enter a valid subscription URL.');
-          return;
-        }
-        const imported = await invokeCmd('import_subscription', { url: subUrl.trim() });
-        const all = await invokeCmd('list_servers');
-        setNodes(all);
-        if (imported[0]) await connectToNode(imported[0].id);
-        pushToast(`Synced ${imported.length} subscription node(s)`, 'success');
-      } else if (addModalTab === 'qr') {
-        if (!qrUri.trim()) {
-          setErrorMsg('Upload a QR image containing a vless:// or vmess:// URI first.');
-          return;
-        }
-        const imported = await invokeCmd('import_uri', { input: qrUri, mode: 'uri' });
-        const all = await invokeCmd('list_servers');
-        setNodes(all);
-        if (imported[0]) await connectToNode(imported[0].id);
-        pushToast(`Imported QR node ${imported[0]?.name || ''}`, 'success');
+      if (!uriText.trim()) {
+        setErrorMsg('Paste a valid vless:// or vmess:// link first.');
+        return;
       }
+      const imported = await invokeCmd('import_uri', { input: uriText.trim(), mode: 'uri' });
+      const all = await invokeCmd('list_servers');
+      setNodes(all);
+      if (imported[0]) await connectToNode(imported[0].id);
+      pushToast(`Added ${imported.length} server(s)`, 'success');
       setUriText('');
-      setJsonText('');
-      setQrUri('');
       setAddModalOpen(false);
       setActiveRoute('servers');
     } catch (err) {
       setErrorMsg(String(err));
     }
   };
-
-  const TABS = [
-    { id: 'uri', label: 'Clipboard URI', icon: ClipboardPaste },
-    { id: 'file', label: '.json / .conf', icon: FileJson },
-    { id: 'sub', label: 'Subscription', icon: Link2 },
-    { id: 'qr', label: 'QR Image', icon: QrCode },
-  ];
 
   return (
     <AnimatePresence>
@@ -4195,291 +3470,127 @@ function AddConfigModal() {
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
           exit={{ opacity: 0 }}
-          className="absolute inset-0 z-50 flex items-center justify-center p-4"
-          style={{ backgroundColor: 'rgba(12, 10, 11, 0.76)', backdropFilter: 'blur(6px)' }}
+          className="absolute inset-0 z-50 flex items-center justify-center p-3"
+          style={{ backgroundColor: 'rgba(12, 10, 11, 0.78)', backdropFilter: 'blur(5px)' }}
           onClick={() => setAddModalOpen(false)}
         >
           <motion.div
-            initial={{ opacity: 0, scale: 0.94, y: 12 }}
+            initial={{ opacity: 0, scale: 0.96, y: 8 }}
             animate={{ opacity: 1, scale: 1, y: 0 }}
-            exit={{ opacity: 0, scale: 0.95, y: 8 }}
-            transition={SPRING}
+            exit={{ opacity: 0, scale: 0.96, y: 6 }}
+            transition={{ duration: 0.16 }}
             onClick={(e) => e.stopPropagation()}
-            className="w-full max-w-[540px] rounded-[26px] p-5 shadow-2xl"
+            className="w-full max-w-[440px] rounded-[22px] p-4 shadow-2xl"
             style={{ backgroundColor: COLORS.surface, border: '1px solid #3D3132' }}
           >
-            <div className="flex items-center justify-between mb-4">
+            <div className="flex items-center justify-between mb-3.5">
               <div className="flex items-center gap-2.5">
                 <div
-                  className="w-9 h-9 rounded-[12px] flex items-center justify-center"
+                  className="w-8 h-8 rounded-[10px] flex items-center justify-center"
                   style={{ backgroundColor: COLORS.surfaceActive, border: `1px solid ${COLORS.surfaceActiveBorder}`, color: COLORS.coral }}
                 >
-                  <Plus className="w-5 h-5" />
+                  <Plus className="w-4 h-4" />
                 </div>
                 <div>
-                  <h3 className="font-jakarta font-bold text-[15.5px]" style={{ color: COLORS.textPrimary }}>
-                    Add / Import Tunnel Config
+                  <h3 className="font-jakarta font-bold text-[14.5px]" style={{ color: COLORS.textPrimary }}>
+                    Add Server Config
                   </h3>
-                  <p className="text-[11.5px]" style={{ color: COLORS.textMuted }}>
-                    VLESS, VMess, Strict VCN, Subscription URL, or QR Image
+                  <p className="text-[11px]" style={{ color: COLORS.textMuted }}>
+                    Paste your vless:// or vmess:// config link
                   </p>
                 </div>
               </div>
               <button
                 type="button"
                 onClick={() => setAddModalOpen(false)}
-                className="w-8 h-8 rounded-full flex items-center justify-center cursor-pointer hover:bg-[#2A2223]"
+                className="w-7 h-7 rounded-full flex items-center justify-center cursor-pointer hover:bg-[#2A2223]"
                 style={{ color: COLORS.textMuted }}
               >
                 <X className="w-4 h-4" />
               </button>
             </div>
 
-            <div
-              className="grid grid-cols-4 p-1 rounded-[15px] mb-4 gap-1"
-              style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}` }}
-            >
-              {TABS.map((t) => {
-                const Icon = t.icon;
-                const active = addModalTab === t.id;
-                return (
-                  <button
-                    key={t.id}
-                    type="button"
-                    onClick={() => {
-                      setAddModalTab(t.id);
-                      setErrorMsg('');
-                    }}
-                    className="py-2 px-1 rounded-[11px] text-[11.5px] font-semibold flex items-center justify-center gap-1.5 cursor-pointer transition-colors"
-                    style={{
-                      backgroundColor: active ? COLORS.taupe : 'transparent',
-                      color: active ? COLORS.textPrimary : COLORS.textMuted,
-                    }}
-                  >
-                    <Icon className="w-3.5 h-3.5 shrink-0" />
-                    <span className="truncate">{t.label}</span>
-                  </button>
-                );
-              })}
-            </div>
-
-            {addModalTab === 'uri' && (
-              <div className="flex flex-col gap-3">
-                <div className="flex flex-wrap items-center gap-2">
-                  <motion.button
-                    whileTap={{ scale: 0.97 }}
-                    onClick={handleClipboardPaste}
-                    className="flex-1 h-[36px] px-3 rounded-[12px] text-[12px] font-semibold flex items-center justify-center gap-1.5 cursor-pointer"
-                    style={{ backgroundColor: COLORS.taupe, color: COLORS.textPrimary, border: '1px solid #634947' }}
-                  >
-                    <ClipboardPaste className="w-3.5 h-3.5" />
-                    <span>Paste vless:// / vmess:// from Clipboard</span>
-                  </motion.button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setUriText(SAMPLE_VLESS_URI);
-                      setErrorMsg('');
-                    }}
-                    className="h-[36px] px-3 rounded-[12px] text-[11.5px] font-semibold flex items-center gap-1.5 cursor-pointer"
-                    style={{ backgroundColor: COLORS.amberBg, color: COLORS.amber }}
-                  >
-                    <Sparkles className="w-3.5 h-3.5" />
-                    <span>Sample</span>
-                  </button>
-                </div>
-
-                <textarea
-                  rows={3}
-                  value={uriText}
-                  onChange={(e) => {
-                    setUriText(e.target.value);
+            <div className="flex flex-col gap-2.5">
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={handleClipboardPaste}
+                  className="flex-1 h-[34px] px-3 rounded-[11px] text-[11.5px] font-semibold flex items-center justify-center gap-1.5 cursor-pointer transition-colors duration-150 hover:bg-[#5C4341]"
+                  style={{ backgroundColor: COLORS.taupe, color: COLORS.textPrimary, border: '1px solid #634947' }}
+                >
+                  <ClipboardPaste className="w-3.5 h-3.5" />
+                  <span>Paste from Clipboard</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setUriText(SAMPLE_VLESS_URI);
                     setErrorMsg('');
                   }}
-                  placeholder="vless://uuid@host:443?security=tls&sni=st1.zoom.us&vcn=vpn.metrodens.site#NodeName"
-                  className="w-full rounded-[16px] p-3 font-mono text-[11.5px] leading-relaxed resize-none focus:outline-none focus:border-[#593B39]"
-                  style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}`, color: COLORS.textPrimary }}
-                />
+                  className="h-[34px] px-3 rounded-[11px] text-[11px] font-semibold flex items-center gap-1 cursor-pointer"
+                  style={{ backgroundColor: COLORS.amberBg, color: COLORS.amber }}
+                >
+                  <Sparkles className="w-3 h-3" />
+                  <span>Sample</span>
+                </button>
+              </div>
 
-                {parsedUri && (
-                  <div
-                    className="rounded-[15px] p-3 flex items-center justify-between"
-                    style={{ backgroundColor: COLORS.surfaceActive, border: `1px solid ${COLORS.surfaceActiveBorder}` }}
-                  >
-                    <div className="min-w-0">
-                      <div className="text-[12.5px] font-bold truncate" style={{ color: COLORS.textPrimary }}>
-                        {parsedUri.name}
-                      </div>
-                      <div className="text-[11px] font-mono" style={{ color: '#D0B4B3' }}>
-                        {parsedUri.isp} — {parsedUri.sni} • {parsedUri.protocol}
-                      </div>
+              <textarea
+                rows={4}
+                value={uriText}
+                onChange={(e) => {
+                  setUriText(e.target.value);
+                  setErrorMsg('');
+                }}
+                placeholder="vless://uuid@host:443?security=tls&sni=st1.zoom.us&vcn=vpn.metrodens.site#NodeName"
+                className="w-full rounded-[14px] p-3 font-mono text-[11px] leading-relaxed resize-none focus:outline-none focus:border-[#593B39]"
+                style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}`, color: COLORS.textPrimary }}
+              />
+
+              {parsedUri && (
+                <div
+                  className="rounded-[13px] p-2.5 flex items-center justify-between gap-2"
+                  style={{ backgroundColor: COLORS.surfaceActive, border: `1px solid ${COLORS.surfaceActiveBorder}` }}
+                >
+                  <div className="min-w-0">
+                    <div className="text-[12px] font-bold truncate" style={{ color: COLORS.textPrimary }}>
+                      {parsedUri.name}
                     </div>
-                    <span className="px-2 py-0.5 rounded-full text-[10.5px] font-bold" style={{ backgroundColor: '#1E332B', color: COLORS.mint }}>
-                      Parsed
-                    </span>
-                  </div>
-                )}
-              </div>
-            )}
-
-            {addModalTab === 'file' && (
-              <div className="flex flex-col gap-3">
-                <div
-                  onDragOver={(e) => {
-                    e.preventDefault();
-                    setIsDragging(true);
-                  }}
-                  onDragLeave={() => setIsDragging(false)}
-                  onDrop={(e) => {
-                    e.preventDefault();
-                    setIsDragging(false);
-                    handleFileRead(e.dataTransfer.files?.[0]);
-                  }}
-                  className="rounded-[18px] border border-dashed p-5 text-center transition-colors"
-                  style={{
-                    borderColor: isDragging ? COLORS.coral : '#4B3A3B',
-                    backgroundColor: isDragging ? '#261A1B' : COLORS.obsidian,
-                  }}
-                >
-                  <Upload className="w-6 h-6 mx-auto mb-2" style={{ color: COLORS.coral }} />
-                  <p className="text-[13px] font-semibold" style={{ color: COLORS.textPrimary }}>
-                    Drag &amp; drop Xray <span className="font-mono">.json</span> or <span className="font-mono">.conf</span> file
-                  </p>
-                  <div className="mt-3 flex items-center justify-center gap-2">
-                    <label
-                      className="px-3 py-1.5 rounded-full text-[11.5px] font-semibold cursor-pointer"
-                      style={{ backgroundColor: COLORS.taupe, color: COLORS.textPrimary }}
-                    >
-                      Browse Files
-                      <input type="file" accept=".json,.conf,.txt" className="hidden" onChange={(e) => handleFileRead(e.target.files?.[0])} />
-                    </label>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setJsonText(SAMPLE_JSON_PROFILE);
-                        setErrorMsg('');
-                      }}
-                      className="px-3 py-1.5 rounded-full text-[11.5px] font-semibold cursor-pointer"
-                      style={{ backgroundColor: COLORS.amberBg, color: COLORS.amber }}
-                    >
-                      Sample Xray JSON
-                    </button>
-                  </div>
-                </div>
-                {jsonText && (
-                  <pre
-                    className="rounded-[14px] p-3 font-mono text-[10.5px] max-h-[108px] overflow-y-auto custom-scrollbar"
-                    style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}`, color: COLORS.textMuted }}
-                  >
-                    {jsonText}
-                  </pre>
-                )}
-              </div>
-            )}
-
-            {addModalTab === 'sub' && (
-              <div className="flex flex-col gap-3">
-                <label className="text-[12px] font-medium" style={{ color: COLORS.textMuted }}>
-                  Remote Xray / V2Ray Subscription URL
-                </label>
-                <input
-                  type="url"
-                  value={subUrl}
-                  onChange={(e) => setSubUrl(e.target.value)}
-                  placeholder="https://your-panel.example/sub/..."
-                  className="w-full h-[42px] rounded-[14px] px-3.5 font-mono text-[12px] focus:outline-none focus:border-[#593B39]"
-                  style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}`, color: COLORS.textPrimary }}
-                />
-                <div
-                  className="rounded-[14px] p-3 text-[11.5px]"
-                  style={{ backgroundColor: '#171314', border: `1px solid ${COLORS.surfaceBorder}`, color: COLORS.textMuted }}
-                >
-                  Syncing pulls updated VLESS Reality &amp; Strict VCN edge endpoints and parses <span className="font-mono">Subscription-Userinfo</span> quota headers automatically.
-                </div>
-              </div>
-            )}
-
-            {addModalTab === 'qr' && (
-              <div className="flex flex-col gap-3">
-                <div
-                  className="rounded-[18px] p-5 flex flex-col items-center text-center gap-3"
-                  style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}` }}
-                >
-                  <div
-                    className="w-12 h-12 rounded-[16px] flex items-center justify-center"
-                    style={{ backgroundColor: COLORS.surfaceActive, border: `1px solid ${COLORS.surfaceActiveBorder}`, color: COLORS.coral }}
-                  >
-                    <Camera className={`w-6 h-6 ${qrScanning ? 'animate-pulse' : ''}`} />
-                  </div>
-                  <div>
-                    <p className="text-[13px] font-semibold" style={{ color: COLORS.textPrimary }}>
-                      {qrScanning ? 'Decoding QR code...' : 'Decode QR Image File'}
-                    </p>
-                    <p className="text-[11.5px] mt-0.5" style={{ color: COLORS.textMuted }}>
-                      Upload a screenshot or PNG/JPG QR code exported from Metrovpn
-                    </p>
-                  </div>
-                  <label
-                    className="h-[34px] px-4 rounded-full text-[12px] font-semibold inline-flex items-center cursor-pointer"
-                    style={{ backgroundColor: COLORS.taupe, color: COLORS.textPrimary }}
-                  >
-                    Upload QR Image
-                    <input
-                      type="file"
-                      accept="image/*"
-                      className="hidden"
-                      onChange={(e) => handleQrImageUpload(e.target.files?.[0])}
-                    />
-                  </label>
-                </div>
-
-                {parsedQr && (
-                  <div
-                    className="rounded-[15px] p-3 flex items-center justify-between"
-                    style={{ backgroundColor: COLORS.surfaceActive, border: `1px solid ${COLORS.surfaceActiveBorder}` }}
-                  >
-                    <div>
-                      <div className="text-[12.5px] font-bold" style={{ color: COLORS.textPrimary }}>
-                        {parsedQr.name}
-                      </div>
-                      <div className="text-[11px] font-mono" style={{ color: '#D0B4B3' }}>
-                        {parsedQr.sni} • {parsedQr.protocol}
-                      </div>
+                    <div className="text-[10.5px] font-mono truncate" style={{ color: '#D0B4B3' }}>
+                      {parsedUri.isp} — {parsedUri.sni}
                     </div>
-                    <span className="px-2 py-0.5 rounded-full text-[10.5px] font-bold" style={{ backgroundColor: '#1E332B', color: COLORS.mint }}>
-                      QR Decoded
-                    </span>
                   </div>
-                )}
-              </div>
-            )}
+                  <span className="px-2 py-0.5 rounded-full text-[10px] font-bold shrink-0" style={{ backgroundColor: '#1E332B', color: COLORS.mint }}>
+                    Ready
+                  </span>
+                </div>
+              )}
+            </div>
 
             {errorMsg && (
-              <p className="mt-2.5 text-[12px] flex items-center gap-1.5" style={{ color: COLORS.coral }}>
+              <p className="mt-2.5 text-[11.5px] flex items-center gap-1.5" style={{ color: COLORS.coral }}>
                 <AlertCircle className="w-3.5 h-3.5 shrink-0" />
                 <span>{errorMsg}</span>
               </p>
             )}
 
-            <div className="mt-5 flex items-center justify-end gap-2">
+            <div className="mt-4 flex items-center justify-end gap-2">
               <button
                 type="button"
                 onClick={() => setAddModalOpen(false)}
-                className="px-4 py-2 rounded-full text-[12.5px] font-semibold cursor-pointer hover:bg-[#2A2223]"
+                className="px-3.5 py-1.5 rounded-full text-[12px] font-semibold cursor-pointer hover:bg-[#2A2223]"
                 style={{ color: COLORS.textMuted }}
               >
                 Cancel
               </button>
-              <motion.button
-                whileHover={{ scale: 1.02 }}
-                whileTap={{ scale: 0.96 }}
-                transition={SPRING}
+              <button
+                type="button"
                 onClick={handleConfirm}
-                className="px-5 py-2 rounded-full text-[12.5px] font-semibold cursor-pointer"
+                className="px-4 py-1.5 rounded-full text-[12px] font-semibold cursor-pointer transition-colors duration-150 hover:bg-[#B50D17]"
                 style={{ backgroundColor: COLORS.crimson, color: COLORS.textPrimary, border: '1px solid #BC1F27' }}
               >
-                {addModalTab === 'sub' ? 'Sync Subscription' : 'Add Tunnel Node'}
-              </motion.button>
+                Add &amp; Connect
+              </button>
             </div>
           </motion.div>
         </motion.div>
@@ -4489,12 +3600,335 @@ function AddConfigModal() {
 }
 
 // ============================================================================
-// WINDOWS APPS (.EXE) SPLIT TUNNELING PICKER MODAL
+// DEDICATED QR SCANNER MODAL (NetMod Screen Capture + Live Camera — No Upload)
+// ============================================================================
+function QrScannerModal() {
+  const {
+    qrModalOpen,
+    setQrModalOpen,
+    setNodes,
+    connectToNode,
+    setActiveRoute,
+    pushToast,
+  } = useMetro();
+
+  const [scanTab, setScanTab] = useState('screen'); // 'screen' | 'camera'
+  const [capturing, setCapturing] = useState(false);
+  const [cameraActive, setCameraActive] = useState(false);
+  const [decodedUri, setDecodedUri] = useState('');
+  const [errorMsg, setErrorMsg] = useState('');
+
+  const videoRef = useRef(null);
+  const canvasRef = useRef(null);
+  const streamRef = useRef(null);
+
+  const stopCamera = useCallback(() => {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
+    }
+    setCameraActive(false);
+  }, []);
+
+  useEffect(() => {
+    if (!qrModalOpen) {
+      stopCamera();
+      setDecodedUri('');
+      setErrorMsg('');
+    }
+  }, [qrModalOpen, stopCamera]);
+
+  const importDecodedQr = useCallback(
+    async (rawQrText) => {
+      try {
+        if (!IN_TAURI) {
+          setDecodedUri(rawQrText);
+          pushToast('Decoded QR in preview mode', 'success');
+          return;
+        }
+        const imported = await invokeCmd('import_uri', { input: rawQrText.trim(), mode: 'uri' });
+        const all = await invokeCmd('list_servers');
+        setNodes(all);
+        if (imported[0]) await connectToNode(imported[0].id);
+        pushToast(`Imported QR server: ${imported[0]?.name || 'Node'}`, 'success');
+        stopCamera();
+        setQrModalOpen(false);
+        setActiveRoute('servers');
+      } catch (err) {
+        setErrorMsg(String(err));
+      }
+    },
+    [setNodes, connectToNode, pushToast, stopCamera, setQrModalOpen, setActiveRoute]
+  );
+
+  // Live Camera QR Loop using jsQR
+  useEffect(() => {
+    if (!qrModalOpen || scanTab !== 'camera') {
+      stopCamera();
+      return;
+    }
+
+    let cancelled = false;
+    let timerId = null;
+
+    (async () => {
+      setErrorMsg('');
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        setErrorMsg('Camera access is not available on this system.');
+        return;
+      }
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: 'environment', width: { ideal: 640 }, height: { ideal: 480 } },
+        });
+        if (cancelled) {
+          stream.getTracks().forEach((t) => t.stop());
+          return;
+        }
+        streamRef.current = stream;
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream;
+          await videoRef.current.play();
+        }
+        setCameraActive(true);
+
+        const scanFrame = () => {
+          if (cancelled || !videoRef.current || !canvasRef.current) return;
+          const v = videoRef.current;
+          if (v.readyState >= 2 && v.videoWidth > 0 && v.videoHeight > 0) {
+            const c = canvasRef.current;
+            c.width = v.videoWidth;
+            c.height = v.videoHeight;
+            const ctx = c.getContext('2d', { willReadFrequently: true });
+            if (ctx) {
+              ctx.drawImage(v, 0, 0, c.width, c.height);
+              const imgData = ctx.getImageData(0, 0, c.width, c.height);
+              const hit = jsQR(imgData.data, c.width, c.height, { inversionAttempts: 'attemptBoth' });
+              if (hit && hit.data) {
+                setDecodedUri(hit.data);
+                importDecodedQr(hit.data);
+                return;
+              }
+            }
+          }
+          timerId = setTimeout(scanFrame, 140);
+        };
+        timerId = setTimeout(scanFrame, 250);
+      } catch (err) {
+        if (!cancelled) {
+          setErrorMsg(`Camera error: ${err?.message || String(err)}`);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      if (timerId) clearTimeout(timerId);
+      stopCamera();
+    };
+  }, [qrModalOpen, scanTab, stopCamera, importDecodedQr]);
+
+  const handleScreenCaptureQr = async () => {
+    setErrorMsg('');
+    setCapturing(true);
+    try {
+      if (!IN_TAURI) {
+        setErrorMsg('Screen Capture QR requires the Windows desktop app.');
+        return;
+      }
+      const qrText = await invokeCmd('scan_screen_qr', { hideWindow: true });
+      setDecodedUri(qrText);
+      await importDecodedQr(qrText);
+    } catch (err) {
+      setErrorMsg(String(err));
+    } finally {
+      setCapturing(false);
+    }
+  };
+
+  return (
+    <AnimatePresence>
+      {qrModalOpen && (
+        <motion.div
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          className="absolute inset-0 z-50 flex items-center justify-center p-3"
+          style={{ backgroundColor: 'rgba(12, 10, 11, 0.80)', backdropFilter: 'blur(5px)' }}
+          onClick={() => setQrModalOpen(false)}
+        >
+          <motion.div
+            initial={{ opacity: 0, scale: 0.96, y: 8 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            exit={{ opacity: 0, scale: 0.96, y: 6 }}
+            transition={{ duration: 0.16 }}
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-[430px] rounded-[22px] p-4 shadow-2xl"
+            style={{ backgroundColor: COLORS.surface, border: '1px solid #3D3132' }}
+          >
+            <div className="flex items-center justify-between mb-3">
+              <div className="flex items-center gap-2.5">
+                <div
+                  className="w-8 h-8 rounded-[10px] flex items-center justify-center"
+                  style={{ backgroundColor: COLORS.surfaceActive, border: `1px solid ${COLORS.surfaceActiveBorder}`, color: COLORS.coral }}
+                >
+                  <QrCode className="w-4 h-4" />
+                </div>
+                <div>
+                  <h3 className="font-jakarta font-bold text-[14.5px]" style={{ color: COLORS.textPrimary }}>
+                    Scan QR Config
+                  </h3>
+                  <p className="text-[11px]" style={{ color: COLORS.textMuted }}>
+                    Capture screen QR or point webcam at a QR code
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setQrModalOpen(false)}
+                className="w-7 h-7 rounded-full flex items-center justify-center cursor-pointer hover:bg-[#2A2223]"
+                style={{ color: COLORS.textMuted }}
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Strictly 2 QR Modes: Screen Capture & Camera */}
+            <div
+              className="grid grid-cols-2 p-1 rounded-[14px] mb-3.5 gap-1"
+              style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}` }}
+            >
+              <button
+                type="button"
+                onClick={() => {
+                  setScanTab('screen');
+                  setErrorMsg('');
+                }}
+                className="py-1.5 px-2 rounded-[10px] text-[11.5px] font-semibold flex items-center justify-center gap-1.5 cursor-pointer transition-colors duration-150"
+                style={{
+                  backgroundColor: scanTab === 'screen' ? COLORS.taupe : 'transparent',
+                  color: scanTab === 'screen' ? COLORS.textPrimary : COLORS.textMuted,
+                }}
+              >
+                <ScanLine className="w-3.5 h-3.5" />
+                <span>Screen Capture</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setScanTab('camera');
+                  setErrorMsg('');
+                }}
+                className="py-1.5 px-2 rounded-[10px] text-[11.5px] font-semibold flex items-center justify-center gap-1.5 cursor-pointer transition-colors duration-150"
+                style={{
+                  backgroundColor: scanTab === 'camera' ? COLORS.taupe : 'transparent',
+                  color: scanTab === 'camera' ? COLORS.textPrimary : COLORS.textMuted,
+                }}
+              >
+                <Video className="w-3.5 h-3.5" />
+                <span>Camera</span>
+              </button>
+            </div>
+
+            {scanTab === 'screen' && (
+              <div
+                className="rounded-[16px] p-5 flex flex-col items-center text-center gap-3"
+                style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}` }}
+              >
+                <div
+                  className="w-12 h-12 rounded-[15px] flex items-center justify-center"
+                  style={{ backgroundColor: COLORS.surfaceActive, border: `1px solid ${COLORS.surfaceActiveBorder}`, color: COLORS.coral }}
+                >
+                  <ScanLine className={`w-6 h-6 ${capturing ? 'animate-pulse' : ''}`} />
+                </div>
+                <div>
+                  <p className="text-[13px] font-semibold" style={{ color: COLORS.textPrimary }}>
+                    {capturing ? 'Scanning your screen...' : 'Scan Any QR Visible on Screen'}
+                  </p>
+                  <p className="text-[11px] mt-1 leading-relaxed max-w-[300px]" style={{ color: COLORS.textMuted }}>
+                    Keep the QR code open on Telegram or browser. Metrovpn hides briefly, captures your desktop, and imports automatically.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  disabled={capturing}
+                  onClick={handleScreenCaptureQr}
+                  className="h-[36px] px-5 rounded-full text-[12px] font-semibold inline-flex items-center gap-2 cursor-pointer transition-colors duration-150 hover:bg-[#B50D17] disabled:opacity-60"
+                  style={{ backgroundColor: COLORS.crimson, color: COLORS.textPrimary, border: '1px solid #BC1F27' }}
+                >
+                  <ScanLine className="w-3.5 h-3.5" />
+                  <span>{capturing ? 'Capturing...' : 'Capture Screen & Scan'}</span>
+                </button>
+              </div>
+            )}
+
+            {scanTab === 'camera' && (
+              <div
+                className="rounded-[16px] p-3 flex flex-col items-center gap-2.5"
+                style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}` }}
+              >
+                <div className="relative w-full h-[210px] rounded-[12px] overflow-hidden bg-black flex items-center justify-center">
+                  <video ref={videoRef} playsInline muted className="w-full h-full object-cover" />
+                  <canvas ref={canvasRef} className="hidden" />
+                  <div
+                    className="absolute w-[140px] h-[140px] rounded-[16px] pointer-events-none"
+                    style={{ border: `2px solid ${cameraActive ? COLORS.coral : COLORS.textMuted}` }}
+                  />
+                  {!cameraActive && !errorMsg && (
+                    <span className="absolute text-[11.5px] font-medium" style={{ color: COLORS.textMuted }}>
+                      Starting webcam...
+                    </span>
+                  )}
+                </div>
+                <p className="text-[11px] text-center" style={{ color: COLORS.textMuted }}>
+                  Hold a phone or printed QR code in front of your camera to import automatically.
+                </p>
+              </div>
+            )}
+
+            {decodedUri && (
+              <div
+                className="mt-2.5 rounded-[12px] p-2.5 text-[11px] font-mono truncate"
+                style={{ backgroundColor: '#1E332B', color: COLORS.mint }}
+              >
+                Decoded: {decodedUri}
+              </div>
+            )}
+
+            {errorMsg && (
+              <p className="mt-2.5 text-[11.5px] flex items-center gap-1.5" style={{ color: COLORS.coral }}>
+                <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                <span>{errorMsg}</span>
+              </p>
+            )}
+          </motion.div>
+        </motion.div>
+      )}
+    </AnimatePresence>
+  );
+}
+
+// ============================================================================
+// WINDOWS APPS (.EXE) SPLIT TUNNELING PICKER MODAL (Scans Real PC Executables)
 // ============================================================================
 function WindowsAppsModal() {
-  const { appsModalOpen, setAppsModalOpen, windowsApps, setWindowsApps, toggleWindowsAppBypass, pushToast } =
-    useMetro();
+  const {
+    appsModalOpen,
+    setAppsModalOpen,
+    windowsApps,
+    setWindowsApps,
+    toggleWindowsAppBypass,
+    scanWindowsApps,
+    scanningApps,
+    pushToast,
+  } = useMetro();
   const [search, setSearch] = useState('');
+
+  useEffect(() => {
+    if (appsModalOpen) {
+      scanWindowsApps();
+    }
+  }, [appsModalOpen, scanWindowsApps]);
 
   const filtered = windowsApps.filter(
     (a) =>
@@ -4521,102 +3955,134 @@ function WindowsAppsModal() {
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
           exit={{ opacity: 0 }}
-          className="absolute inset-0 z-50 flex items-center justify-center p-4"
-          style={{ backgroundColor: 'rgba(12, 10, 11, 0.74)', backdropFilter: 'blur(5px)' }}
+          className="absolute inset-0 z-50 flex items-center justify-center p-3"
+          style={{ backgroundColor: 'rgba(12, 10, 11, 0.78)', backdropFilter: 'blur(5px)' }}
           onClick={() => setAppsModalOpen(false)}
         >
           <motion.div
-            initial={{ opacity: 0, scale: 0.95, y: 10 }}
+            initial={{ opacity: 0, scale: 0.96, y: 8 }}
             animate={{ opacity: 1, scale: 1, y: 0 }}
-            exit={{ opacity: 0, scale: 0.95, y: 8 }}
-            transition={SPRING}
+            exit={{ opacity: 0, scale: 0.96, y: 6 }}
+            transition={{ duration: 0.16 }}
             onClick={(e) => e.stopPropagation()}
-            className="w-full max-w-[460px] rounded-[24px] p-5 shadow-2xl"
+            className="w-full max-w-[440px] rounded-[22px] p-4 shadow-2xl"
             style={{ backgroundColor: COLORS.surface, border: '1px solid #3D3132' }}
           >
-            <div className="flex items-center justify-between mb-3.5">
+            <div className="flex items-center justify-between mb-3">
               <div>
-                <h3 className="font-jakarta font-bold text-[15px]" style={{ color: COLORS.textPrimary }}>
-                  Select Windows Apps (.exe)
+                <h3 className="font-jakarta font-bold text-[14.5px]" style={{ color: COLORS.textPrimary }}>
+                  Split Tunneling Apps (.exe)
                 </h3>
-                <p className="text-[11.5px]" style={{ color: COLORS.textMuted }}>
-                  Checked executables bypass Xray routing directly
+                <p className="text-[11px]" style={{ color: COLORS.textMuted }}>
+                  Checked apps bypass VPN and use direct internet
                 </p>
               </div>
               <button
                 type="button"
                 onClick={() => setAppsModalOpen(false)}
-                className="w-8 h-8 rounded-full flex items-center justify-center cursor-pointer hover:bg-[#2A2223]"
+                className="w-7 h-7 rounded-full flex items-center justify-center cursor-pointer hover:bg-[#2A2223]"
                 style={{ color: COLORS.textMuted }}
               >
                 <X className="w-4 h-4" />
               </button>
             </div>
 
-            <div className="flex items-center gap-2 mb-3">
+            <div className="flex items-center gap-1.5 mb-2.5">
               <div
-                className="flex-1 h-[38px] rounded-full px-3.5 flex items-center gap-2"
+                className="flex-1 h-[34px] rounded-full px-3 flex items-center gap-1.5"
                 style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}` }}
               >
-                <Search className="w-3.5 h-3.5" style={{ color: COLORS.textMuted }} />
+                <Search className="w-3.5 h-3.5 shrink-0" style={{ color: COLORS.textMuted }} />
                 <input
                   type="text"
                   value={search}
                   onChange={(e) => setSearch(e.target.value)}
-                  placeholder="Filter Windows executables..."
-                  className="w-full bg-transparent text-[12.5px] focus:outline-none"
+                  placeholder="Search installed / running .exe..."
+                  className="w-full bg-transparent text-[11.5px] focus:outline-none"
                   style={{ color: COLORS.textPrimary }}
                 />
               </div>
               <button
                 type="button"
+                onClick={scanWindowsApps}
+                disabled={scanningApps}
+                title="Rescan PC executables"
+                className="h-[34px] px-2.5 rounded-full text-[11px] font-semibold flex items-center gap-1 cursor-pointer shrink-0 transition-colors duration-150 hover:bg-[#2A2223]"
+                style={{ backgroundColor: COLORS.obsidian, color: COLORS.amber, border: `1px solid ${COLORS.surfaceBorder}` }}
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${scanningApps ? 'animate-spin' : ''}`} />
+                <span>Scan</span>
+              </button>
+              <button
+                type="button"
                 onClick={handleBrowseExe}
-                className="h-[38px] px-3.5 rounded-full text-[12px] font-semibold flex items-center gap-1.5 cursor-pointer shrink-0"
+                className="h-[34px] px-2.5 rounded-full text-[11px] font-semibold flex items-center gap-1 cursor-pointer shrink-0 transition-colors duration-150 hover:bg-[#5C4341]"
                 style={{ backgroundColor: COLORS.taupe, color: COLORS.textPrimary, border: '1px solid #634947' }}
               >
                 <FolderOpen className="w-3.5 h-3.5" />
-                <span>Browse .exe</span>
+                <span>Browse</span>
               </button>
             </div>
 
-            <div className="max-h-[270px] overflow-y-auto flex flex-col gap-1.5 pr-1 custom-scrollbar">
-              {filtered.map((app) => (
-                <button
-                  key={app.id}
-                  type="button"
-                  onClick={() => toggleWindowsAppBypass(app.id)}
-                  className="w-full rounded-[14px] px-3 py-2.5 flex items-center justify-between cursor-pointer transition-colors"
-                  style={{
-                    backgroundColor: app.bypassed ? COLORS.surfaceActive : '#151213',
-                    border: `1px solid ${app.bypassed ? COLORS.surfaceActiveBorder : '#272021'}`,
-                  }}
-                >
-                  <div className="text-left min-w-0">
-                    <div className="text-[13px] font-semibold truncate" style={{ color: COLORS.textPrimary }}>
-                      {app.name}
-                    </div>
-                    <div className="font-mono text-[11px] truncate" style={{ color: COLORS.textMuted }}>
-                      {app.exe}
-                    </div>
-                  </div>
-                  <div
-                    className="w-5 h-5 rounded-[6px] flex items-center justify-center shrink-0"
+            <div className="max-h-[250px] overflow-y-auto flex flex-col gap-1.5 pr-1 custom-scrollbar">
+              {scanningApps && filtered.length === 0 ? (
+                <div className="py-8 text-center text-[12px]" style={{ color: COLORS.textMuted }}>
+                  Scanning installed &amp; running apps on your PC...
+                </div>
+              ) : filtered.length === 0 ? (
+                <div className="py-8 text-center text-[12px]" style={{ color: COLORS.textMuted }}>
+                  No executables found. Click Scan or Browse to pick an .exe file.
+                </div>
+              ) : (
+                filtered.map((app) => (
+                  <button
+                    key={app.id}
+                    type="button"
+                    onClick={() => toggleWindowsAppBypass(app.id)}
+                    className="w-full rounded-[12px] px-3 py-2 flex items-center justify-between cursor-pointer transition-colors duration-150"
                     style={{
-                      backgroundColor: app.bypassed ? COLORS.coral : '#2A2223',
-                      border: `1px solid ${app.bypassed ? '#FF7970' : '#443839'}`,
+                      backgroundColor: app.bypassed ? COLORS.surfaceActive : '#151213',
+                      border: `1px solid ${app.bypassed ? COLORS.surfaceActiveBorder : '#272021'}`,
                     }}
                   >
-                    {app.bypassed && <Check className="w-3.5 h-3.5 text-[#141112]" strokeWidth={3} />}
-                  </div>
-                </button>
-              ))}
+                    <div className="text-left min-w-0 pr-2">
+                      <div className="flex items-center gap-1.5">
+                        <span className="text-[12px] font-semibold truncate" style={{ color: COLORS.textPrimary }}>
+                          {app.name}
+                        </span>
+                        <span
+                          className="text-[9px] font-semibold px-1.5 py-0.5 rounded-full shrink-0"
+                          style={{
+                            backgroundColor: app.category === 'Running' ? '#1E332B' : '#262021',
+                            color: app.category === 'Running' ? COLORS.mint : COLORS.textMuted,
+                          }}
+                        >
+                          {app.category}
+                        </span>
+                      </div>
+                      <div className="font-mono text-[10.5px] truncate" style={{ color: COLORS.textMuted }}>
+                        {app.exe}
+                      </div>
+                    </div>
+                    <div
+                      className="w-4.5 h-4.5 rounded-[5px] flex items-center justify-center shrink-0"
+                      style={{
+                        backgroundColor: app.bypassed ? COLORS.coral : '#2A2223',
+                        border: `1px solid ${app.bypassed ? '#FF7970' : '#443839'}`,
+                      }}
+                    >
+                      {app.bypassed && <Check className="w-3 h-3 text-[#141112]" strokeWidth={3} />}
+                    </div>
+                  </button>
+                ))
+              )}
             </div>
 
-            <div className="mt-4 flex justify-end">
+            <div className="mt-3.5 flex justify-end">
               <button
                 type="button"
                 onClick={() => setAppsModalOpen(false)}
-                className="px-5 py-2 rounded-full text-[12.5px] font-semibold cursor-pointer"
+                className="px-4 py-1.5 rounded-full text-[12px] font-semibold cursor-pointer"
                 style={{ backgroundColor: COLORS.crimson, color: COLORS.textPrimary }}
               >
                 Done
@@ -4695,7 +4161,6 @@ function AdminElevationModal() {
                 Stay in Proxy Mode
               </button>
               <motion.button
-                whileHover={{ scale: 1.02 }}
                 whileTap={{ scale: 0.96 }}
                 onClick={handleRestartAsAdmin}
                 className="px-4 py-2 rounded-full text-[12.5px] font-semibold cursor-pointer"
@@ -4933,281 +4398,227 @@ function NodeUtilityModals() {
 }
 
 // ============================================================================
-// FIRST-RUN USER GUIDANCE (ONBOARDING) MODAL
+// INTERACTIVE STEP-BY-STEP USER GUIDE (Navigates Real App Tabs Live)
 // ============================================================================
 function OnboardingGuideModal() {
   const {
     onboardingOpen,
-    setOnboardingOpen,
     completeOnboarding,
-    settings,
+    systemMode,
     setSystemMode,
     setActiveRoute,
+    setSettingsTab,
+    setQrModalOpen,
   } = useMetro();
   const [step, setStep] = useState(0);
+
+  // Navigate to the corresponding real app tab automatically on each step
+  useEffect(() => {
+    if (!onboardingOpen) return;
+    if (step === 0) {
+      setActiveRoute('home');
+    } else if (step === 1) {
+      setActiveRoute('servers');
+    } else if (step === 2) {
+      setActiveRoute('settings');
+      setSettingsTab('tun');
+    } else if (step === 3) {
+      setActiveRoute('home');
+    }
+  }, [onboardingOpen, step, setActiveRoute, setSettingsTab]);
 
   useEffect(() => {
     if (onboardingOpen) setStep(0);
   }, [onboardingOpen]);
 
-  const steps = [
+  const guideSteps = [
     {
-      badge: 'Step 1 of 3 • Quick Setup',
-      title: 'Import Your MetroVPN Server or Subscription',
-      subtitle: 'No preloaded dummy nodes — start cleanly with your own VLESS, VMess, JSON config, or Subscription URL.',
-      icon: Upload,
-      highlights: [
-        {
-          title: 'Paste VLESS / VMess URI or File',
-          desc: 'Supports Reality, VCN (verifyPeerCertByName), WebSocket, gRPC, uTLS fingerprints, and raw Xray JSON.',
-        },
-        {
-          title: 'Subscription Auto-Sync',
-          desc: 'Paste a Base64 subscription link to fetch all nodes at once and refresh anytime from Servers or Settings → Subs.',
-        },
-        {
-          title: 'Auto ISP Detection & Badges',
-          desc: 'Names containing SLT, Dialog, Hutch, Airtel, or Mobitel automatically display crisp ISP badges & filter tabs.',
-        },
-      ],
+      stepLabel: 'Step 1 of 4 • Home & Import',
+      title: 'Add Your Server Link or Scan QR',
+      body: 'Click "+ Add" in the top bar to paste a VLESS/VMess link, or tap the QR icon to capture a QR directly from your screen or webcam.',
+      actionLabel: 'Paste Link Now',
+      onAction: () => completeOnboarding('uri'),
+      altLabel: 'Scan QR',
+      onAlt: () => {
+        completeOnboarding(null);
+        setQrModalOpen(true);
+      },
     },
     {
-      badge: 'Step 2 of 3 • Windows Routing',
-      title: 'System Proxy Mode vs Full Wintun TUN Mode',
-      subtitle: 'Pick the routing mode from the left rail at any time. Both include crash-safe cleanup on exit.',
-      icon: Cpu,
-      highlights: [
-        {
-          title: 'System Proxy Mode (Recommended Start • No Admin)',
-          desc: 'Configures Windows Internet Settings instantly for Chrome, Edge, Discord & apps without needing Administrator rights.',
-        },
-        {
-          title: 'TUN Mode (Full System • Wintun + tun2socks)',
-          desc: 'Routes every TCP/UDP packet on Windows including games & CLI tools. Prompts UAC once to elevate, with .exe Split Tunneling.',
-        },
-        {
-          title: 'Configurable Ports & Routing Rules',
-          desc: 'Inspired by v2rayN & NekoRay: customize SOCKS/HTTP ports, Rule/Global/Direct modes, Mux, and DNS in the 5 Settings tabs.',
-        },
-      ],
+      stepLabel: 'Step 2 of 4 • Servers Tab',
+      title: 'Test Latency & Pick Your Server',
+      body: 'You are now viewing the Servers tab. Tap "Test Pings" or any server ping badge to check speed, filter by ISP (SLT, Dialog, Hutch, Airtel, Mobitel), and click a card to connect.',
+      actionLabel: null,
     },
     {
-      badge: 'Step 3 of 3 • Privacy & Tips',
-      title: 'Anti-DPI Profiles, SmartScreen & System Tray',
-      subtitle: 'Built to align with MetroVPN Android for reliable high-speed bypassing on Windows 10 & 11.',
-      icon: ShieldCheck,
-      highlights: [
-        {
-          title: 'Strict VCN & TLS Frag Profiles',
-          desc: 'Use Strict VCN for strict certificate pinning/uTLS, or TLS Frag to split TLS ClientHello packets against ISP DPI throttling.',
-        },
-        {
-          title: 'True HTTP 204 Ping & Cloudflare Speed Test',
-          desc: 'Servers screen measures real Xray-routed generate_204 latency; Speed screen runs 3-phase Cloudflare benchmarks.',
-        },
-        {
-          title: 'Minimizes to System Tray & Community Support',
-          desc: 'Closing the window keeps your tunnel running in the tray flyout. Need configs or help? Open Settings → About & Guide.',
-        },
-      ],
+      stepLabel: 'Step 3 of 4 • System Proxy vs TUN',
+      title: 'Choose How Windows Routes Traffic',
+      body: 'System Proxy routes browsers & Telegram with no Admin prompt. TUN Mode routes every app, game & CLI tool on your PC (asks Admin once) and lets you bypass specific .exe apps.',
+      showModeToggle: true,
+    },
+    {
+      stepLabel: 'Step 4 of 4 • Ready to Connect',
+      title: 'Tap the Power Orb & Check Speed',
+      body: 'Tap the crimson orb on Home to connect. Watch live Download/Upload speeds, run speed benchmarks in Speed, and close the window anytime to keep VPN running in System Tray.',
+      actionLabel: null,
     },
   ];
 
-  const current = steps[step];
-  const StepIcon = current.icon;
+  const cur = guideSteps[step];
 
   return (
     <AnimatePresence>
       {onboardingOpen && (
         <motion.div
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          exit={{ opacity: 0 }}
-          className="absolute inset-0 z-50 flex items-center justify-center p-4"
-          style={{ backgroundColor: 'rgba(10, 8, 9, 0.80)', backdropFilter: 'blur(6px)' }}
-          onClick={() => completeOnboarding(null)}
+          initial={{ opacity: 0, y: 18 }}
+          animate={{ opacity: 1, y: 0 }}
+          exit={{ opacity: 0, y: 14 }}
+          transition={{ duration: 0.16 }}
+          className="absolute inset-x-3 bottom-3 z-50 rounded-[20px] p-4 shadow-2xl"
+          style={{
+            backgroundColor: '#1B1617',
+            border: `1.5px solid ${COLORS.coral}`,
+            boxShadow: '0 20px 50px rgba(0,0,0,0.85)',
+          }}
         >
-          <motion.div
-            initial={{ opacity: 0, scale: 0.94, y: 14 }}
-            animate={{ opacity: 1, scale: 1, y: 0 }}
-            exit={{ opacity: 0, scale: 0.95, y: 10 }}
-            transition={SPRING}
-            onClick={(e) => e.stopPropagation()}
-            className="w-full max-w-[580px] rounded-[26px] p-6 shadow-2xl relative overflow-hidden"
-            style={{
-              backgroundColor: COLORS.surface,
-              border: `1px solid ${COLORS.surfaceActiveBorder}`,
-              backgroundImage: 'radial-gradient(circle at 85% 15%, rgba(155, 10, 18, 0.20) 0%, transparent 55%)',
-            }}
-          >
-            <div className="flex items-start justify-between gap-4 mb-4">
-              <div className="flex items-center gap-3.5">
-                <div
-                  className="w-12 h-12 rounded-[16px] flex items-center justify-center shrink-0"
-                  style={{ backgroundColor: '#2B1719', border: '1px solid #592C2C' }}
-                >
-                  <StepIcon className="w-5 h-5" style={{ color: COLORS.coral }} />
-                </div>
-                <div>
-                  <span
-                    className="inline-block px-2.5 py-0.5 rounded-full text-[10.5px] font-semibold uppercase tracking-wider mb-1"
-                    style={{ backgroundColor: '#291D1E', color: COLORS.amber, border: '1px solid #4A3921' }}
-                  >
-                    {current.badge}
-                  </span>
-                  <h2 className="font-jakarta font-bold text-[19px] leading-snug" style={{ color: COLORS.textPrimary }}>
-                    {current.title}
-                  </h2>
-                </div>
-              </div>
+          <div className="flex items-start justify-between gap-2 mb-1.5">
+            <span
+              className="px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider"
+              style={{ backgroundColor: COLORS.amberBg, color: COLORS.amber }}
+            >
+              {cur.stepLabel}
+            </span>
+            <button
+              type="button"
+              onClick={() => completeOnboarding(null)}
+              aria-label="Close guide"
+              className="w-6 h-6 rounded-full flex items-center justify-center cursor-pointer hover:bg-[#2E2627]"
+              style={{ color: COLORS.textMuted }}
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+
+          <h3 className="font-jakarta font-bold text-[14.5px] mb-1" style={{ color: COLORS.textPrimary }}>
+            {cur.title}
+          </h3>
+          <p className="text-[11.5px] leading-relaxed mb-3" style={{ color: '#CFC2C2' }}>
+            {cur.body}
+          </p>
+
+          {cur.showModeToggle && (
+            <div className="grid grid-cols-2 gap-2 mb-3">
               <button
                 type="button"
-                onClick={() => completeOnboarding(null)}
-                aria-label="Close guide"
-                className="w-8 h-8 rounded-full flex items-center justify-center cursor-pointer hover:bg-[#2F2829]"
-                style={{ color: COLORS.textMuted }}
+                onClick={() => setSystemMode('PROXY')}
+                className="py-1.5 px-2.5 rounded-[12px] text-[11px] font-semibold cursor-pointer text-left"
+                style={{
+                  backgroundColor: systemMode === 'PROXY' ? COLORS.crimson : COLORS.obsidian,
+                  color: COLORS.textPrimary,
+                  border: `1px solid ${systemMode === 'PROXY' ? '#BC1F27' : COLORS.surfaceBorder}`,
+                }}
               >
-                <X className="w-4 h-4" />
+                <div>System Proxy</div>
+                <div className="text-[9.5px] opacity-80">Browsers • No Admin</div>
+              </button>
+              <button
+                type="button"
+                onClick={() => setSystemMode('TUN')}
+                className="py-1.5 px-2.5 rounded-[12px] text-[11px] font-semibold cursor-pointer text-left"
+                style={{
+                  backgroundColor: systemMode === 'TUN' ? COLORS.crimson : COLORS.obsidian,
+                  color: COLORS.textPrimary,
+                  border: `1px solid ${systemMode === 'TUN' ? '#BC1F27' : COLORS.surfaceBorder}`,
+                }}
+              >
+                <div>TUN Mode</div>
+                <div className="text-[9.5px] opacity-80">All Apps/Games • Admin</div>
               </button>
             </div>
+          )}
 
-            <p className="text-[12.5px] leading-relaxed mb-4" style={{ color: COLORS.textMuted }}>
-              {current.subtitle}
-            </p>
-
-            <div className="space-y-2.5 mb-5">
-              {current.highlights.map((item, idx) => (
-                <div
-                  key={item.title}
-                  className="rounded-[16px] p-3.5 flex items-start gap-3"
-                  style={{ backgroundColor: '#151112', border: `1px solid ${COLORS.surfaceBorder}` }}
+          {cur.actionLabel && (
+            <div className="flex items-center gap-2 mb-3">
+              <button
+                type="button"
+                onClick={cur.onAction}
+                className="h-[28px] px-3 rounded-full text-[11px] font-semibold cursor-pointer"
+                style={{ backgroundColor: COLORS.taupe, color: COLORS.textPrimary, border: '1px solid #634947' }}
+              >
+                {cur.actionLabel}
+              </button>
+              {cur.onAlt && (
+                <button
+                  type="button"
+                  onClick={cur.onAlt}
+                  className="h-[28px] px-3 rounded-full text-[11px] font-semibold cursor-pointer"
+                  style={{ backgroundColor: COLORS.obsidian, color: COLORS.amber, border: `1px solid ${COLORS.surfaceBorder}` }}
                 >
-                  <div
-                    className="w-6 h-6 rounded-full flex items-center justify-center shrink-0 text-[11px] font-bold font-mono mt-0.5"
-                    style={{ backgroundColor: COLORS.crimson, color: COLORS.textPrimary }}
-                  >
-                    {idx + 1}
-                  </div>
-                  <div className="min-w-0">
-                    <div className="text-[13px] font-semibold" style={{ color: COLORS.textPrimary }}>
-                      {item.title}
-                    </div>
-                    <p className="text-[11.5px] leading-relaxed mt-0.5" style={{ color: COLORS.textMuted }}>
-                      {item.desc}
-                    </p>
-                  </div>
-                </div>
+                  {cur.altLabel}
+                </button>
+              )}
+            </div>
+          )}
+
+          <div className="flex items-center justify-between pt-2 border-t" style={{ borderColor: '#2D2425' }}>
+            <div className="flex items-center gap-1">
+              {guideSteps.map((_, idx) => (
+                <button
+                  key={idx}
+                  type="button"
+                  onClick={() => setStep(idx)}
+                  aria-label={`Step ${idx + 1}`}
+                  className="h-1.5 rounded-full cursor-pointer transition-all"
+                  style={{
+                    width: step === idx ? 18 : 6,
+                    backgroundColor: step === idx ? COLORS.coral : '#3A2E2F',
+                  }}
+                />
               ))}
             </div>
 
-            {step === 1 && (
-              <div
-                className="rounded-[14px] p-2.5 mb-4 flex items-center justify-between gap-3"
-                style={{ backgroundColor: '#1A1415', border: `1px solid ${COLORS.surfaceBorder}` }}
-              >
-                <span className="text-[11.5px] font-medium pl-1" style={{ color: COLORS.textMuted }}>
-                  Current Windows Mode:
-                </span>
-                <div className="flex items-center gap-1.5">
-                  <button
-                    type="button"
-                    onClick={() => setSystemMode('proxy')}
-                    className="px-3 py-1.5 rounded-full text-[11.5px] font-semibold cursor-pointer"
-                    style={{
-                      backgroundColor: settings.systemMode === 'proxy' ? COLORS.crimson : '#262021',
-                      color: COLORS.textPrimary,
-                    }}
-                  >
-                    System Proxy
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setSystemMode('tun')}
-                    className="px-3 py-1.5 rounded-full text-[11.5px] font-semibold cursor-pointer"
-                    style={{
-                      backgroundColor: settings.systemMode === 'tun' ? COLORS.crimson : '#262021',
-                      color: COLORS.textPrimary,
-                    }}
-                  >
-                    TUN Mode (Admin)
-                  </button>
-                </div>
-              </div>
-            )}
+            <div className="flex items-center gap-1.5">
+              {step > 0 ? (
+                <button
+                  type="button"
+                  onClick={() => setStep((s) => Math.max(0, s - 1))}
+                  className="px-3 py-1 rounded-full text-[11px] font-semibold cursor-pointer hover:bg-[#2A2324]"
+                  style={{ color: COLORS.textMuted, border: `1px solid ${COLORS.surfaceBorder}` }}
+                >
+                  Back
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => completeOnboarding(null)}
+                  className="px-3 py-1 rounded-full text-[11px] font-semibold cursor-pointer hover:bg-[#2A2324]"
+                  style={{ color: COLORS.textMuted }}
+                >
+                  Skip
+                </button>
+              )}
 
-            <div className="flex items-center justify-between gap-3 pt-3 border-t" style={{ borderColor: '#292122' }}>
-              <div className="flex items-center gap-1.5">
-                {steps.map((_, i) => (
-                  <button
-                    key={i}
-                    type="button"
-                    onClick={() => setStep(i)}
-                    aria-label={`Go to step ${i + 1}`}
-                    className="h-2 rounded-full transition-all cursor-pointer"
-                    style={{
-                      width: step === i ? 24 : 8,
-                      backgroundColor: step === i ? COLORS.coral : '#3A2E2F',
-                    }}
-                  />
-                ))}
-              </div>
-
-              <div className="flex items-center gap-2">
-                {step > 0 ? (
-                  <button
-                    type="button"
-                    onClick={() => setStep((s) => Math.max(0, s - 1))}
-                    className="px-4 py-2 rounded-full text-[12px] font-semibold cursor-pointer hover:bg-[#2A2324]"
-                    style={{ color: COLORS.textMuted, border: `1px solid ${COLORS.surfaceBorder}` }}
-                  >
-                    Back
-                  </button>
-                ) : (
-                  <button
-                    type="button"
-                    onClick={() => completeOnboarding(null)}
-                    className="px-4 py-2 rounded-full text-[12px] font-semibold cursor-pointer hover:bg-[#2A2324]"
-                    style={{ color: COLORS.textMuted }}
-                  >
-                    Skip for now
-                  </button>
-                )}
-
-                {step < steps.length - 1 ? (
-                  <button
-                    type="button"
-                    onClick={() => setStep((s) => Math.min(steps.length - 1, s + 1))}
-                    className="px-5 py-2 rounded-full text-[12.5px] font-semibold cursor-pointer"
-                    style={{ backgroundColor: COLORS.crimson, color: COLORS.textPrimary }}
-                  >
-                    Next Step
-                  </button>
-                ) : (
-                  <div className="flex items-center gap-2">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setActiveRoute('settings');
-                        completeOnboarding(null);
-                      }}
-                      className="px-4 py-2 rounded-full text-[12px] font-semibold cursor-pointer"
-                      style={{ backgroundColor: '#282021', border: `1px solid ${COLORS.surfaceBorder}`, color: COLORS.textPrimary }}
-                    >
-                      Open Settings
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => completeOnboarding('uri')}
-                      className="px-5 py-2 rounded-full text-[12.5px] font-semibold cursor-pointer"
-                      style={{ backgroundColor: COLORS.crimson, color: COLORS.textPrimary }}
-                    >
-                      Import First Server
-                    </button>
-                  </div>
-                )}
-              </div>
+              {step < guideSteps.length - 1 ? (
+                <button
+                  type="button"
+                  onClick={() => setStep((s) => s + 1)}
+                  className="px-3.5 py-1 rounded-full text-[11.5px] font-semibold cursor-pointer"
+                  style={{ backgroundColor: COLORS.crimson, color: COLORS.textPrimary }}
+                >
+                  Next Step
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => completeOnboarding(null)}
+                  className="px-3.5 py-1 rounded-full text-[11.5px] font-semibold cursor-pointer"
+                  style={{ backgroundColor: COLORS.crimson, color: COLORS.textPrimary }}
+                >
+                  Finish
+                </button>
+              )}
             </div>
-          </motion.div>
+          </div>
         </motion.div>
       )}
     </AnimatePresence>
@@ -5654,13 +5065,14 @@ function DesktopStage() {
         style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}` }}
       >
         <Titlebar />
-        <div className="flex-1 flex gap-3.5 p-3.5 min-h-0 overflow-hidden">
+        <div className="flex-1 flex gap-2.5 p-2.5 min-h-0 overflow-hidden">
           <NavigationRail />
-          <main className="flex-1 min-w-0 h-full overflow-y-auto pr-1 custom-scrollbar">
+          <main className="flex-1 min-w-0 h-full overflow-y-auto overflow-x-hidden pr-0.5 custom-scrollbar">
             <AnimatePresence mode="wait">{renderScreen()}</AnimatePresence>
           </main>
         </div>
         <AddConfigModal />
+        <QrScannerModal />
         <WindowsAppsModal />
         <AdminElevationModal />
         <OnboardingGuideModal />
@@ -5684,12 +5096,11 @@ function DesktopStage() {
         {!windowMinimizedToTray ? (
           <motion.div
             key="main-desktop-window"
-            layout
-            initial={{ opacity: 0, scale: 0.94, y: 16 }}
+            initial={{ opacity: 0, scale: 0.96, y: 12 }}
             animate={{ opacity: 1, scale: 1, y: 0 }}
-            exit={{ opacity: 0, scale: 0.88, y: 40 }}
-            transition={SPRING_SOFT}
-            className="relative flex flex-col overflow-hidden w-full max-w-[1040px] h-[680px] max-h-[calc(100vh-76px)] rounded-[14px]"
+            exit={{ opacity: 0, scale: 0.92, y: 30 }}
+            transition={{ duration: 0.16 }}
+            className="relative flex flex-col overflow-hidden w-full max-w-[520px] h-[620px] max-h-[calc(100vh-70px)] rounded-[14px]"
             style={{
               backgroundColor: COLORS.obsidian,
               border: `1px solid ${COLORS.surfaceBorder}`,
@@ -5697,13 +5108,14 @@ function DesktopStage() {
             }}
           >
             <Titlebar />
-            <div className="flex-1 flex gap-3.5 p-3.5 min-h-0 overflow-hidden">
+            <div className="flex-1 flex gap-2.5 p-2.5 min-h-0 overflow-hidden">
               <NavigationRail />
-              <main className="flex-1 min-w-0 h-full overflow-y-auto pr-1 custom-scrollbar">
+              <main className="flex-1 min-w-0 h-full overflow-y-auto overflow-x-hidden pr-0.5 custom-scrollbar">
                 <AnimatePresence mode="wait">{renderScreen()}</AnimatePresence>
               </main>
             </div>
             <AddConfigModal />
+            <QrScannerModal />
             <WindowsAppsModal />
             <AdminElevationModal />
             <OnboardingGuideModal />
@@ -5730,7 +5142,6 @@ function DesktopStage() {
               Metrovpn is running in System Tray
             </h2>
             <motion.button
-              whileHover={{ scale: 1.03 }}
               whileTap={{ scale: 0.96 }}
               transition={SPRING}
               onClick={restoreFromTray}
@@ -5761,7 +5172,6 @@ function DesktopStage() {
         )}
 
         <motion.button
-          whileHover={{ scale: 1.02 }}
           whileTap={{ scale: 0.96 }}
           transition={SPRING}
           onClick={() => setTrayFlyoutOpen((v) => !v)}

@@ -1,3 +1,4 @@
+use crate::models::WindowsAppRule;
 use serde::{Deserialize, Serialize};
 use std::net::UdpSocket;
 use std::path::Path;
@@ -33,19 +34,33 @@ pub fn get_active_lan_ipv4() -> String {
 
 #[cfg(windows)]
 mod win_impl {
-    use super::ProxyBackup;
+    use super::{ProxyBackup, WindowsAppRule};
+    use std::collections::{BTreeMap, HashSet};
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::process::CommandExt;
     use std::path::Path;
     use std::process::Command;
+    use std::sync::OnceLock;
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
+    use windows_sys::Win32::Graphics::Gdi::{
+        BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC,
+        GetDIBits, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
+        SRCCOPY,
+    };
     use windows_sys::Win32::Networking::WinInet::{
         InternetSetOptionW, INTERNET_OPTION_REFRESH, INTERNET_OPTION_SETTINGS_CHANGED,
     };
+    use windows_sys::Win32::System::Threading::CreateMutexW;
     use windows_sys::Win32::UI::Shell::{IsUserAnAdmin, ShellExecuteW};
-    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-    use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, GetSystemMetrics, SetForegroundWindow, ShowWindow, SM_CXVIRTUALSCREEN,
+        SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_RESTORE, SW_SHOWNORMAL,
+    };
+    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE};
     use winreg::RegKey;
+
+    static SINGLE_INSTANCE_HANDLE: OnceLock<isize> = OnceLock::new();
 
     pub const CREATE_NO_WINDOW: u32 = 0x08000000;
     const INTERNET_SETTINGS_PATH: &str =
@@ -182,17 +197,50 @@ mod win_impl {
         unsafe { IsUserAnAdmin() != 0 }
     }
 
+    pub fn acquire_single_instance_or_focus() -> bool {
+        let is_relaunch = std::env::args().any(|a| a == "--relaunch");
+        let name = to_wide("Local\\MetrovpnSingleInstanceMutex");
+        let attempts = if is_relaunch { 30 } else { 1 };
+        for _ in 0..attempts {
+            let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+            if handle != std::ptr::null_mut() {
+                let err = unsafe { GetLastError() };
+                if err != ERROR_ALREADY_EXISTS {
+                    let _ = SINGLE_INSTANCE_HANDLE.set(handle as isize);
+                    return true;
+                }
+                unsafe {
+                    CloseHandle(handle);
+                }
+            }
+            if is_relaunch {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+
+        let title = to_wide("Metrovpn");
+        unsafe {
+            let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+            if hwnd != std::ptr::null_mut() {
+                ShowWindow(hwnd, SW_RESTORE);
+                SetForegroundWindow(hwnd);
+            }
+        }
+        false
+    }
+
     pub fn relaunch_as_admin() -> Result<(), String> {
         let exe = std::env::current_exe()
             .map_err(|e| format!("Failed to resolve current executable: {e}"))?;
         let verb = to_wide("runas");
         let file = to_wide(&exe.to_string_lossy());
+        let params = to_wide("--relaunch");
         let res = unsafe {
             ShellExecuteW(
                 std::ptr::null_mut(),
                 verb.as_ptr(),
                 file.as_ptr(),
-                std::ptr::null(),
+                params.as_ptr(),
                 std::ptr::null(),
                 SW_SHOWNORMAL,
             )
@@ -313,12 +361,342 @@ mod win_impl {
                 .output();
         }
     }
+
+    fn is_noisy_system_exe(exe_lower: &str) -> bool {
+        matches!(
+            exe_lower,
+            "svchost.exe"
+                | "csrss.exe"
+                | "smss.exe"
+                | "wininit.exe"
+                | "services.exe"
+                | "lsass.exe"
+                | "lsm.exe"
+                | "winlogon.exe"
+                | "dwm.exe"
+                | "fontdrvhost.exe"
+                | "conhost.exe"
+                | "sihost.exe"
+                | "ctfmon.exe"
+                | "taskhostw.exe"
+                | "runtimebroker.exe"
+                | "shellexperiencehost.exe"
+                | "startmenuexperiencehost.exe"
+                | "searchhost.exe"
+                | "searchindexer.exe"
+                | "spoolsv.exe"
+                | "audiodg.exe"
+                | "wmiprvse.exe"
+                | "dllhost.exe"
+                | "registry"
+                | "system"
+                | "system idle process"
+                | "memory compression"
+                | "secure system"
+                | "applicationframehost.exe"
+                | "textinputhost.exe"
+                | "widgetservice.exe"
+                | "widgets.exe"
+                | "taskmgr.exe"
+                | "metrovpn.exe"
+                | "xray.exe"
+                | "tun2socks.exe"
+        ) || exe_lower.starts_with("unins")
+            || exe_lower.contains("uninstall")
+            || exe_lower.contains("crashreporter")
+            || exe_lower.contains("helper")
+            || exe_lower.contains("updater")
+    }
+
+    fn pretty_app_name(exe: &str, raw_name: Option<&str>) -> String {
+        if let Some(n) = raw_name {
+            let cleaned = n.trim();
+            if !cleaned.is_empty() && cleaned.len() <= 48 {
+                return cleaned.to_string();
+            }
+        }
+        let stem = exe
+            .strip_suffix(".exe")
+            .or_else(|| exe.strip_suffix(".EXE"))
+            .unwrap_or(exe);
+        let mut chars = stem.chars();
+        match chars.next() {
+            Some(c) => format!("{}{}", c.to_uppercase(), chars.as_str()),
+            None => exe.to_string(),
+        }
+    }
+
+    fn extract_exe_from_icon_or_path(raw: &str) -> Option<String> {
+        let trimmed = raw.trim().trim_matches('"');
+        let before_comma = trimmed.split(',').next().unwrap_or(trimmed).trim().trim_matches('"');
+        if before_comma.to_lowercase().ends_with(".exe") {
+            let fname = Path::new(before_comma).file_name()?.to_str()?.to_string();
+            return Some(fname);
+        }
+        None
+    }
+
+    pub fn scan_installed_windows_apps(existing: &[WindowsAppRule]) -> Vec<WindowsAppRule> {
+        let mut bypassed_map: BTreeMap<String, WindowsAppRule> = BTreeMap::new();
+        for rule in existing {
+            let key = rule.exe.to_lowercase();
+            if rule.bypassed || rule.category == "Custom" {
+                bypassed_map.insert(key, rule.clone());
+            }
+        }
+
+        let mut running_exes: HashSet<String> = HashSet::new();
+        let mut found: BTreeMap<String, (String, String, &'static str)> = BTreeMap::new();
+
+        // 1. Scan active user processes via tasklist
+        if let Ok(out) = Command::new("tasklist")
+            .args(["/FO", "CSV", "/NH"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+        {
+            let text = String::from_utf8_lossy(&out.stdout);
+            for line in text.lines() {
+                let first_col = line.trim().trim_start_matches('"').split('"').next().unwrap_or("").trim();
+                if first_col.to_lowercase().ends_with(".exe") {
+                    let lower = first_col.to_lowercase();
+                    if !is_noisy_system_exe(&lower) {
+                        running_exes.insert(lower.clone());
+                        found.entry(lower).or_insert_with(|| {
+                            (pretty_app_name(first_col, None), first_col.to_string(), "Running")
+                        });
+                    }
+                }
+            }
+        }
+
+        // 2. Scan Windows Registry Uninstall entries (HKLM, WOW6432Node, HKCU)
+        let uninstall_paths = [
+            (RegKey::predef(HKEY_LOCAL_MACHINE), "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall"),
+            (RegKey::predef(HKEY_LOCAL_MACHINE), "SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall"),
+            (RegKey::predef(HKEY_CURRENT_USER), "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall"),
+        ];
+        for (root, sub) in uninstall_paths {
+            if let Ok(key) = root.open_subkey_with_flags(sub, KEY_READ) {
+                for name_res in key.enum_keys() {
+                    let Ok(sub_name) = name_res else { continue };
+                    let Ok(app_key) = key.open_subkey_with_flags(&sub_name, KEY_READ) else {
+                        continue;
+                    };
+                    let display_name: Option<String> = app_key.get_value("DisplayName").ok();
+                    let exe_opt = app_key
+                        .get_value::<String, _>("DisplayIcon")
+                        .ok()
+                        .and_then(|s| extract_exe_from_icon_or_path(&s))
+                        .or_else(|| {
+                            let loc: String = app_key.get_value("InstallLocation").ok()?;
+                            let p = Path::new(loc.trim().trim_matches('"'));
+                            if !p.is_dir() {
+                                return None;
+                            }
+                            let entries = std::fs::read_dir(p).ok()?;
+                            for e in entries.flatten() {
+                                let path = e.path();
+                                if path.extension().and_then(|x| x.to_str()).map(|x| x.eq_ignore_ascii_case("exe")).unwrap_or(false) {
+                                    if let Some(fname) = path.file_name().and_then(|x| x.to_str()) {
+                                        if !is_noisy_system_exe(&fname.to_lowercase()) {
+                                            return Some(fname.to_string());
+                                        }
+                                    }
+                                }
+                            }
+                            None
+                        });
+                    if let Some(exe) = exe_opt {
+                        let lower = exe.to_lowercase();
+                        if !is_noisy_system_exe(&lower) {
+                            let cat = if running_exes.contains(&lower) { "Running" } else { "Installed" };
+                            let label = pretty_app_name(&exe, display_name.as_deref());
+                            found.insert(lower, (label, exe, cat));
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Scan common Program Files / LocalAppData\Programs top folders
+        let mut prog_dirs = Vec::new();
+        for env_key in ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"] {
+            if let Ok(val) = std::env::var(env_key) {
+                let p = if env_key == "LOCALAPPDATA" {
+                    Path::new(&val).join("Programs")
+                } else {
+                    Path::new(&val).to_path_buf()
+                };
+                if p.is_dir() {
+                    prog_dirs.push(p);
+                }
+            }
+        }
+        for dir in prog_dirs {
+            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            for entry in entries.flatten() {
+                let sub = entry.path();
+                if !sub.is_dir() {
+                    continue;
+                }
+                let folder_name = sub.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                if folder_name.eq_ignore_ascii_case("WindowsApps")
+                    || folder_name.starts_with("Windows ")
+                    || folder_name.starts_with("Common Files")
+                {
+                    continue;
+                }
+                if let Ok(sub_entries) = std::fs::read_dir(&sub) {
+                    for se in sub_entries.flatten() {
+                        let sp = se.path();
+                        if sp.extension().and_then(|x| x.to_str()).map(|x| x.eq_ignore_ascii_case("exe")).unwrap_or(false) {
+                            if let Some(fname) = sp.file_name().and_then(|x| x.to_str()) {
+                                let lower = fname.to_lowercase();
+                                if !is_noisy_system_exe(&lower) {
+                                    let cat = if running_exes.contains(&lower) { "Running" } else { "Installed" };
+                                    found.entry(lower).or_insert_with(|| {
+                                        (pretty_app_name(fname, Some(folder_name)), fname.to_string(), cat)
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut merged: Vec<WindowsAppRule> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+
+        for (lower, rule) in &bypassed_map {
+            seen.insert(lower.clone());
+            let cat = if rule.category == "Custom" {
+                "Custom".to_string()
+            } else if running_exes.contains(lower) {
+                "Running".to_string()
+            } else {
+                "Installed".to_string()
+            };
+            merged.push(WindowsAppRule {
+                id: rule.id.clone(),
+                name: rule.name.clone(),
+                exe: rule.exe.clone(),
+                category: cat,
+                bypassed: rule.bypassed,
+            });
+        }
+
+        for (lower, (name, exe, cat)) in found {
+            if seen.contains(&lower) {
+                continue;
+            }
+            seen.insert(lower.clone());
+            merged.push(WindowsAppRule {
+                id: format!("app-{lower}"),
+                name,
+                exe,
+                category: cat.to_string(),
+                bypassed: false,
+            });
+        }
+
+        merged.sort_by(|a, b| {
+            b.bypassed
+                .cmp(&a.bypassed)
+                .then_with(|| (b.category == "Running").cmp(&(a.category == "Running")))
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+        merged.truncate(120);
+        merged
+    }
+
+    pub fn capture_virtual_screen_rgba() -> Result<(u32, u32, Vec<u8>), String> {
+        unsafe {
+            let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+            let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+            if vw <= 0 || vh <= 0 {
+                return Err("Cannot query Windows screen dimensions".into());
+            }
+
+            let screen_dc = GetDC(std::ptr::null_mut());
+            if screen_dc.is_null() {
+                return Err("Failed to acquire screen device context".into());
+            }
+            let mem_dc = CreateCompatibleDC(screen_dc);
+            if mem_dc.is_null() {
+                ReleaseDC(std::ptr::null_mut(), screen_dc);
+                return Err("Failed to create memory device context".into());
+            }
+            let bmp = CreateCompatibleBitmap(screen_dc, vw, vh);
+            if bmp.is_null() {
+                DeleteDC(mem_dc);
+                ReleaseDC(std::ptr::null_mut(), screen_dc);
+                return Err("Failed to create screen bitmap".into());
+            }
+
+            let old_obj = SelectObject(mem_dc, bmp);
+            let copied = BitBlt(mem_dc, 0, 0, vw, vh, screen_dc, vx, vy, SRCCOPY);
+            SelectObject(mem_dc, old_obj);
+            ReleaseDC(std::ptr::null_mut(), screen_dc);
+
+            if copied == 0 {
+                DeleteObject(bmp);
+                DeleteDC(mem_dc);
+                return Err("BitBlt screen capture failed".into());
+            }
+
+            let mut bmi: BITMAPINFO = std::mem::zeroed();
+            bmi.bmiHeader = BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: vw,
+                biHeight: -vh,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB,
+                biSizeImage: 0,
+                biXPelsPerMeter: 0,
+                biYPelsPerMeter: 0,
+                biClrUsed: 0,
+                biClrImportant: 0,
+            };
+
+            let mut buf = vec![0u8; (vw as usize) * (vh as usize) * 4];
+            let lines = GetDIBits(
+                mem_dc,
+                bmp,
+                0,
+                vh as u32,
+                buf.as_mut_ptr() as *mut _,
+                &mut bmi,
+                DIB_RGB_COLORS,
+            );
+            DeleteObject(bmp);
+            DeleteDC(mem_dc);
+
+            if lines == 0 {
+                return Err("GetDIBits failed to read captured pixels".into());
+            }
+
+            for chunk in buf.chunks_exact_mut(4) {
+                chunk.swap(0, 2); // BGRA -> RGBA
+                chunk[3] = 255;
+            }
+            Ok((vw as u32, vh as u32, buf))
+        }
+    }
 }
 
 #[cfg(not(windows))]
 mod win_impl {
+    use super::WindowsAppRule;
     use std::path::Path;
     pub const CREATE_NO_WINDOW: u32 = 0;
+
+    pub fn acquire_single_instance_or_focus() -> bool {
+        true
+    }
 
     pub fn enable_system_proxy(
         backup_path: &Path,
@@ -359,11 +737,20 @@ mod win_impl {
     }
 
     pub fn teardown_tun_routes(_pinned_server_ips: &[String]) {}
+
+    pub fn scan_installed_windows_apps(existing: &[WindowsAppRule]) -> Vec<WindowsAppRule> {
+        existing.to_vec()
+    }
+
+    pub fn capture_virtual_screen_rgba() -> Result<(u32, u32, Vec<u8>), String> {
+        Err("Screen capture QR is only supported on Windows".into())
+    }
 }
 
 pub use win_impl::{
-    configure_tun_interface, enable_system_proxy, is_elevated, relaunch_as_admin,
-    restore_system_proxy, teardown_tun_routes, CREATE_NO_WINDOW,
+    acquire_single_instance_or_focus, capture_virtual_screen_rgba, configure_tun_interface,
+    enable_system_proxy, is_elevated, relaunch_as_admin, restore_system_proxy,
+    scan_installed_windows_apps, teardown_tun_routes, CREATE_NO_WINDOW,
 };
 
 pub fn backup_file_path(app_data_dir: &Path) -> std::path::PathBuf {

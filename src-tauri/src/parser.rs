@@ -180,7 +180,7 @@ pub fn parse_vless_uri(raw: &str) -> Result<ServerNode, String> {
         allow_insecure,
         ping: None,
         quota_used_gb: 0.0,
-        quota_total_gb: 100.0,
+        quota_total_gb: 0.0,
         starred: false,
         online: false,
         ip: address,
@@ -277,7 +277,7 @@ pub fn parse_vmess_uri(raw: &str) -> Result<ServerNode, String> {
         allow_insecure: false,
         ping: None,
         quota_used_gb: 0.0,
-        quota_total_gb: 100.0,
+        quota_total_gb: 0.0,
         starred: false,
         online: false,
         ip: address,
@@ -434,7 +434,7 @@ pub fn parse_xray_json(raw: &str) -> Result<ServerNode, String> {
             .unwrap_or(false),
         ping: None,
         quota_used_gb: 0.0,
-        quota_total_gb: 100.0,
+        quota_total_gb: 0.0,
         starred: false,
         online: false,
         ip: address,
@@ -565,6 +565,31 @@ pub fn decode_qr_from_bytes(bytes: &[u8]) -> Result<String, String> {
         }
     }
     Err("No QR code detected in the provided image".into())
+}
+
+pub fn decode_qr_from_rgba(width: u32, height: u32, rgba: Vec<u8>) -> Result<String, String> {
+    let img = image::RgbaImage::from_raw(width, height, rgba)
+        .ok_or_else(|| "Invalid screen image buffer".to_string())?;
+    let luma = image::DynamicImage::ImageRgba8(img).to_luma8();
+    let mut prepared = rqrr::PreparedImage::prepare(luma.clone());
+    for grid in prepared.detect_grids() {
+        if let Ok((_meta, content)) = grid.decode() {
+            return Ok(content);
+        }
+    }
+
+    // Retry inverted luminance for white-on-dark QR codes
+    let mut inverted = luma;
+    for p in inverted.pixels_mut() {
+        p.0[0] = 255u8.saturating_sub(p.0[0]);
+    }
+    let mut prep_inv = rqrr::PreparedImage::prepare(inverted);
+    for grid in prep_inv.detect_grids() {
+        if let Ok((_meta, content)) = grid.decode() {
+            return Ok(content);
+        }
+    }
+    Err("No QR code found on screen. Make sure the QR code is clearly visible and try again.".into())
 }
 
 fn urlencoding_decode(input: &str) -> String {

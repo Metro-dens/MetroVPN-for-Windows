@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: "Release tag to create (e.g. v2.5.1)"
+        description: "Release tag to create (e.g. v2.6.0)"
         required: true
-        default: "v2.5.1"
+        default: "v2.6.0"
         type: string
       draft:
         description: "Create as a draft release (hidden until published)"
@@ -76,11 +76,11 @@ jobs:
             - **`Metrovpn-windows-x64-portable.zip`** — Portable folder archive with all binaries side-by-side.
             - **`SHA256SUMS.txt`** — SHA-256 verification checksums (`Get-FileHash <file> -Algorithm SHA256`).
 
-            ### What's New in v2.5.0
-            - **First-Run Onboarding Guide (`?`):** 3-step walkthrough for importing VLESS/VMess/Subscriptions, choosing System Proxy vs Wintun TUN Mode, and configuring Strict VCN / TLS Frag / System Tray.
-            - **5-Tab Settings (v2rayN & NekoRay Style + MetroVPN Android Parity):** `General & Proxy`, `TUN & Routing` (`Rule`/`Global`/`Direct`, custom fragment, IPv6 control, Split Tunnel `.exe` exclusions), `DNS & Security` (`1.1.1.2`, bootstrap DNS, Mux, uTLS), `Subs & Speed`, and `About & Guide` (in-app update checker + Telegram links).
-            - **Cleaner, Faster & Offline-Safe Desktop UI:** Removed dead dummy node, fixed last-node deletion, fixed window button hitboxes (`data-tauri-drag-region`), removed blocking remote Google Fonts, and prevented keystroke-induced tunnel drops.
-            - **True Xray HTTP 204 Ping & Stronger Windows Proxy/TUN:** Real `generate_204` Xray latency testing, PAC (`AutoConfigURL`) backup/restore, `store=active` route fixes, and multi-IP server bypass pinning.
+            ### What's New in v2.6.0
+            - **Compact NetMod-Inspired `520×620` Window:** Crisp uncropped layout across `Home`, `Servers`, `Speed`, and `Settings` with smooth non-flickering hover transitions.
+            - **Screen Capture + Camera QR Scanner:** Dedicated QR Scanner captures QRs straight off your screen (NetMod style) or via live webcam; `+ Add` focuses cleanly on `vless://` / `vmess://` links.
+            - **Real PC Split Tunneling Scanner & Live Quota/Telemetry:** Scans installed & running Windows `.exe` apps automatically, tracks live server data usage, and drives `Realtime Telemetry Stream` from real Xray throughput.
+            - **Interactive Walkthrough & Simplified 3-Tab Settings:** Step-by-step live tour across tabs, plain-English **System Proxy vs TUN Mode** guide, and single-instance tray cleanup (no duplicate wolf tray icons).
 
             > **SmartScreen Note:** If Windows Defender SmartScreen prompts on an unsigned build, verify the SHA-256 checksum against `SHA256SUMS.txt` and click **More info → Run anyway**.
           releaseDraft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft || false }}

@@ -69,6 +69,8 @@ pub async fn query_xray_stats(port: u16) -> Result<XrayTrafficTotals, String> {
 
 fn parse_query_stats_response(data: &[u8]) -> XrayTrafficTotals {
     let mut totals = XrayTrafficTotals::default();
+    let mut inbound_up: u64 = 0;
+    let mut inbound_down: u64 = 0;
     let mut i = 0;
 
     while i < data.len() {
@@ -85,17 +87,28 @@ fn parse_query_stats_response(data: &[u8]) -> XrayTrafficTotals {
             };
             let end = start.saturating_add(len as usize).min(data.len());
             if let Some((name, val)) = parse_stat_msg(&data[start..end]) {
-                // Prefer outbound>>>proxy>>>traffic>>>{uplink,downlink}
+                let uval = val.max(0) as u64;
                 if name == "outbound>>>proxy>>>traffic>>>uplink" {
-                    totals.uplink_bytes = val.max(0) as u64;
+                    totals.uplink_bytes = uval;
                 } else if name == "outbound>>>proxy>>>traffic>>>downlink" {
-                    totals.downlink_bytes = val.max(0) as u64;
+                    totals.downlink_bytes = uval;
+                } else if name.starts_with("inbound>>>") && name.ends_with(">>>traffic>>>uplink") {
+                    inbound_up = inbound_up.saturating_add(uval);
+                } else if name.starts_with("inbound>>>") && name.ends_with(">>>traffic>>>downlink") {
+                    inbound_down = inbound_down.saturating_add(uval);
                 }
             }
             i = end;
         } else {
             i = skip_field(data, i, wire_type);
         }
+    }
+
+    if totals.uplink_bytes == 0 && inbound_up > 0 {
+        totals.uplink_bytes = inbound_up;
+    }
+    if totals.downlink_bytes == 0 && inbound_down > 0 {
+        totals.downlink_bytes = inbound_down;
     }
 
     totals

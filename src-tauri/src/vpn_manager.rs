@@ -3,10 +3,11 @@ use crate::models::{
     VpnStatusPayload, WindowsAppRule,
 };
 use crate::network_win::{
-    backup_file_path, configure_tun_interface, enable_system_proxy, get_active_lan_ipv4,
-    is_elevated, relaunch_as_admin, restore_system_proxy, teardown_tun_routes, CREATE_NO_WINDOW,
+    backup_file_path, capture_virtual_screen_rgba, configure_tun_interface, enable_system_proxy,
+    get_active_lan_ipv4, is_elevated, relaunch_as_admin, restore_system_proxy,
+    scan_installed_windows_apps, teardown_tun_routes, CREATE_NO_WINDOW,
 };
-use crate::parser::{decode_qr_from_bytes, fetch_subscription, parse_any};
+use crate::parser::{decode_qr_from_bytes, decode_qr_from_rgba, fetch_subscription, parse_any};
 use crate::xray_config::{build_xray_config, STATS_API_PORT};
 use crate::xray_stats::query_xray_stats;
 use chrono::Local;
@@ -117,6 +118,7 @@ impl AppState {
             guard.telemetry_generation = guard.telemetry_generation.wrapping_add(1);
             guard.status = "Disconnected".into();
             guard.connected_at = None;
+            save_store(&guard.store_path, &guard.store);
             (
                 guard.xray_child.take(),
                 guard.tun_child.take(),
@@ -605,8 +607,10 @@ pub async fn connect_internal(
 fn spawn_telemetry_loop(app: AppHandle, state: AppState, generation: u64) {
     tauri::async_runtime::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
+        let mut ticks: u64 = 0;
         loop {
             interval.tick().await;
+            ticks = ticks.wrapping_add(1);
 
             let (still_active, elapsed, prev_down, prev_up) = {
                 let Ok(guard) = state.inner.lock() else {
@@ -633,14 +637,32 @@ fn spawn_telemetry_loop(app: AppHandle, state: AppState, generation: u64) {
             let totals = query_xray_stats(STATS_API_PORT).await.unwrap_or_default();
             let down_bps = totals.downlink_bytes.saturating_sub(prev_down);
             let up_bps = totals.uplink_bytes.saturating_sub(prev_up);
+            let delta_bytes = down_bps.saturating_add(up_bps);
 
-            if let Ok(mut guard) = state.inner.lock() {
+            let active_quota_gb = if let Ok(mut guard) = state.inner.lock() {
                 if guard.telemetry_generation != generation {
                     break;
                 }
                 guard.last_down_bytes = totals.downlink_bytes;
                 guard.last_up_bytes = totals.uplink_bytes;
-            }
+
+                let mut quota_now = None;
+                if let Some(active_id) = guard.store.settings.active_node_id.clone() {
+                    if let Some(node) = guard.store.servers.iter_mut().find(|s| s.id == active_id) {
+                        if delta_bytes > 0 {
+                            let delta_gb = (delta_bytes as f64) / 1_073_741_824.0;
+                            node.quota_used_gb += delta_gb;
+                        }
+                        quota_now = Some(node.quota_used_gb);
+                    }
+                }
+                if delta_bytes > 0 && ticks % 10 == 0 {
+                    save_store(&guard.store_path, &guard.store);
+                }
+                quota_now
+            } else {
+                None
+            };
 
             let payload = TelemetryPayload {
                 down_bps,
@@ -648,6 +670,7 @@ fn spawn_telemetry_loop(app: AppHandle, state: AppState, generation: u64) {
                 total_down: totals.downlink_bytes,
                 total_up: totals.uplink_bytes,
                 elapsed_secs: elapsed,
+                active_node_quota_used_gb: active_quota_gb,
             };
             let _ = app.emit("vpn://telemetry", &payload);
         }
@@ -1023,9 +1046,58 @@ pub async fn is_admin() -> Result<bool, String> {
 #[tauri::command]
 pub async fn restart_as_admin(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     state.cleanup_all();
+    let _ = app.remove_tray_by_id("metrovpn-tray");
     relaunch_as_admin()?;
     app.exit(0);
     Ok(())
+}
+
+#[tauri::command]
+pub async fn scan_windows_apps(state: State<'_, AppState>) -> Result<Vec<WindowsAppRule>, String> {
+    let existing = {
+        let guard = state.inner.lock().map_err(|_| "State lock poisoned")?;
+        guard.store.settings.windows_apps.clone()
+    };
+
+    let merged = tokio::task::spawn_blocking(move || scan_installed_windows_apps(&existing))
+        .await
+        .map_err(|e| format!("Failed to scan installed Windows apps: {e}"))?;
+
+    let mut guard = state.inner.lock().map_err(|_| "State lock poisoned")?;
+    guard.store.settings.windows_apps = merged.clone();
+    save_store(&guard.store_path, &guard.store);
+    Ok(merged)
+}
+
+#[tauri::command]
+pub async fn scan_screen_qr(app: AppHandle, hide_window: Option<bool>) -> Result<String, String> {
+    let should_hide = hide_window.unwrap_or(true);
+    let main_win = app.get_webview_window("main");
+
+    if should_hide {
+        if let Some(ref w) = main_win {
+            let _ = w.hide();
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    let capture_res = tokio::task::spawn_blocking(capture_virtual_screen_rgba).await;
+
+    if should_hide {
+        if let Some(ref w) = main_win {
+            let _ = w.show();
+            let _ = w.unminimize();
+            let _ = w.set_focus();
+        }
+    }
+
+    let (w, h, rgba) = capture_res
+        .map_err(|e| format!("Screen capture task failed: {e}"))?
+        ?;
+
+    tokio::task::spawn_blocking(move || decode_qr_from_rgba(w, h, rgba))
+        .await
+        .map_err(|e| format!("QR decode task failed: {e}"))?
 }
 
 #[tauri::command]
@@ -1071,6 +1143,7 @@ pub async fn add_custom_windows_app(
 #[tauri::command]
 pub async fn quit_app(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     state.cleanup_all();
+    let _ = app.remove_tray_by_id("metrovpn-tray");
     app.exit(0);
     Ok(())
 }

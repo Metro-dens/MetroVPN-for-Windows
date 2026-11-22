@@ -16,8 +16,8 @@ use vpn_manager::{
     add_custom_windows_app, check_github_update, clear_logs, connect_internal, connect_server,
     decode_qr_image, delete_server, disconnect, emit_status, get_logs, get_settings, get_status,
     import_subscription, import_uri, is_admin, list_servers, quit_app, reconnect_active,
-    refresh_local_ip, reset_settings, restart_as_admin, toggle_star, update_all_subscriptions,
-    update_server, update_settings, AppState,
+    refresh_local_ip, reset_settings, restart_as_admin, scan_screen_qr, scan_windows_apps,
+    toggle_star, update_all_subscriptions, update_server, update_settings, AppState,
 };
 
 fn toggle_tray_flyout(app: &tauri::AppHandle) {
@@ -57,6 +57,10 @@ fn show_main_window(app: &tauri::AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    if !network_win::acquire_single_instance_or_focus() {
+        return;
+    }
+
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_store::Builder::default().build())
@@ -126,6 +130,7 @@ pub fn run() {
                         "open_app" => show_main_window(app),
                         "quit" => {
                             state.cleanup_all();
+                            let _ = app.remove_tray_by_id("metrovpn-tray");
                             app.exit(0);
                         }
                         "toggle_connect" => {
@@ -235,8 +240,11 @@ pub fn run() {
                         if close_to_tray {
                             api.prevent_close();
                             let _ = window.hide();
-                        } else if let Some(st) = window.app_handle().try_state::<AppState>() {
-                            st.cleanup_all();
+                        } else {
+                            if let Some(st) = window.app_handle().try_state::<AppState>() {
+                                st.cleanup_all();
+                            }
+                            let _ = window.app_handle().remove_tray_by_id("metrovpn-tray");
                         }
                     }
                 }
@@ -253,6 +261,7 @@ pub fn run() {
             import_subscription,
             update_all_subscriptions,
             decode_qr_image,
+            scan_screen_qr,
             list_servers,
             update_server,
             delete_server,
@@ -270,6 +279,7 @@ pub fn run() {
             refresh_local_ip,
             is_admin,
             restart_as_admin,
+            scan_windows_apps,
             add_custom_windows_app,
             quit_app,
             ping::ping_server,
@@ -287,6 +297,9 @@ pub fn run() {
         if matches!(event, RunEvent::ExitRequested { .. } | RunEvent::Exit) {
             if let Some(state) = app_handle.try_state::<AppState>() {
                 state.cleanup_all();
+            }
+            if matches!(event, RunEvent::Exit) {
+                let _ = app_handle.remove_tray_by_id("metrovpn-tray");
             }
         }
     });

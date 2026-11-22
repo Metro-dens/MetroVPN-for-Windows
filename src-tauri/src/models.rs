@@ -247,64 +247,7 @@ impl Default for AppSettings {
 }
 
 pub fn default_windows_apps() -> Vec<WindowsAppRule> {
-    vec![
-        WindowsAppRule {
-            id: "chrome".into(),
-            name: "Google Chrome".into(),
-            exe: "chrome.exe".into(),
-            category: "Browser".into(),
-            bypassed: false,
-        },
-        WindowsAppRule {
-            id: "valorant".into(),
-            name: "VALORANT".into(),
-            exe: "VALORANT-Win64-Shipping.exe".into(),
-            category: "Gaming".into(),
-            bypassed: true,
-        },
-        WindowsAppRule {
-            id: "steam".into(),
-            name: "Steam Client".into(),
-            exe: "steam.exe".into(),
-            category: "Gaming".into(),
-            bypassed: true,
-        },
-        WindowsAppRule {
-            id: "discord".into(),
-            name: "Discord".into(),
-            exe: "Discord.exe".into(),
-            category: "Comms".into(),
-            bypassed: false,
-        },
-        WindowsAppRule {
-            id: "vscode".into(),
-            name: "Visual Studio Code".into(),
-            exe: "Code.exe".into(),
-            category: "Developer".into(),
-            bypassed: false,
-        },
-        WindowsAppRule {
-            id: "qbittorrent".into(),
-            name: "qBittorrent".into(),
-            exe: "qbittorrent.exe".into(),
-            category: "Network".into(),
-            bypassed: false,
-        },
-        WindowsAppRule {
-            id: "onedrive".into(),
-            name: "Microsoft OneDrive".into(),
-            exe: "OneDrive.exe".into(),
-            category: "System".into(),
-            bypassed: true,
-        },
-        WindowsAppRule {
-            id: "spotify".into(),
-            name: "Spotify Desktop".into(),
-            exe: "Spotify.exe".into(),
-            category: "Media".into(),
-            bypassed: true,
-        },
-    ]
+    Vec::new()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -324,6 +267,8 @@ pub struct TelemetryPayload {
     pub total_down: u64,
     pub total_up: u64,
     pub elapsed_secs: u64,
+    #[serde(default)]
+    pub active_node_quota_used_gb: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

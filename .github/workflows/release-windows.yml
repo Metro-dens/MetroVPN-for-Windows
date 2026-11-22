@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: "Release tag to create (e.g. v2.6.0)"
+        description: "Release tag to create (e.g. v2.7.0)"
         required: true
-        default: "v2.6.0"
+        default: "v2.7.0"
         type: string
       draft:
         description: "Create as a draft release (hidden until published)"
@@ -76,11 +76,12 @@ jobs:
             - **`Metrovpn-windows-x64-portable.zip`** — Portable folder archive with all binaries side-by-side.
             - **`SHA256SUMS.txt`** — SHA-256 verification checksums (`Get-FileHash <file> -Algorithm SHA256`).
 
-            ### What's New in v2.6.0
-            - **Compact NetMod-Inspired `520×620` Window:** Crisp uncropped layout across `Home`, `Servers`, `Speed`, and `Settings` with smooth non-flickering hover transitions.
-            - **Screen Capture + Camera QR Scanner:** Dedicated QR Scanner captures QRs straight off your screen (NetMod style) or via live webcam; `+ Add` focuses cleanly on `vless://` / `vmess://` links.
-            - **Real PC Split Tunneling Scanner & Live Quota/Telemetry:** Scans installed & running Windows `.exe` apps automatically, tracks live server data usage, and drives `Realtime Telemetry Stream` from real Xray throughput.
-            - **Interactive Walkthrough & Simplified 3-Tab Settings:** Step-by-step live tour across tabs, plain-English **System Proxy vs TUN Mode** guide, and single-instance tray cleanup (no duplicate wolf tray icons).
+            ### What's New in v2.7.0
+            - **3x-ui Inbound Data Quota Sync (`ClientQuotaFetcher` Parity):** Queries `/api/quota?uuid=<uuid>` across your VCN host, WebSocket Host, server address, and `vpn.metrodens.site` (plus direct IP+SNI override for dedicated VPS nodes), routed over local HTTP proxy `127.0.0.1:10809` when connected.
+            - **Fixed SOCKS5 (`10808`) & HTTP (`10809`) Inbound Ports:** Locked to the same fixed ports as MetroVPN for Android (`XrayConfigBuilder`).
+            - **Fixed-Position Rotating Connect Ring:** The outer wavy connect ring stays anchored at its exact center and rotates smoothly in place without off-center wobble.
+            - **Reliable Xray & TUN Connectivity:** Matches Android's zero-rating-safe plain IP DNS configuration, explicit `socks-in`/`http-in` -> `proxy` routing rule, VCN `verifyPeerCertByName` across all profiles, WebSocket `host` fallback (`wsHost` -> `vcn` -> `sni`), stale `xray.exe`/`tun2socks.exe` cleanup before connect, and resilient Wintun interface polling.
+            - **Built-in Auto-Update Downloader & Installer:** Checks GitHub Releases & `update.json` on startup or on demand, streams the latest Windows installer with a live progress bar, and launches the update automatically.
 
             > **SmartScreen Note:** If Windows Defender SmartScreen prompts on an unsigned build, verify the SHA-256 checksum against `SHA256SUMS.txt` and click **More info → Run anyway**.
           releaseDraft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft || false }}

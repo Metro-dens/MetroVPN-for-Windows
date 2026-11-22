@@ -42,6 +42,20 @@ pub struct ServerNode {
     pub quota_used_gb: f64,
     #[serde(rename = "quotaTotalGB")]
     pub quota_total_gb: f64,
+    #[serde(default)]
+    pub quota_up_bytes: u64,
+    #[serde(default)]
+    pub quota_down_bytes: u64,
+    #[serde(default)]
+    pub quota_total_bytes: u64,
+    #[serde(default)]
+    pub quota_expiry_ms: u64,
+    #[serde(default = "default_true")]
+    pub quota_enabled: bool,
+    #[serde(default)]
+    pub quota_email: String,
+    #[serde(default)]
+    pub quota_updated_at_ms: u64,
     pub starred: bool,
     pub online: bool,
     pub ip: String,
@@ -142,6 +156,8 @@ pub struct AppSettings {
     pub latency_test_url: String,
     #[serde(default)]
     pub onboarding_completed: bool,
+    #[serde(default = "default_true")]
+    pub auto_check_updates: bool,
 }
 
 fn default_custom_doh() -> String {
@@ -242,6 +258,7 @@ impl Default for AppSettings {
             latency_mode: default_latency_mode(),
             latency_test_url: default_latency_url(),
             onboarding_completed: false,
+            auto_check_updates: true,
         }
     }
 }
@@ -321,7 +338,24 @@ pub struct ReleaseUpdateInfo {
     pub latest_version: String,
     pub update_available: bool,
     pub release_url: String,
+    pub download_url: String,
+    pub asset_name: String,
+    pub title: String,
+    pub message: String,
     pub published_at: String,
+    #[serde(default)]
+    pub mandatory: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateDownloadProgress {
+    pub percent: u8,
+    pub downloaded_bytes: u64,
+    pub total_bytes: u64,
+    pub phase: String, // "downloading" | "ready" | "launching" | "error"
+    pub file_path: Option<String>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

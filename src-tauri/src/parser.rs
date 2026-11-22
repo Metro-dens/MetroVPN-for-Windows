@@ -125,7 +125,11 @@ pub fn parse_vless_uri(raw: &str) -> Result<ServerNode, String> {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| address.clone());
 
-    let vcn_param = params.get("vcn").cloned().filter(|v| !v.is_empty());
+    let vcn_param = params
+        .get("vcn")
+        .or_else(|| params.get("verifypeercertbyname"))
+        .cloned()
+        .filter(|v| !v.is_empty());
     let vcn = vcn_param.is_some() || tls_mode == "reality";
     let vcn_host = vcn_param.filter(|v| v != "strict" && v != "1" && v != "true");
 
@@ -147,6 +151,7 @@ pub fn parse_vless_uri(raw: &str) -> Result<ServerNode, String> {
         .filter(|s| !s.is_empty());
     let allow_insecure = params
         .get("allowinsecure")
+        .or_else(|| params.get("insecure"))
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
 
@@ -181,6 +186,13 @@ pub fn parse_vless_uri(raw: &str) -> Result<ServerNode, String> {
         ping: None,
         quota_used_gb: 0.0,
         quota_total_gb: 0.0,
+        quota_up_bytes: 0,
+        quota_down_bytes: 0,
+        quota_total_bytes: 0,
+        quota_expiry_ms: 0,
+        quota_enabled: true,
+        quota_email: String::new(),
+        quota_updated_at_ms: 0,
         starred: false,
         online: false,
         ip: address,
@@ -278,6 +290,13 @@ pub fn parse_vmess_uri(raw: &str) -> Result<ServerNode, String> {
         ping: None,
         quota_used_gb: 0.0,
         quota_total_gb: 0.0,
+        quota_up_bytes: 0,
+        quota_down_bytes: 0,
+        quota_total_bytes: 0,
+        quota_expiry_ms: 0,
+        quota_enabled: true,
+        quota_email: String::new(),
+        quota_updated_at_ms: 0,
         starred: false,
         online: false,
         ip: address,
@@ -435,6 +454,13 @@ pub fn parse_xray_json(raw: &str) -> Result<ServerNode, String> {
         ping: None,
         quota_used_gb: 0.0,
         quota_total_gb: 0.0,
+        quota_up_bytes: 0,
+        quota_down_bytes: 0,
+        quota_total_bytes: 0,
+        quota_expiry_ms: 0,
+        quota_enabled: true,
+        quota_email: String::new(),
+        quota_updated_at_ms: 0,
         starred: false,
         online: false,
         ip: address,

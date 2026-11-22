@@ -251,40 +251,89 @@ mod win_impl {
         Ok(())
     }
 
+    pub fn kill_stale_core_processes() {
+        let _ = Command::new("taskkill")
+            .args(["/F", "/IM", "xray.exe", "/T"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+        let _ = Command::new("taskkill")
+            .args(["/F", "/IM", "tun2socks.exe", "/T"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+    }
+
     pub fn configure_tun_interface(
         interface_name: &str,
         server_host: &str,
         dns_server: &str,
         mtu: u16,
     ) -> Result<Vec<String>, String> {
+        // Clean up any leftover TUN routes before querying physical default gateway
+        teardown_tun_routes(&[]);
+
         // Resolve physical default gateway before adding split default route
         let gw_output = Command::new("powershell")
             .args([
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
-                "(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' | Where-Object { $_.NextHop -ne '0.0.0.0' -and $_.InterfaceAlias -ne 'Metrovpn-TUN' } | Sort-Object RouteMetric | Select-Object -First 1).NextHop",
+                "(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' | Where-Object { $_.NextHop -ne '0.0.0.0' -and $_.NextHop -ne '198.18.0.2' -and $_.InterfaceAlias -ne 'Metrovpn-TUN' } | Sort-Object RouteMetric | Select-Object -First 1).NextHop",
             ])
             .creation_flags(CREATE_NO_WINDOW)
             .output()
             .map_err(|e| format!("Failed to query default gateway: {e}"))?;
-        let orig_gw = String::from_utf8_lossy(&gw_output.stdout).trim().to_string();
+        let mut orig_gw = String::from_utf8_lossy(&gw_output.stdout).trim().to_string();
 
-        // Assign non-persistent static IP (store=active) without adding a competing 0.0.0.0/0 gateway
-        let _ = Command::new("netsh")
-            .args([
-                "interface",
-                "ipv4",
-                "set",
-                "address",
-                &format!("name={interface_name}"),
-                "static",
-                "198.18.0.1",
-                "255.255.255.0",
-                "store=active",
-            ])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output();
+        if orig_gw.is_empty() {
+            // Fast fallback via `route print 0.0.0.0` in case PowerShell Get-NetRoute is slow or restricted
+            if let Ok(rp) = Command::new("route")
+                .args(["print", "0.0.0.0"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output()
+            {
+                let text = String::from_utf8_lossy(&rp.stdout);
+                for line in text.lines() {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() >= 4 && parts[0] == "0.0.0.0" && parts[1] == "0.0.0.0" {
+                        let gw = parts[2];
+                        if gw != "0.0.0.0" && gw != "198.18.0.2" && gw.contains('.') {
+                            orig_gw = gw.to_string();
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Poll up to 10 times (2.5s total) for Wintun adapter to finish registering in Windows TCP/IP stack
+        let mut addr_assigned = false;
+        for _ in 0..10 {
+            if let Ok(out) = Command::new("netsh")
+                .args([
+                    "interface",
+                    "ipv4",
+                    "set",
+                    "address",
+                    &format!("name={interface_name}"),
+                    "static",
+                    "198.18.0.1",
+                    "255.255.255.0",
+                    "store=active",
+                ])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output()
+            {
+                if out.status.success() {
+                    addr_assigned = true;
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+
+        if !addr_assigned {
+            return Err("Wintun virtual adapter 'Metrovpn-TUN' did not come online in time".into());
+        }
 
         let _ = Command::new("netsh")
             .args([
@@ -727,6 +776,8 @@ mod win_impl {
         Err("UAC elevation is only supported on Windows 10/11".into())
     }
 
+    pub fn kill_stale_core_processes() {}
+
     pub fn configure_tun_interface(
         _interface_name: &str,
         _server_host: &str,
@@ -749,8 +800,8 @@ mod win_impl {
 
 pub use win_impl::{
     acquire_single_instance_or_focus, capture_virtual_screen_rgba, configure_tun_interface,
-    enable_system_proxy, is_elevated, relaunch_as_admin, restore_system_proxy,
-    scan_installed_windows_apps, teardown_tun_routes, CREATE_NO_WINDOW,
+    enable_system_proxy, is_elevated, kill_stale_core_processes, relaunch_as_admin,
+    restore_system_proxy, scan_installed_windows_apps, teardown_tun_routes, CREATE_NO_WINDOW,
 };
 
 pub fn backup_file_path(app_data_dir: &Path) -> std::path::PathBuf {

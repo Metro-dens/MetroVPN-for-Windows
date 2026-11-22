@@ -60,6 +60,7 @@ import {
   Compass,
   ScanLine,
   Info,
+  Lock,
 } from 'lucide-react';
 import {
   IN_TAURI,
@@ -377,7 +378,7 @@ const DEFAULT_SETTINGS_STATE = {
   closeToTray: true,
   routingMode: 'rule',
   fragmentPackets: 'tlshello',
-  fragmentLength: '10-50',
+  fragmentLength: '10-20',
   fragmentInterval: '10-20',
   ipv6Enabled: false,
   tunStrictRoute: true,
@@ -394,6 +395,7 @@ const DEFAULT_SETTINGS_STATE = {
   latencyMode: 'http_204',
   latencyTestUrl: 'https://www.gstatic.com/generate_204',
   onboardingCompleted: false,
+  autoCheckUpdates: true,
 };
 
 function MetroProvider({ children }) {
@@ -408,6 +410,7 @@ function MetroProvider({ children }) {
   const [nodes, setNodes] = useState(INITIAL_NODES);
   const [activeNodeId, setActiveNodeId] = useState(null);
   const [testingAllPings, setTestingAllPings] = useState(false);
+  const [syncingQuotaIds, setSyncingQuotaIds] = useState({});
 
   const [downHistory, setDownHistory] = useState(Array(14).fill(0));
   const [upHistory, setUpHistory] = useState(Array(14).fill(0));
@@ -435,6 +438,9 @@ function MetroProvider({ children }) {
   const [editNodeModal, setEditNodeModal] = useState(null);
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [updateInfo, setUpdateInfo] = useState(null);
+  const [updateModalOpen, setUpdateModalOpen] = useState(false);
+  const [downloadingUpdate, setDownloadingUpdate] = useState(false);
+  const [updateDownloadProgress, setUpdateDownloadProgress] = useState(null);
 
   const [logs, setLogs] = useState([]);
   const [logsStreaming, setLogsStreaming] = useState(true);
@@ -471,6 +477,8 @@ function MetroProvider({ children }) {
     setSettingsState((prev) => ({
       ...prev,
       ...s,
+      socksPort: 10808,
+      httpPort: 10809,
       windowsApps: Array.isArray(s.windowsApps) ? s.windowsApps : prev.windowsApps,
       savedSubscriptions: Array.isArray(s.savedSubscriptions) ? s.savedSubscriptions : prev.savedSubscriptions,
     }));
@@ -512,6 +520,19 @@ function MetroProvider({ children }) {
         }
         if (Array.isArray(initLogs)) setLogs(initLogs);
         if (Array.isArray(history)) setSpeedHistory(history);
+
+        // Auto-check for updates on launch if enabled (matching Android MainViewModel)
+        if (!settings || settings.autoCheckUpdates !== false) {
+          invokeCmd('check_github_update')
+            .then((info) => {
+              if (!mounted || !info) return;
+              setUpdateInfo(info);
+              if (info.updateAvailable) {
+                setUpdateModalOpen(true);
+              }
+            })
+            .catch(() => {});
+        }
       } catch (err) {
         appendLog('Warning', `Initial backend hydration error: ${String(err)}`);
       }
@@ -534,6 +555,23 @@ function MetroProvider({ children }) {
                   : n
               )
             );
+          }
+        })
+      );
+
+      unsubs.push(
+        await listenEvent('vpn://quota-updated', (updatedNode) => {
+          if (!mounted || !updatedNode) return;
+          setNodes((prev) => prev.map((n) => (n.id === updatedNode.id ? { ...n, ...updatedNode } : n)));
+        })
+      );
+
+      unsubs.push(
+        await listenEvent('update://progress', (prog) => {
+          if (!mounted || !prog) return;
+          setUpdateDownloadProgress(prog);
+          if (prog.phase === 'error' || prog.phase === 'ready') {
+            setDownloadingUpdate(false);
           }
         })
       );
@@ -604,6 +642,8 @@ function MetroProvider({ children }) {
         ...settingsRef.current,
         activeNodeId,
         ...patch,
+        socksPort: 10808,
+        httpPort: 10809,
       };
       applySettingsObject(next);
       if (connectionStatus === 'connected' && affectsTunnel && !reconnect) {
@@ -663,13 +703,45 @@ function MetroProvider({ children }) {
     [persistSettingsPatch]
   );
 
+  const syncNodeQuota = useCallback(
+    async (nodeId, silent = false) => {
+      if (!nodeId || !IN_TAURI) return;
+      setSyncingQuotaIds((prev) => ({ ...prev, [nodeId]: true }));
+      try {
+        const updated = await invokeCmd('sync_node_quota', { id: nodeId });
+        if (updated) {
+          setNodes((prev) => prev.map((n) => (n.id === updated.id ? { ...n, ...updated } : n)));
+          if (!silent) {
+            pushToast(
+              `Synced 3x-ui quota: ${formatUsageData(updated.quotaUsedGB || 0)}${
+                updated.quotaTotalGB > 0 ? ` / ${updated.quotaTotalGB.toFixed(1)} GB` : ' (Unlimited)'
+              }`,
+              'success'
+            );
+          }
+        }
+      } catch (err) {
+        if (!silent) {
+          pushToast(`Quota sync: ${String(err)}`, 'amber');
+        }
+      } finally {
+        setSyncingQuotaIds((prev) => {
+          const copy = { ...prev };
+          delete copy[nodeId];
+          return copy;
+        });
+      }
+    },
+    [pushToast]
+  );
+
   const connectToNode = useCallback(
     async (nodeId, forcedMode) => {
       const target = nodes.find((n) => n.id === nodeId);
       if (!target) {
         setAddModalTab('uri');
         setAddModalOpen(true);
-        pushToast('Import a VLESS, VMess, JSON, or Subscription node first', 'amber');
+        pushToast('Import a VLESS or VMess node first', 'amber');
         return;
       }
       const modeToUse = forcedMode || settingsRef.current.systemMode;
@@ -721,7 +793,7 @@ function MetroProvider({ children }) {
     } else {
       setAddModalTab('uri');
       setAddModalOpen(true);
-      pushToast('No server added yet — Import a server or open Quick Start Guide', 'amber');
+      pushToast('No server added yet — Paste a VLESS link or scan QR to start', 'amber');
     }
   }, [connectionStatus, activeNode, connectToNode, pushToast]);
 
@@ -787,7 +859,10 @@ function MetroProvider({ children }) {
     if (IN_TAURI) {
       try {
         await invokeCmd('ping_all_servers');
-        pushToast('Latency probe complete across all nodes', 'success');
+        invokeCmd('sync_all_quotas')
+          .then((list) => Array.isArray(list) && setNodes(list))
+          .catch(() => {});
+        pushToast('Latency & 3x-ui quota probe complete', 'success');
       } catch (err) {
         pushToast(`Ping failed: ${String(err)}`, 'amber');
       } finally {
@@ -816,16 +891,25 @@ function MetroProvider({ children }) {
     setCheckingUpdate(true);
     try {
       if (!IN_TAURI) {
-        setUpdateInfo({
-          currentVersion: '2.5.0',
-          latestVersion: '2.5.0',
+        const mockInfo = {
+          currentVersion: '2.7.0',
+          latestVersion: '2.7.0',
           updateAvailable: false,
           releaseUrl: 'https://github.com/Metro-dens/MetroVPN-for-Windows/releases',
-        });
+          downloadUrl: 'https://github.com/Metro-dens/MetroVPN-for-Windows/releases/latest/download/Metrovpn-standalone-x64.exe',
+          assetName: 'Metrovpn-standalone-x64.exe',
+          title: 'Metrovpn v2.7.0',
+          message: 'You are running the latest version of Metrovpn for Windows.',
+        };
+        setUpdateInfo(mockInfo);
+        pushToast('You are on the latest version (v2.7.0)', 'success');
         return;
       }
       const info = await invokeCmd('check_github_update');
       setUpdateInfo(info);
+      if (info.updateAvailable) {
+        setUpdateModalOpen(true);
+      }
       pushToast(
         info.updateAvailable
           ? `New version v${info.latestVersion} available!`
@@ -838,6 +922,25 @@ function MetroProvider({ children }) {
       setCheckingUpdate(false);
     }
   }, [checkingUpdate, pushToast]);
+
+  const downloadAndInstallUpdate = useCallback(async () => {
+    if (!updateInfo?.downloadUrl || downloadingUpdate) return;
+    if (!IN_TAURI) {
+      openExternalUrl(updateInfo.downloadUrl);
+      return;
+    }
+    setDownloadingUpdate(true);
+    setUpdateDownloadProgress({ percent: 0, downloadedBytes: 0, totalBytes: 0, phase: 'downloading' });
+    try {
+      await invokeCmd('download_and_install_update', {
+        downloadUrl: updateInfo.downloadUrl,
+        assetName: updateInfo.assetName || 'Metrovpn-Update-Setup.exe',
+      });
+    } catch (err) {
+      setDownloadingUpdate(false);
+      pushToast(`Update install failed: ${String(err)}`, 'amber');
+    }
+  }, [updateInfo, downloadingUpdate, pushToast]);
 
   const toggleSystemMode = useCallback(
     async (forcedMode) => {
@@ -858,7 +961,7 @@ function MetroProvider({ children }) {
       pushToast(
         next === 'TUN'
           ? 'TUN Mode selected (Wintun NIC)'
-          : `System Proxy selected (127.0.0.1:${settingsRef.current.httpPort})`,
+          : 'System Proxy selected (127.0.0.1:10809)',
         'neutral'
       );
     },
@@ -955,6 +1058,8 @@ function MetroProvider({ children }) {
     updateNodeDetails,
     testingAllPings,
     testAllPings,
+    syncNodeQuota,
+    syncingQuotaIds,
     downHistory,
     upHistory,
     totalSessionBytes,
@@ -973,12 +1078,19 @@ function MetroProvider({ children }) {
     checkForUpdates,
     checkingUpdate,
     updateInfo,
+    updateModalOpen,
+    setUpdateModalOpen,
+    downloadingUpdate,
+    updateDownloadProgress,
+    downloadAndInstallUpdate,
     persistSettingsPatch,
     applySettingsObject,
 
     // All Settings fields exposed ergonomically + settings object alias
     settings: settingsState,
     ...settingsState,
+    socksPort: 10808,
+    httpPort: 10809,
     systemMode: settingsState.systemMode,
     setSystemMode,
     toggleSystemMode,
@@ -995,6 +1107,7 @@ function MetroProvider({ children }) {
     setMtu: (v) => persistSettingsPatch({ mtu: v }),
     setCertPinning: (v) => persistSettingsPatch({ certPinning: v }),
     setStartWithWindows: (v) => persistSettingsPatch({ startWithWindows: v }, { affectsTunnel: false }),
+    setAutoCheckUpdates: (v) => persistSettingsPatch({ autoCheckUpdates: v }, { affectsTunnel: false }),
 
     addModalOpen,
     setAddModalOpen,
@@ -1096,11 +1209,11 @@ function M3ExpressiveSwitch({ checked, onChange, ariaLabel }) {
 function ScallopedConnectButton({ size = 220, status, onClick }) {
   const isConnected = status === 'connected';
   const isConnecting = status === 'connecting';
+  const isActive = isConnected || isConnecting;
 
-  const innerScallop = useMemo(() => generateScallopedPath(110, 110, 74, 6.4, 12, 120), []);
-  const innerCircle = useMemo(() => generateScallopedPath(110, 110, 74, 0, 12, 120), []);
-  const outerWavyRing = useMemo(() => generateScallopedPath(110, 110, 96, 5.2, 12, 120), []);
-  const outerSubtleCircle = useMemo(() => generateScallopedPath(110, 110, 92, 0, 12, 120), []);
+  const innerScallop = useMemo(() => generateScallopedPath(110, 110, 74, 5.4, 12, 144), []);
+  const innerCircle = useMemo(() => generateScallopedPath(110, 110, 74, 0, 12, 144), []);
+  const outerWavyRing = useMemo(() => generateScallopedPath(110, 110, 96, 4.0, 14, 168), []);
 
   const iconSize = size >= 180 ? 'w-14 h-14' : 'w-7 h-7';
 
@@ -1114,85 +1227,60 @@ function ScallopedConnectButton({ size = 220, status, onClick }) {
       className="relative flex items-center justify-center cursor-pointer select-none focus:outline-none group"
       style={{ width: size, height: size }}
     >
-      <svg viewBox="0 0 220 220" className="w-full h-full overflow-visible">
-        <motion.g
-          style={{ originX: '110px', originY: '110px' }}
-          animate={
-            isConnecting
-              ? { rotate: 360, scale: [0.97, 1.03, 0.97] }
-              : isConnected
-              ? { rotate: [0, 360], scale: [1, 1.018, 1] }
-              : { rotate: 0, scale: 0.96 }
-          }
-          transition={
-            isConnecting
-              ? {
-                  rotate: { repeat: Infinity, duration: 4.2, ease: 'linear' },
-                  scale: { repeat: Infinity, duration: 1.4, ease: 'easeInOut' },
-                }
-              : isConnected
-              ? {
-                  rotate: { repeat: Infinity, duration: 42, ease: 'linear' },
-                  scale: { repeat: Infinity, duration: 3.8, ease: 'easeInOut' },
-                }
-              : SPRING
-          }
-        >
-          <motion.path
-            initial={false}
-            animate={{
-              d: isConnected || isConnecting ? outerWavyRing : outerSubtleCircle,
-              stroke: isConnected
-                ? COLORS.coral
-                : isConnecting
-                ? COLORS.amber
-                : '#3B2E2F',
-              strokeOpacity: isConnected ? 0.95 : isConnecting ? 0.9 : 0.65,
-            }}
-            transition={SPRING_SOFT}
-            fill="none"
-            strokeWidth={isConnected || isConnecting ? 3.2 : 2}
-            strokeLinecap="round"
-            strokeLinejoin="round"
-          />
-        </motion.g>
+      {/* Static idle outer track circle */}
+      <svg viewBox="0 0 220 220" className="absolute inset-0 w-full h-full pointer-events-none">
+        <circle
+          cx="110"
+          cy="110"
+          r="94"
+          fill="none"
+          stroke="#3B2E2F"
+          strokeWidth="2"
+          strokeOpacity={isActive ? 0 : 0.65}
+          style={{ transition: 'stroke-opacity 220ms ease' }}
+        />
+      </svg>
 
-        <motion.g
-          style={{ originX: '110px', originY: '110px' }}
-          animate={
-            isConnected
-              ? { scale: [1, 1.016, 1] }
-              : isConnecting
-              ? { scale: [0.96, 1.02, 0.96] }
-              : { scale: 1 }
-          }
-          transition={
-            isConnected
-              ? { repeat: Infinity, duration: 3.8, ease: 'easeInOut' }
-              : isConnecting
-              ? { repeat: Infinity, duration: 1.2, ease: 'easeInOut' }
-              : SPRING
-          }
-        >
-          <motion.path
-            initial={false}
-            animate={{
-              d: isConnected ? innerScallop : isConnecting ? innerScallop : innerCircle,
-              fill: isConnected
-                ? COLORS.crimson
-                : isConnecting
-                ? '#6E1419'
-                : '#261F20',
-              stroke: isConnected
-                ? '#BA1D25'
-                : isConnecting
-                ? COLORS.amber
-                : '#4A3637',
-            }}
-            transition={SPRING}
-            strokeWidth={1.8}
-          />
-        </motion.g>
+      {/* Fixed-position outer wavy ring rotating strictly around its own 50% 50% center */}
+      <motion.svg
+        viewBox="0 0 220 220"
+        className="absolute inset-0 w-full h-full pointer-events-none"
+        style={{ transformOrigin: '50% 50%' }}
+        animate={{
+          rotate: isActive ? 360 : 0,
+          opacity: isActive ? 1 : 0,
+        }}
+        transition={{
+          rotate: isActive
+            ? {
+                repeat: Infinity,
+                duration: isConnecting ? 6 : 18,
+                ease: 'linear',
+              }
+            : { duration: 0.25 },
+          opacity: { duration: 0.22 },
+        }}
+      >
+        <path
+          d={outerWavyRing}
+          fill="none"
+          stroke={isConnected ? COLORS.coral : COLORS.amber}
+          strokeOpacity={0.95}
+          strokeWidth={3.2}
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
+      </motion.svg>
+
+      {/* Fixed-position inner scalloped shield button */}
+      <svg viewBox="0 0 220 220" className="relative w-full h-full pointer-events-none">
+        <path
+          d={isActive ? innerScallop : innerCircle}
+          fill={isConnected ? COLORS.crimson : isConnecting ? '#6E1419' : '#261F20'}
+          stroke={isConnected ? '#BA1D25' : isConnecting ? COLORS.amber : '#4A3637'}
+          strokeWidth={1.8}
+          style={{ transition: 'fill 220ms ease, stroke 220ms ease' }}
+        />
       </svg>
 
       <motion.div
@@ -1259,7 +1347,7 @@ function Titlebar() {
           }}
         >
           <span className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: COLORS.coral }} />
-          v2.6
+          v2.7
         </span>
       </div>
 
@@ -1730,7 +1818,13 @@ function HomeScreen() {
               </div>
               <p className="text-[11px] mt-0.5 truncate" style={{ color: '#CEB4B3' }}>
                 {activeNode
-                  ? `${activeNode.protocol} • Used: ${formatUsageData(activeNode.quotaUsedGB || 0)}`
+                  ? `${activeNode.protocol} • Quota: ${formatUsageData(activeNode.quotaUsedGB || 0)}${
+                      activeNode.quotaTotalGB > 0
+                        ? ` / ${activeNode.quotaTotalGB.toFixed(1)} GB`
+                        : activeNode.quotaUpdatedAtMs > 0
+                        ? ' / Unlimited'
+                        : ''
+                    }`
                   : 'Click to paste VLESS / VMess URI'}
               </p>
             </div>
@@ -1787,7 +1881,7 @@ function HomeScreen() {
           style={{ backgroundColor: COLORS.taupe, color: COLORS.textPrimary, border: '1px solid #634947' }}
         >
           {copiedProxy ? <Check className="w-3.5 h-3.5" style={{ color: COLORS.mint }} /> : <Copy className="w-3.5 h-3.5" />}
-          <span>{copiedProxy ? 'Copied' : `:${socksPort || 10808}`}</span>
+          <span>{copiedProxy ? 'Copied' : ':10808 / :10809'}</span>
         </button>
       </div>
     </motion.div>
@@ -1803,7 +1897,7 @@ function WavyQuotaBar({ usedGB, totalGB, isConnectedCard }) {
   const pct = hasLimit
     ? Math.max(usedGB > 0 ? 3 : 0, Math.min(100, (usedGB / totalGB) * 100))
     : usedGB > 0
-    ? Math.min(100, Math.max(8, ((usedGB * 1024) % 100)))
+    ? 25
     : 0;
   const remainingGB = hasLimit ? Math.max(0, totalGB - usedGB) : 0;
 
@@ -1838,7 +1932,7 @@ function WavyQuotaBar({ usedGB, totalGB, isConnectedCard }) {
               {' '}• <span style={{ color: COLORS.mint }}>{remainingGB.toFixed(1)} GB</span> left
             </>
           ) : (
-            ' • Live Xray counter'
+            ' • 3x-ui Unlimited Plan'
           )}
         </div>
       )}
@@ -1860,6 +1954,8 @@ function ServersScreen() {
     deleteNode,
     testingAllPings,
     testAllPings,
+    syncNodeQuota,
+    syncingQuotaIds,
     setShareNodeModal,
     setEditNodeModal,
     pushToast,
@@ -1889,11 +1985,6 @@ function ServersScreen() {
       return () => window.removeEventListener('click', closeMenu);
     }
   }, [openMenuId]);
-
-  const dynamicIsps = useMemo(() => {
-    const set = new Set(nodes.map((n) => n.isp).filter(Boolean));
-    return Array.from(set);
-  }, [nodes]);
 
   const filterChips = useMemo(
     () => [
@@ -1950,6 +2041,11 @@ function ServersScreen() {
     } catch (err) {
       pushToast(String(err), 'amber');
     }
+  };
+
+  const handleSyncQuota = async (e, nodeId) => {
+    e.stopPropagation();
+    await syncNodeQuota(nodeId, false);
   };
 
   return (
@@ -2110,6 +2206,10 @@ function ServersScreen() {
             const isActiveNode = node.id === activeNodeId;
             const isConnectedCard = isActiveNode && connectionStatus === 'connected';
             const isConnectingCard = isActiveNode && connectionStatus === 'connecting';
+            const isSyncingQuota = Boolean(syncingQuotaIds?.[node.id]);
+            const hasQuotaSynced = (node.quotaUpdatedAtMs || 0) > 0;
+            const remainingGB =
+              node.quotaTotalGB > 0 ? Math.max(0, node.quotaTotalGB - (node.quotaUsedGB || 0)) : null;
 
             return (
               <div
@@ -2160,6 +2260,16 @@ function ServersScreen() {
                   <div className="flex items-center gap-0.5 shrink-0 relative" onClick={(e) => e.stopPropagation()}>
                     <button
                       type="button"
+                      onClick={(e) => handleSyncQuota(e, node.id)}
+                      title="Sync 3x-ui Inbound Data Quota"
+                      className="w-7 h-7 rounded-full flex items-center justify-center cursor-pointer transition-colors hover:bg-black/20"
+                      style={{ color: hasQuotaSynced ? COLORS.mint : COLORS.textMuted }}
+                    >
+                      <RefreshCw className={`w-3.5 h-3.5 ${isSyncingQuota ? 'animate-spin' : ''}`} />
+                    </button>
+
+                    <button
+                      type="button"
                       onClick={() => toggleStarNode(node.id)}
                       title={node.starred ? 'Unstar node' : 'Star node'}
                       className="w-7 h-7 rounded-full flex items-center justify-center cursor-pointer transition-colors hover:bg-black/20"
@@ -2188,9 +2298,21 @@ function ServersScreen() {
                           animate={{ opacity: 1, scale: 1, y: 0 }}
                           exit={{ opacity: 0, scale: 0.96, y: -4 }}
                           transition={{ duration: 0.12 }}
-                          className="absolute right-0 top-8 w-[148px] rounded-[14px] p-1 z-40 shadow-2xl"
+                          className="absolute right-0 top-8 w-[156px] rounded-[14px] p-1 z-40 shadow-2xl"
                           style={{ backgroundColor: '#231D1E', border: '1px solid #3D3132' }}
                         >
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              setOpenMenuId(null);
+                              handleSyncQuota(e, node.id);
+                            }}
+                            className="w-full px-2.5 py-1.5 rounded-[9px] text-[11.5px] font-medium flex items-center gap-2 cursor-pointer hover:bg-[#312829]"
+                            style={{ color: COLORS.textPrimary }}
+                          >
+                            <RefreshCw className="w-3.5 h-3.5" style={{ color: COLORS.mint }} />
+                            <span>Sync 3x-ui Quota</span>
+                          </button>
                           <button
                             type="button"
                             onClick={() => {
@@ -2284,17 +2406,33 @@ function ServersScreen() {
                       VCN
                     </span>
                   )}
+                  {node.quotaEmail && (
+                    <span
+                      className="px-2 py-0.5 rounded-[7px] font-mono text-[10px] truncate max-w-[130px]"
+                      style={{ backgroundColor: '#1E2C27', color: COLORS.mint }}
+                    >
+                      {node.quotaEmail}
+                    </span>
+                  )}
                 </div>
 
                 <div>
                   <div className="flex items-center justify-between text-[10px] font-mono tabular-nums mb-0.5">
                     <span style={{ color: isActiveNode ? '#CCB1B0' : COLORS.textMuted }}>
-                      {node.quotaTotalGB > 0 ? 'Quota Usage' : 'Traffic Used'}
+                      {isSyncingQuota
+                        ? 'Syncing 3x-ui Quota...'
+                        : node.quotaTotalGB > 0
+                        ? `Used: ${formatUsageData(node.quotaUsedGB || 0)}`
+                        : hasQuotaSynced
+                        ? `Used: ${formatUsageData(node.quotaUsedGB || 0)}`
+                        : 'Data Quota'}
                     </span>
                     <span style={{ color: COLORS.textPrimary }}>
                       {node.quotaTotalGB > 0
-                        ? `${formatUsageData(node.quotaUsedGB || 0)} / ${node.quotaTotalGB.toFixed(1)} GB`
-                        : `${formatUsageData(node.quotaUsedGB || 0)} • Unmetered`}
+                        ? `Left: ${remainingGB.toFixed(1)} GB / ${node.quotaTotalGB.toFixed(1)} GB`
+                        : hasQuotaSynced
+                        ? 'Unlimited Plan'
+                        : `${formatUsageData(node.quotaUsedGB || 0)} • Tap ↻ to Sync`}
                     </span>
                   </div>
                   <WavyQuotaBar
@@ -2812,10 +2950,10 @@ function SettingsScreen() {
     setLanProxySharing,
     localLanIp,
     setLocalLanIp,
-    socksPort,
-    httpPort,
     autoConnectOnLaunch,
     closeToTray,
+    autoCheckUpdates,
+    setAutoCheckUpdates,
     tunnelProfile,
     setTunnelProfile,
     splitTunneling,
@@ -2837,6 +2975,10 @@ function SettingsScreen() {
     checkForUpdates,
     checkingUpdate,
     updateInfo,
+    setUpdateModalOpen,
+    downloadingUpdate,
+    updateDownloadProgress,
+    downloadAndInstallUpdate,
     setLogsDrawerOpen,
     setOnboardingOpen,
     settingsTab,
@@ -2855,7 +2997,7 @@ function SettingsScreen() {
     try {
       const nextIp = IN_TAURI ? await invokeCmd('refresh_local_ip') : localLanIp;
       setLocalLanIp(nextIp);
-      appendLog('Info', `Adapter IP refreshed -> ${nextIp}:${socksPort || 10808}`);
+      appendLog('Info', `Adapter IP refreshed -> ${nextIp}:10808 (SOCKS5) / :10809 (HTTP)`);
       pushToast(`Active adapter IP: ${nextIp}`, 'success');
     } catch (err) {
       pushToast(String(err), 'amber');
@@ -3029,44 +3171,50 @@ function SettingsScreen() {
             </div>
           </div>
 
-          {/* Local Ports & LAN Sharing */}
+          {/* Fixed Inbound Ports (10808 SOCKS5 & 10809 HTTP) & LAN Sharing */}
           <div className="rounded-[20px] p-3.5 flex flex-col gap-3" style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}>
-            <div className="grid grid-cols-2 gap-2.5">
-              <label className="flex flex-col gap-1">
-                <span className="text-[11px] font-semibold" style={{ color: COLORS.textMuted }}>
-                  SOCKS5 Port
-                </span>
-                <input
-                  type="number"
-                  min={1024}
-                  max={65535}
-                  value={socksPort}
-                  onChange={(e) => {
-                    const v = Number(e.target.value);
-                    if (v >= 1024 && v <= 65535) persistSettingsPatch({ socksPort: v });
-                  }}
-                  className="h-[34px] rounded-[10px] px-2.5 font-mono text-[12px] focus:outline-none"
-                  style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}`, color: COLORS.textPrimary }}
-                />
-              </label>
+            <div className="flex items-center justify-between">
+              <span className="font-jakarta font-bold text-[12.5px]" style={{ color: COLORS.textPrimary }}>
+                Fixed Inbound Proxy Ports
+              </span>
+              <span
+                className="px-2 py-0.5 rounded-full text-[9.5px] font-bold uppercase"
+                style={{ backgroundColor: '#1E332B', color: COLORS.mint }}
+              >
+                FIXED • ANDROID SYNCED
+              </span>
+            </div>
 
-              <label className="flex flex-col gap-1">
-                <span className="text-[11px] font-semibold" style={{ color: COLORS.textMuted }}>
-                  HTTP Port
-                </span>
-                <input
-                  type="number"
-                  min={1024}
-                  max={65535}
-                  value={httpPort}
-                  onChange={(e) => {
-                    const v = Number(e.target.value);
-                    if (v >= 1024 && v <= 65535) persistSettingsPatch({ httpPort: v });
-                  }}
-                  className="h-[34px] rounded-[10px] px-2.5 font-mono text-[12px] focus:outline-none"
-                  style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}`, color: COLORS.textPrimary }}
-                />
-              </label>
+            <div className="grid grid-cols-2 gap-2.5">
+              <div
+                className="rounded-[12px] px-3 py-2 flex items-center justify-between"
+                style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}` }}
+              >
+                <div>
+                  <span className="text-[10px] font-semibold uppercase block" style={{ color: COLORS.textMuted }}>
+                    SOCKS5 Inbound
+                  </span>
+                  <span className="font-mono text-[13px] font-bold" style={{ color: COLORS.textPrimary }}>
+                    127.0.0.1:10808
+                  </span>
+                </div>
+                <Lock className="w-3.5 h-3.5 shrink-0" style={{ color: COLORS.amber }} />
+              </div>
+
+              <div
+                className="rounded-[12px] px-3 py-2 flex items-center justify-between"
+                style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}` }}
+              >
+                <div>
+                  <span className="text-[10px] font-semibold uppercase block" style={{ color: COLORS.textMuted }}>
+                    HTTP Inbound
+                  </span>
+                  <span className="font-mono text-[13px] font-bold" style={{ color: COLORS.textPrimary }}>
+                    127.0.0.1:10809
+                  </span>
+                </div>
+                <Lock className="w-3.5 h-3.5 shrink-0" style={{ color: COLORS.amber }} />
+              </div>
             </div>
 
             <div className="flex items-center justify-between gap-2 pt-2 border-t" style={{ borderColor: '#292223' }}>
@@ -3084,7 +3232,7 @@ function SettingsScreen() {
             {lanProxySharing && (
               <div className="rounded-[12px] p-2.5 flex items-center justify-between gap-2" style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}` }}>
                 <span className="font-mono text-[11px] truncate" style={{ color: COLORS.amber }}>
-                  {localLanIp}:{socksPort || 10808}
+                  SOCKS {localLanIp}:10808 • HTTP :10809
                 </span>
                 <div className="flex items-center gap-1 shrink-0">
                   <button
@@ -3098,7 +3246,7 @@ function SettingsScreen() {
                   </button>
                   <button
                     type="button"
-                    onClick={() => handleCopyProxy(socksPort || 10808)}
+                    onClick={() => handleCopyProxy(10808)}
                     className="px-2.5 py-1 rounded-full text-[10.5px] font-semibold cursor-pointer"
                     style={{ backgroundColor: COLORS.taupe, color: COLORS.textPrimary }}
                   >
@@ -3165,7 +3313,7 @@ function SettingsScreen() {
                   </span>
                 </div>
                 <p className="text-[11px] leading-relaxed" style={{ color: systemMode === 'PROXY' ? '#DFC7C6' : COLORS.textMuted }}>
-                  Best for everyday browsing. Routes Chrome, Edge, Telegram &amp; Discord instantly. Some games or CLI tools may ignore system proxy.
+                  Best for everyday browsing. Routes Chrome, Edge, Telegram &amp; Discord instantly on fixed HTTP port <span className="font-mono">10809</span>.
                 </p>
               </button>
 
@@ -3254,7 +3402,7 @@ function SettingsScreen() {
           <div className="rounded-[20px] p-3.5 flex flex-col gap-3" style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}>
             <div>
               <div className="text-[12.5px] font-semibold mb-2" style={{ color: COLORS.textPrimary }}>
-                Encrypted DNS (DoH)
+                DNS Resolver (Zero-Rating Safe)
               </div>
               <div className="flex flex-wrap gap-1.5">
                 {DNS_OPTIONS.map((opt) => {
@@ -3317,9 +3465,25 @@ function SettingsScreen() {
               <div className="min-w-0">
                 <img src={metrovpnWordmark} alt="Metrovpn" className="h-[20px] w-auto object-contain mb-0.5" />
                 <div className="font-mono text-[11px] truncate" style={{ color: COLORS.textMuted }}>
-                  v2.6.0 • Xray v26.11.9 • Wintun
+                  v2.7.0 • Xray v26.11.9 • Fixed :10808/:10809
                 </div>
               </div>
+            </div>
+
+            <div className="flex items-center justify-between gap-3 py-2 px-3 rounded-[14px]" style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}` }}>
+              <div className="min-w-0">
+                <div className="text-[12px] font-semibold" style={{ color: COLORS.textPrimary }}>
+                  Auto-Check for Updates
+                </div>
+                <p className="text-[10.5px]" style={{ color: COLORS.textMuted }}>
+                  Automatically check GitHub Releases on launch
+                </p>
+              </div>
+              <M3ExpressiveSwitch
+                checked={autoCheckUpdates !== false}
+                onChange={setAutoCheckUpdates}
+                ariaLabel="Auto-Check for Updates"
+              />
             </div>
 
             <div className="grid grid-cols-2 gap-2">
@@ -3335,7 +3499,7 @@ function SettingsScreen() {
               <button
                 type="button"
                 onClick={checkForUpdates}
-                disabled={checkingUpdate}
+                disabled={checkingUpdate || downloadingUpdate}
                 className="h-[36px] px-3 rounded-full text-[11.5px] font-semibold flex items-center justify-center gap-1.5 cursor-pointer transition-colors duration-150 hover:bg-[#B50D17]"
                 style={{ backgroundColor: COLORS.crimson, color: COLORS.textPrimary, border: '1px solid #BC1F27' }}
               >
@@ -3346,23 +3510,44 @@ function SettingsScreen() {
 
             {updateInfo && (
               <div
-                className="rounded-[12px] p-2.5 flex items-center justify-between gap-2"
-                style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}` }}
+                className="rounded-[14px] p-3 flex flex-col gap-2"
+                style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${updateInfo.updateAvailable ? COLORS.coral : COLORS.surfaceBorder}` }}
               >
-                <span className="text-[11.5px]" style={{ color: updateInfo.updateAvailable ? COLORS.amber : COLORS.mint }}>
-                  {updateInfo.updateAvailable
-                    ? `v${updateInfo.latestVersion} available!`
-                    : `Up to date (v${updateInfo.currentVersion})`}
-                </span>
-                <button
-                  type="button"
-                  onClick={() => openExternalUrl(updateInfo.releaseUrl)}
-                  className="text-[11px] font-semibold inline-flex items-center gap-1 cursor-pointer hover:underline"
-                  style={{ color: COLORS.coral }}
-                >
-                  <span>Releases</span>
-                  <ExternalLink className="w-3 h-3" />
-                </button>
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[11.5px] font-semibold" style={{ color: updateInfo.updateAvailable ? COLORS.amber : COLORS.mint }}>
+                    {updateInfo.updateAvailable
+                      ? `New Update v${updateInfo.latestVersion} Ready!`
+                      : `Up to date (v${updateInfo.currentVersion})`}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      updateInfo.updateAvailable ? setUpdateModalOpen(true) : openExternalUrl(updateInfo.releaseUrl)
+                    }
+                    className="text-[11px] font-semibold inline-flex items-center gap-1 cursor-pointer hover:underline"
+                    style={{ color: COLORS.coral }}
+                  >
+                    <span>{updateInfo.updateAvailable ? 'Details' : 'Releases'}</span>
+                    <ExternalLink className="w-3 h-3" />
+                  </button>
+                </div>
+
+                {updateInfo.updateAvailable && (
+                  <button
+                    type="button"
+                    onClick={downloadAndInstallUpdate}
+                    disabled={downloadingUpdate}
+                    className="w-full h-[32px] px-3 rounded-full text-[11.5px] font-semibold flex items-center justify-center gap-1.5 cursor-pointer"
+                    style={{ backgroundColor: COLORS.crimson, color: COLORS.textPrimary, border: '1px solid #BC1F27' }}
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    <span>
+                      {downloadingUpdate
+                        ? `Downloading Update (${updateDownloadProgress?.percent || 0}%)...`
+                        : `Auto-Update to v${updateInfo.latestVersion}`}
+                    </span>
+                  </button>
+                )}
               </div>
             )}
 
@@ -5030,6 +5215,137 @@ function ToastOverlay() {
 }
 
 // ============================================================================
+// AUTO UPDATE DIALOG MODAL (Download & Install with Live Progress Bar)
+// ============================================================================
+function AutoUpdateModal() {
+  const {
+    updateModalOpen,
+    setUpdateModalOpen,
+    updateInfo,
+    downloadingUpdate,
+    updateDownloadProgress,
+    downloadAndInstallUpdate,
+  } = useMetro();
+
+  if (!updateInfo) return null;
+  const pct = updateDownloadProgress?.percent || 0;
+  const dlMb = ((updateDownloadProgress?.downloadedBytes || 0) / (1024 * 1024)).toFixed(1);
+  const totMb =
+    (updateDownloadProgress?.totalBytes || 0) > 0
+      ? `/ ${((updateDownloadProgress?.totalBytes || 0) / (1024 * 1024)).toFixed(1)} MB`
+      : 'MB';
+
+  return (
+    <AnimatePresence>
+      {updateModalOpen && (
+        <motion.div
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          transition={{ duration: 0.14 }}
+          className="fixed inset-0 z-50 flex items-center justify-center p-4"
+          style={{ backgroundColor: 'rgba(10, 8, 9, 0.80)', backdropFilter: 'blur(6px)' }}
+          onClick={() => !downloadingUpdate && setUpdateModalOpen(false)}
+        >
+          <motion.div
+            initial={{ scale: 0.96, opacity: 0, y: 12 }}
+            animate={{ scale: 1, opacity: 1, y: 0 }}
+            exit={{ scale: 0.96, opacity: 0, y: 10 }}
+            transition={{ duration: 0.15 }}
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-[390px] rounded-[22px] p-4 flex flex-col gap-3 shadow-2xl"
+            style={{ backgroundColor: COLORS.surface, border: `1.5px solid ${COLORS.coral}` }}
+          >
+            <div className="flex items-start justify-between gap-2">
+              <div className="flex items-center gap-2.5">
+                <div
+                  className="w-10 h-10 rounded-[14px] flex items-center justify-center shrink-0"
+                  style={{ backgroundColor: '#2D1A1C', border: '1px solid #592C30' }}
+                >
+                  <Download className="w-5 h-5" style={{ color: COLORS.coral }} />
+                </div>
+                <div>
+                  <span
+                    className="px-2 py-0.5 rounded-full text-[9.5px] font-bold uppercase tracking-wider"
+                    style={{ backgroundColor: COLORS.amberBg, color: COLORS.amber }}
+                  >
+                    Auto Update • v{updateInfo.latestVersion}
+                  </span>
+                  <h3 className="font-jakarta font-bold text-[15px] mt-0.5" style={{ color: COLORS.textPrimary }}>
+                    {updateInfo.title || 'New Update Available'}
+                  </h3>
+                </div>
+              </div>
+              {!downloadingUpdate && (
+                <button
+                  type="button"
+                  onClick={() => setUpdateModalOpen(false)}
+                  className="w-7 h-7 rounded-full flex items-center justify-center cursor-pointer hover:bg-[#2A2223]"
+                  style={{ color: COLORS.textMuted }}
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              )}
+            </div>
+
+            <div
+              className="rounded-[14px] p-3 text-[11.5px] leading-relaxed max-h-[140px] overflow-y-auto custom-scrollbar"
+              style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}`, color: '#D6C6C6' }}
+            >
+              {updateInfo.message || `Metrovpn v${updateInfo.latestVersion} is ready to download and install automatically.`}
+            </div>
+
+            {downloadingUpdate && (
+              <div className="flex flex-col gap-1.5">
+                <div className="flex items-center justify-between text-[11px] font-mono tabular-nums">
+                  <span style={{ color: COLORS.amber }}>
+                    {updateDownloadProgress?.phase === 'launching'
+                      ? 'Launching Windows Installer...'
+                      : `Downloading ${updateInfo.assetName || 'Update'}...`}
+                  </span>
+                  <span style={{ color: COLORS.textPrimary }}>
+                    {pct}% ({dlMb} {totMb})
+                  </span>
+                </div>
+                <div className="w-full h-2 rounded-full overflow-hidden" style={{ backgroundColor: '#2E2627' }}>
+                  <div
+                    className="h-full rounded-full transition-all duration-200"
+                    style={{ width: `${pct}%`, backgroundColor: COLORS.coral }}
+                  />
+                </div>
+              </div>
+            )}
+
+            <div className="flex items-center justify-end gap-2 pt-1">
+              {!downloadingUpdate && (
+                <button
+                  type="button"
+                  onClick={() => setUpdateModalOpen(false)}
+                  className="h-[34px] px-3.5 rounded-full text-[11.5px] font-semibold cursor-pointer hover:bg-[#272021]"
+                  style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}`, color: COLORS.textMuted }}
+                >
+                  Later
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={downloadAndInstallUpdate}
+                disabled={downloadingUpdate}
+                className="h-[34px] px-4 rounded-full text-[12px] font-semibold flex items-center gap-1.5 cursor-pointer disabled:opacity-70"
+                style={{ backgroundColor: COLORS.crimson, color: COLORS.textPrimary, border: '1px solid #BC1F27' }}
+              >
+                <Download className="w-3.5 h-3.5" />
+                <span>{downloadingUpdate ? 'Installing...' : 'Download & Install Now'}</span>
+              </button>
+            </div>
+          </motion.div>
+        </motion.div>
+      )}
+    </AnimatePresence>
+  );
+}
+
+// ============================================================================
 // DESKTOP STAGE / MAIN APPLICATION SHELL
 // ============================================================================
 function DesktopStage() {
@@ -5076,6 +5392,7 @@ function DesktopStage() {
         <WindowsAppsModal />
         <AdminElevationModal />
         <OnboardingGuideModal />
+        <AutoUpdateModal />
         <NodeUtilityModals />
         <XrayLogsDrawer />
         <ToastOverlay />
@@ -5119,6 +5436,7 @@ function DesktopStage() {
             <WindowsAppsModal />
             <AdminElevationModal />
             <OnboardingGuideModal />
+            <AutoUpdateModal />
             <NodeUtilityModals />
             <XrayLogsDrawer />
           </motion.div>

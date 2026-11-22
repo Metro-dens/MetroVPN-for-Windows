@@ -8,26 +8,36 @@ pub const STATS_API_PORT: u16 = 10085;
 pub fn build_xray_config(
     node: &ServerNode,
     settings: &AppSettings,
-    socks_port: u16,
-    http_port: u16,
+    req_socks_port: u16,
+    req_http_port: u16,
     enable_api: bool,
 ) -> Value {
+    let socks_port = if enable_api { SOCKS_PORT } else { req_socks_port };
+    let http_port = if enable_api { HTTP_PORT } else { req_http_port };
     let listen_addr = if settings.lan_proxy_sharing && enable_api {
         "0.0.0.0"
     } else {
         "127.0.0.1"
     };
 
-    let sniffing_obj = if settings.sniffing_enabled {
+    let sniffing_socks = if settings.sniffing_enabled {
         json!({
             "enabled": true,
             "destOverride": ["http", "tls", "quic"],
             "routeOnly": settings.sniffing_route_only
         })
     } else {
+        json!({ "enabled": false })
+    };
+
+    let sniffing_http = if settings.sniffing_enabled {
         json!({
-            "enabled": false
+            "enabled": true,
+            "destOverride": ["http", "tls"],
+            "routeOnly": settings.sniffing_route_only
         })
+    } else {
+        json!({ "enabled": false })
     };
 
     let mut inbounds = vec![
@@ -38,16 +48,21 @@ pub fn build_xray_config(
             "protocol": "socks",
             "settings": {
                 "auth": "noauth",
-                "udp": settings.udp_enabled
+                "udp": true,
+                "userLevel": 8
             },
-            "sniffing": sniffing_obj.clone()
+            "sniffing": sniffing_socks
         }),
         json!({
             "tag": "http-in",
             "listen": listen_addr,
             "port": http_port,
             "protocol": "http",
-            "sniffing": sniffing_obj
+            "settings": {
+                "allowTransparent": false,
+                "userLevel": 8
+            },
+            "sniffing": sniffing_http
         }),
     ];
 
@@ -64,19 +79,7 @@ pub fn build_xray_config(
     }
 
     let proxy_outbound = build_proxy_outbound(node, settings);
-    let mut outbounds = vec![
-        proxy_outbound,
-        json!({
-            "tag": "direct",
-            "protocol": "freedom",
-            "settings": {}
-        }),
-        json!({
-            "tag": "block",
-            "protocol": "blackhole",
-            "settings": {}
-        }),
-    ];
+    let mut outbounds = vec![proxy_outbound];
 
     if settings.tunnel_profile == "TLS Frag" {
         let packets = if settings.fragment_packets.trim().is_empty() {
@@ -85,7 +88,7 @@ pub fn build_xray_config(
             settings.fragment_packets.trim()
         };
         let length = if settings.fragment_length.trim().is_empty() {
-            "10-50"
+            "10-20"
         } else {
             settings.fragment_length.trim()
         };
@@ -107,6 +110,17 @@ pub fn build_xray_config(
             }
         }));
     }
+
+    outbounds.push(json!({
+        "tag": "direct",
+        "protocol": "freedom",
+        "settings": {}
+    }));
+    outbounds.push(json!({
+        "tag": "block",
+        "protocol": "blackhole",
+        "settings": {}
+    }));
 
     let dns_servers = build_dns_servers(settings);
     let mut routing_rules = Vec::new();
@@ -152,7 +166,6 @@ pub fn build_xray_config(
             routing_rules.push(json!({
                 "type": "field",
                 "ip": [
-                    "geoip:private",
                     "127.0.0.0/8",
                     "10.0.0.0/8",
                     "172.16.0.0/12",
@@ -191,6 +204,13 @@ pub fn build_xray_config(
                 }));
             }
         }
+
+        // Explicit final catch-all rule matching Android XrayConfigBuilder.kt
+        routing_rules.push(json!({
+            "type": "field",
+            "inboundTag": ["socks-in", "http-in"],
+            "outboundTag": "proxy"
+        }));
     }
 
     let log_level = match settings.log_level.as_str() {
@@ -223,6 +243,18 @@ pub fn build_xray_config(
         root["policy"] = json!({
             "levels": {
                 "0": {
+                    "handshake": 4,
+                    "connIdle": 120,
+                    "uplinkOnly": 0,
+                    "downlinkOnly": 0,
+                    "statsUserUplink": true,
+                    "statsUserDownlink": true
+                },
+                "8": {
+                    "handshake": 4,
+                    "connIdle": 120,
+                    "uplinkOnly": 0,
+                    "downlinkOnly": 0,
                     "statsUserUplink": true,
                     "statsUserDownlink": true
                 }
@@ -245,15 +277,19 @@ fn build_dns_servers(settings: &AppSettings) -> Vec<Value> {
     } else {
         settings.bootstrap_dns.trim()
     };
+    // Plain IP DNS resolvers first (like Android XrayConfigBuilder) so Xray never deadlocks on DoH bootstrap over ISP zero-rating packages
     match settings.dns_resolver.as_str() {
-        "Cloudflare 1.1.1.2" => vec![json!("https://1.1.1.2/dns-query"), json!(bootstrap)],
-        "Google 8.8.8.8" => vec![json!("https://8.8.8.8/dns-query"), json!(bootstrap)],
-        "Quad9 9.9.9.9" => vec![json!("https://9.9.9.9/dns-query"), json!(bootstrap)],
-        "Custom DoH" => vec![
-            json!(settings.custom_doh_url),
-            json!(bootstrap),
-        ],
-        _ => vec![json!("https://1.1.1.1/dns-query"), json!(bootstrap)],
+        "Cloudflare 1.1.1.2" => vec![json!("1.1.1.2"), json!("1.0.0.2"), json!(bootstrap)],
+        "Google 8.8.8.8" => vec![json!("8.8.8.8"), json!("8.8.4.4"), json!(bootstrap)],
+        "Quad9 9.9.9.9" => vec![json!("9.9.9.9"), json!("1.1.1.1")],
+        "Custom DoH" => {
+            if settings.custom_doh_url.trim().is_empty() {
+                vec![json!("1.1.1.1"), json!("8.8.8.8")]
+            } else {
+                vec![json!(bootstrap), json!(settings.custom_doh_url.trim()), json!("8.8.8.8")]
+            }
+        }
+        _ => vec![json!("1.1.1.1"), json!("8.8.8.8")],
     }
 }
 
@@ -283,6 +319,12 @@ fn build_proxy_outbound(node: &ServerNode, settings: &AppSettings) -> Value {
         "chrome"
     };
 
+    let effective_sni = if node.sni.trim().is_empty() {
+        node.address.as_str()
+    } else {
+        node.sni.trim()
+    };
+
     let mut stream_settings = json!({
         "network": node.transport,
         "security": security
@@ -292,7 +334,7 @@ fn build_proxy_outbound(node: &ServerNode, settings: &AppSettings) -> Value {
         stream_settings["realitySettings"] = json!({
             "show": false,
             "fingerprint": fp,
-            "serverName": node.sni,
+            "serverName": effective_sni,
             "publicKey": node.public_key.clone().unwrap_or_default(),
             "shortId": node.short_id.clone().unwrap_or_default(),
             "spiderX": node.spider_x.clone().unwrap_or_else(|| "/".into())
@@ -310,23 +352,28 @@ fn build_proxy_outbound(node: &ServerNode, settings: &AppSettings) -> Value {
             vec!["h2".to_string(), "http/1.1".to_string()]
         };
 
-        let strict_verify = settings.tunnel_profile == "Strict VCN" && settings.cert_pinning;
-        let allow_insecure = if strict_verify {
+        let has_vcn_host = node
+            .vcn_host
+            .as_ref()
+            .map(|h| !h.trim().is_empty())
+            .unwrap_or(false);
+        let allow_insecure = if has_vcn_host && settings.cert_pinning {
             false
         } else {
             node.allow_insecure || settings.allow_insecure_fallback
         };
 
         let mut tls_obj = json!({
-            "serverName": node.sni,
+            "serverName": effective_sni,
             "allowInsecure": allow_insecure,
             "fingerprint": fp,
             "alpn": alpn_list
         });
 
+        // Always apply verifyPeerCertByName when node has vcn_host & cert_pinning is enabled (even in TLS Frag or Standard profile!)
         if let Some(vcn_host) = &node.vcn_host {
-            if !vcn_host.is_empty() && settings.cert_pinning {
-                tls_obj["verifyPeerCertByName"] = json!(vcn_host);
+            if !vcn_host.trim().is_empty() && settings.cert_pinning {
+                tls_obj["verifyPeerCertByName"] = json!(vcn_host.trim());
             }
         }
         stream_settings["tlsSettings"] = tls_obj;
@@ -334,15 +381,31 @@ fn build_proxy_outbound(node: &ServerNode, settings: &AppSettings) -> Value {
 
     match node.transport.as_str() {
         "ws" => {
+            let ws_path = node
+                .path
+                .clone()
+                .filter(|p| !p.trim().is_empty())
+                .unwrap_or_else(|| "/".into());
+            // Match Android XrayConfigBuilder: wsHost.ifBlank { vcn.ifBlank { sni } }
+            let host_header = node
+                .host
+                .as_deref()
+                .filter(|h| !h.trim().is_empty())
+                .or_else(|| node.vcn_host.as_deref().filter(|v| !v.trim().is_empty()))
+                .unwrap_or(effective_sni);
             let mut ws = json!({
-                "path": node.path.clone().unwrap_or_else(|| "/".into())
+                "path": ws_path
             });
-            if let Some(h) = &node.host {
-                ws["headers"] = json!({ "Host": h });
-            } else {
-                ws["headers"] = json!({ "Host": node.sni });
+            if !host_header.is_empty() {
+                ws["host"] = json!(host_header);
+                ws["headers"] = json!({ "Host": host_header });
             }
             stream_settings["wsSettings"] = ws;
+        }
+        "tcp" => {
+            stream_settings["tcpSettings"] = json!({
+                "header": { "type": "none" }
+            });
         }
         "grpc" => {
             stream_settings["grpcSettings"] = json!({
@@ -375,7 +438,8 @@ fn build_proxy_outbound(node: &ServerNode, settings: &AppSettings) -> Value {
                     "users": [{
                         "id": node.uuid,
                         "alterId": 0,
-                        "security": "auto"
+                        "security": "auto",
+                        "level": 8
                     }]
                 }]
             },
@@ -384,7 +448,8 @@ fn build_proxy_outbound(node: &ServerNode, settings: &AppSettings) -> Value {
     } else {
         let mut user = json!({
             "id": node.uuid,
-            "encryption": "none"
+            "encryption": "none",
+            "level": 8
         });
         if let Some(flow) = &node.flow {
             if !flow.is_empty() && node.transport == "tcp" {

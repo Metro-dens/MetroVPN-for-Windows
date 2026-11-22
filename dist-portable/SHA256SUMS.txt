@@ -1,2 +1,2 @@
-671567cf7ef961e289939bf74c026bdc98b35c44267e36e2ea3ac13c9ba3c8cf  Metrovpn.exe
-5491be87d20d6529a0231600f1d0274f1a4a821423aeee582f9494ae0f66ff23  Metrovpn-windows-x64-portable.zip
+a57ad762a719d5837f0b821887af344ec31d1b61f6df1aaf37412ce74d49a367  Metrovpn.exe
+8367e52a4a23f273dcde076e9a8dc3c6e5bfe6d75b5e2f68ea610b9119a70e75  Metrovpn-windows-x64-portable.zip

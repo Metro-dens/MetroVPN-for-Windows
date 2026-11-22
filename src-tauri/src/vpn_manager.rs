@@ -3,23 +3,26 @@ use crate::models::{
     UpdateDownloadProgress, VpnStatusPayload, WindowsAppRule,
 };
 use crate::network_win::{
-    backup_file_path, capture_virtual_screen_rgba, configure_tun_interface, enable_system_proxy,
-    get_active_lan_ipv4, is_elevated, kill_stale_core_processes, relaunch_as_admin,
-    restore_system_proxy, scan_installed_windows_apps, teardown_tun_routes, CREATE_NO_WINDOW,
+    backup_file_path, capture_virtual_screen_rgba, capture_virtual_screen_with_bounds,
+    configure_tun_interface, enable_system_proxy, get_active_lan_ipv4, is_elevated,
+    kill_stale_core_processes, relaunch_as_admin, restore_system_proxy,
+    scan_installed_windows_apps, teardown_tun_routes, CREATE_NO_WINDOW,
 };
 use crate::parser::{decode_qr_from_bytes, decode_qr_from_rgba, fetch_subscription, parse_any};
 use crate::xray_config::{build_xray_config, HTTP_PORT, SOCKS_PORT, STATS_API_PORT};
 use crate::xray_stats::query_xray_stats;
+use base64::engine::general_purpose::STANDARD as BASE64_STD;
+use base64::Engine as _;
 use chrono::Local;
 use futures_util::StreamExt;
 use std::collections::VecDeque;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Cursor, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, State};
 use uuid::Uuid;
 
 const MAX_LOG_LINES: usize = 500;
@@ -28,6 +31,14 @@ const UPDATE_MANIFEST_URL: &str =
     "https://raw.githubusercontent.com/Metro-dens/MetroVPN-for-Windows/main/update.json";
 const GITHUB_RELEASES_API_URL: &str =
     "https://api.github.com/repos/Metro-dens/MetroVPN-for-Windows/releases/latest";
+
+#[derive(Clone)]
+pub struct PendingSnipCapture {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+    pub preview_data_url: String,
+}
 
 pub struct InnerState {
     pub app_data_dir: PathBuf,
@@ -43,6 +54,7 @@ pub struct InnerState {
     pub telemetry_generation: u64,
     pub last_up_bytes: u64,
     pub last_down_bytes: u64,
+    pub pending_snip: Option<PendingSnipCapture>,
 }
 
 #[derive(Clone)]
@@ -97,6 +109,7 @@ impl AppState {
                 telemetry_generation: 0,
                 last_up_bytes: 0,
                 last_down_bytes: 0,
+                pending_snip: None,
             })),
         }
     }
@@ -1974,6 +1987,169 @@ pub async fn scan_screen_qr(app: AppHandle, hide_window: Option<bool>) -> Result
     tokio::task::spawn_blocking(move || decode_qr_from_rgba(w, h, rgba))
         .await
         .map_err(|e| format!("QR decode task failed: {e}"))?
+}
+
+fn restore_main_after_snip(app: &AppHandle) {
+    if let Some(snip) = app.get_webview_window("snip") {
+        let _ = snip.hide();
+    }
+    if let Some(main) = app.get_webview_window("main") {
+        let _ = main.show();
+        let _ = main.unminimize();
+        let _ = main.set_focus();
+    }
+}
+
+#[tauri::command]
+pub async fn start_screen_snip(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    if let Some(main) = app.get_webview_window("main") {
+        let _ = main.hide();
+    }
+    tokio::time::sleep(Duration::from_millis(240)).await;
+
+    let capture_res = tokio::task::spawn_blocking(move || {
+        let (vx, vy, vw, vh, rgba) = capture_virtual_screen_with_bounds()?;
+        let img = image::RgbaImage::from_raw(vw, vh, rgba.clone())
+            .ok_or_else(|| "Invalid screen buffer".to_string())?;
+        let rgb = image::DynamicImage::ImageRgba8(img).to_rgb8();
+        let mut jpeg_buf = Cursor::new(Vec::new());
+        let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_buf, 86);
+        enc.encode(&rgb, vw, vh, image::ExtendedColorType::Rgb8)
+            .map_err(|e| format!("Failed to encode snip preview: {e}"))?;
+        let b64 = BASE64_STD.encode(jpeg_buf.into_inner());
+        let data_url = format!("data:image/jpeg;base64,{b64}");
+        Ok::<_, String>((vx, vy, vw, vh, rgba, data_url))
+    })
+    .await;
+
+    let (vx, vy, vw, vh, rgba, preview_data_url) = match capture_res {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => {
+            restore_main_after_snip(&app);
+            return Err(e);
+        }
+        Err(e) => {
+            restore_main_after_snip(&app);
+            return Err(format!("Screen snip capture task failed: {e}"));
+        }
+    };
+
+    if let Ok(mut g) = state.inner.lock() {
+        g.pending_snip = Some(PendingSnipCapture {
+            width: vw,
+            height: vh,
+            rgba,
+            preview_data_url: preview_data_url.clone(),
+        });
+    }
+
+    let snip_win = app
+        .get_webview_window("snip")
+        .ok_or_else(|| {
+            restore_main_after_snip(&app);
+            "Snipping overlay window is unavailable".to_string()
+        })?;
+    let _ = snip_win.set_position(PhysicalPosition::new(vx, vy));
+    let _ = snip_win.set_size(PhysicalSize::new(vw, vh));
+    let _ = snip_win.emit("vpn://snip-ready", &preview_data_url);
+    let _ = snip_win.show();
+    let _ = snip_win.set_always_on_top(true);
+    let _ = snip_win.set_focus();
+    Ok(())
+}
+
+#[tauri::command]
+pub fn get_snip_preview(state: State<'_, AppState>) -> Result<String, String> {
+    let guard = state.inner.lock().map_err(|_| "State lock poisoned")?;
+    Ok(guard
+        .pending_snip
+        .as_ref()
+        .map(|s| s.preview_data_url.clone())
+        .unwrap_or_default())
+}
+
+#[tauri::command]
+pub async fn cancel_screen_snip(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    if let Ok(mut g) = state.inner.lock() {
+        g.pending_snip = None;
+    }
+    restore_main_after_snip(&app);
+    let _ = app.emit("vpn://snip-cancelled", serde_json::json!({}));
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn finish_screen_snip(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    x_ratio: f64,
+    y_ratio: f64,
+    w_ratio: f64,
+    h_ratio: f64,
+) -> Result<String, String> {
+    let pending = {
+        let mut g = state.inner.lock().map_err(|_| "State lock poisoned")?;
+        g.pending_snip.take()
+    };
+    restore_main_after_snip(&app);
+
+    let Some(cap) = pending else {
+        let err = "No captured screenshot buffer found".to_string();
+        let _ = app.emit(
+            "vpn://snip-result",
+            serde_json::json!({ "ok": false, "error": &err }),
+        );
+        return Err(err);
+    };
+
+    let decode_res = tokio::task::spawn_blocking(move || {
+        let full_w = cap.width as f64;
+        let full_h = cap.height as f64;
+        let pad = 16i32;
+
+        let raw_x = (x_ratio.clamp(0.0, 1.0) * full_w).round() as i32;
+        let raw_y = (y_ratio.clamp(0.0, 1.0) * full_h).round() as i32;
+        let raw_w = (w_ratio.clamp(0.0, 1.0) * full_w).round() as i32;
+        let raw_h = (h_ratio.clamp(0.0, 1.0) * full_h).round() as i32;
+
+        if raw_w < 12 || raw_h < 12 {
+            return Err("Selected region is too small. Drag a box around the QR code.".into());
+        }
+
+        let cx = (raw_x - pad).max(0) as u32;
+        let cy = (raw_y - pad).max(0) as u32;
+        let cx2 = (raw_x + raw_w + pad).min(cap.width as i32) as u32;
+        let cy2 = (raw_y + raw_h + pad).min(cap.height as i32) as u32;
+        let cw = cx2.saturating_sub(cx).max(1);
+        let ch = cy2.saturating_sub(cy).max(1);
+
+        let full_img = image::RgbaImage::from_raw(cap.width, cap.height, cap.rgba)
+            .ok_or_else(|| "Corrupted screenshot buffer".to_string())?;
+        let cropped = image::imageops::crop_imm(&full_img, cx, cy, cw, ch).to_image();
+        decode_qr_from_rgba(cw, ch, cropped.into_raw())
+    })
+    .await
+    .map_err(|e| format!("QR snip decode task failed: {e}"))?;
+
+    match decode_res {
+        Ok(text) => {
+            let _ = app.emit(
+                "vpn://snip-result",
+                serde_json::json!({ "ok": true, "text": &text }),
+            );
+            Ok(text)
+        }
+        Err(err) => {
+            let _ = app.emit(
+                "vpn://snip-result",
+                serde_json::json!({ "ok": false, "error": &err }),
+            );
+            Err(err)
+        }
+    }
 }
 
 #[tauri::command]

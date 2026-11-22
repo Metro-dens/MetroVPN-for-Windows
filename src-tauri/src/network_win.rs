@@ -685,7 +685,7 @@ mod win_impl {
         merged
     }
 
-    pub fn capture_virtual_screen_rgba() -> Result<(u32, u32, Vec<u8>), String> {
+    pub fn capture_virtual_screen_with_bounds() -> Result<(i32, i32, u32, u32, Vec<u8>), String> {
         unsafe {
             let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
             let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
@@ -758,8 +758,13 @@ mod win_impl {
                 chunk.swap(0, 2); // BGRA -> RGBA
                 chunk[3] = 255;
             }
-            Ok((vw as u32, vh as u32, buf))
+            Ok((vx, vy, vw as u32, vh as u32, buf))
         }
+    }
+
+    pub fn capture_virtual_screen_rgba() -> Result<(u32, u32, Vec<u8>), String> {
+        let (_vx, _vy, vw, vh, buf) = capture_virtual_screen_with_bounds()?;
+        Ok((vw, vh, buf))
     }
 }
 
@@ -819,15 +824,20 @@ mod win_impl {
         existing.to_vec()
     }
 
+    pub fn capture_virtual_screen_with_bounds() -> Result<(i32, i32, u32, u32, Vec<u8>), String> {
+        Err("Screen capture QR is only supported on Windows".into())
+    }
+
     pub fn capture_virtual_screen_rgba() -> Result<(u32, u32, Vec<u8>), String> {
         Err("Screen capture QR is only supported on Windows".into())
     }
 }
 
 pub use win_impl::{
-    acquire_single_instance_or_focus, capture_virtual_screen_rgba, configure_tun_interface,
-    enable_system_proxy, is_elevated, kill_stale_core_processes, relaunch_as_admin,
-    restore_system_proxy, scan_installed_windows_apps, teardown_tun_routes, CREATE_NO_WINDOW,
+    acquire_single_instance_or_focus, capture_virtual_screen_rgba,
+    capture_virtual_screen_with_bounds, configure_tun_interface, enable_system_proxy,
+    is_elevated, kill_stale_core_processes, relaunch_as_admin, restore_system_proxy,
+    scan_installed_windows_apps, teardown_tun_routes, CREATE_NO_WINDOW,
 };
 
 pub fn backup_file_path(app_data_dir: &Path) -> std::path::PathBuf {

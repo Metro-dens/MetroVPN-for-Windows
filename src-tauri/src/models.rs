@@ -219,7 +219,7 @@ fn default_latency_url() -> String {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
-            system_mode: "PROXY".to_string(),
+            system_mode: "TUN".to_string(),
             tunnel_profile: "Strict VCN".to_string(),
             lan_proxy_sharing: false,
             split_tunneling: true,

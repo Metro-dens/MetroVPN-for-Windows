@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: "Release tag to create (e.g. v2.7.1)"
+        description: "Release tag to create (e.g. v2.7.2)"
         required: true
-        default: "v2.7.1"
+        default: "v2.7.2"
         type: string
       draft:
         description: "Create as a draft release (hidden until published)"
@@ -76,11 +76,12 @@ jobs:
             - **`Metrovpn-windows-x64-portable.zip`** — Portable folder archive with all binaries side-by-side.
             - **`SHA256SUMS.txt`** — SHA-256 verification checksums (`Get-FileHash <file> -Algorithm SHA256`).
 
-            ### What's New in v2.7.1
-            - **Fixed Windows TUN Mode (`tun2socks` exit code 2):** Switched `tun2socks v2.7.0` launch flags to POSIX double-dash syntax (`--device`, `--proxy`, `--mtu`, `--loglevel`) required by `spf13/pflag`, and set working directory next to `wintun.dll`.
-            - **Hardened Wintun Routing & DNS:** Routes `0.0.0.0/1` and `128.0.0.0/1` explicitly via the `Metrovpn-TUN` interface index (`if <idx>`), and pre-resolves domain server addresses into Xray's `dns.hosts` in TUN mode to prevent DNS bootstrap loops.
-            - **Cleaner Error Diagnostics:** Captures the last `[TUN]` log line when `tun2socks` exits early and deduplicates stacked error toast banners.
-            - **Includes all `v2.7.0` improvements:** 3x-ui inbound data quota sync (`/api/quota?uuid=...`), fixed SOCKS5 (`10808`) & HTTP (`10809`) ports, fixed-center rotating connect ring, and built-in auto-updater.
+            ### What's New in v2.7.2
+            - **Always Starts as Administrator & TUN Default:** Embedded UAC `requireAdministrator` manifest so Windows launches Metrovpn elevated every time, and set **TUN Mode** as the out-of-the-box default.
+            - **Snipping-Tool Mouse-Drag QR Scanner:** Drag your mouse over any QR code anywhere on your desktop/browser (with zoomed dim backdrop and `Esc` cancel) to crop and import instantly.
+            - **Fixed Spoofed-SNI TCP+TLS Links (e.g. `type=tcp&security=tls&sni=st1.zoom.us`):** Automatically infers `verifyPeerCertByName` from domain addresses when `sni` differs from host without an explicit `vcn=` parameter.
+            - **Android Frosted Glass UI + Smooth Neon Telemetry:** Added layered glassmorphic cards with ambient radial lighting, silky-smooth `requestAnimationFrame` speedometer & sparkline interpolation, and neon-blooming Download/Upload lines with glowing endpoint dots.
+            - **Cleaner Add Config Dialog:** Removed the Sample button so pasting/importing configs stays focused.
 
             > **SmartScreen Note:** If Windows Defender SmartScreen prompts on an unsigned build, verify the SHA-256 checksum against `SHA256SUMS.txt` and click **More info → Run anyway**.
           releaseDraft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft || false }}

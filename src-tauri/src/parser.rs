@@ -130,8 +130,25 @@ pub fn parse_vless_uri(raw: &str) -> Result<ServerNode, String> {
         .or_else(|| params.get("verifypeercertbyname"))
         .cloned()
         .filter(|v| !v.is_empty());
-    let vcn = vcn_param.is_some() || tls_mode == "reality";
-    let vcn_host = vcn_param.filter(|v| v != "strict" && v != "1" && v != "true");
+    let explicit_allow_insecure = params
+        .get("allowinsecure")
+        .or_else(|| params.get("insecure"))
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let implicit_vcn_host = if vcn_param.is_none()
+        && tls_mode.eq_ignore_ascii_case("tls")
+        && !explicit_allow_insecure
+        && address.parse::<std::net::IpAddr>().is_err()
+        && !address.eq_ignore_ascii_case(&sni)
+    {
+        Some(address.clone())
+    } else {
+        None
+    };
+    let vcn = vcn_param.is_some() || implicit_vcn_host.is_some() || tls_mode == "reality";
+    let vcn_host = vcn_param
+        .filter(|v| v != "strict" && v != "1" && v != "true")
+        .or(implicit_vcn_host);
 
     let fingerprint = params
         .get("fp")
@@ -593,42 +610,85 @@ pub fn decode_qr_from_bytes(bytes: &[u8]) -> Result<String, String> {
     Err("No QR code detected in the provided image".into())
 }
 
-pub fn decode_qr_from_rgba(width: u32, height: u32, rgba: Vec<u8>) -> Result<String, String> {
-    let img = image::RgbaImage::from_raw(width, height, rgba)
-        .ok_or_else(|| "Invalid screen image buffer".to_string())?;
-    let luma = image::DynamicImage::ImageRgba8(img).to_luma8();
+fn try_decode_luma_grid(luma: &image::GrayImage) -> Option<String> {
     let mut prepared = rqrr::PreparedImage::prepare(luma.clone());
     for grid in prepared.detect_grids() {
         if let Ok((_meta, content)) = grid.decode() {
-            return Ok(content);
+            return Some(content);
         }
     }
-
-    // Retry inverted luminance for white-on-dark QR codes
-    let mut inverted = luma;
+    let mut inverted = luma.clone();
     for p in inverted.pixels_mut() {
         p.0[0] = 255u8.saturating_sub(p.0[0]);
     }
     let mut prep_inv = rqrr::PreparedImage::prepare(inverted);
     for grid in prep_inv.detect_grids() {
         if let Ok((_meta, content)) = grid.decode() {
-            return Ok(content);
+            return Some(content);
         }
     }
-    Err("No QR code found on screen. Make sure the QR code is clearly visible and try again.".into())
+    None
+}
+
+pub fn decode_qr_from_rgba(width: u32, height: u32, rgba: Vec<u8>) -> Result<String, String> {
+    let img = image::RgbaImage::from_raw(width, height, rgba)
+        .ok_or_else(|| "Invalid screen image buffer".to_string())?;
+    let luma = image::DynamicImage::ImageRgba8(img).to_luma8();
+
+    if let Some(hit) = try_decode_luma_grid(&luma) {
+        return Ok(hit);
+    }
+
+    // Upscale clipped/small QR regions 2x so rqrr finder patterns lock cleanly
+    if width < 900 || height < 900 {
+        let up_w = (width.saturating_mul(2)).clamp(120, 2000);
+        let up_h = (height.saturating_mul(2)).clamp(120, 2000);
+        let upscaled =
+            image::imageops::resize(&luma, up_w, up_h, image::imageops::FilterType::Triangle);
+        if let Some(hit) = try_decode_luma_grid(&upscaled) {
+            return Ok(hit);
+        }
+    }
+
+    // High-contrast binarized fallback for dimmed/low-contrast screens
+    let mut contrast = luma;
+    for p in contrast.pixels_mut() {
+        p.0[0] = if p.0[0] > 128 { 255 } else { 0 };
+    }
+    if let Some(hit) = try_decode_luma_grid(&contrast) {
+        return Ok(hit);
+    }
+
+    Err("No QR code found in the selected region. Draw the box slightly around the whole QR code and try again.".into())
 }
 
 fn urlencoding_decode(input: &str) -> String {
-    url::form_urlencoded::parse(input.as_bytes())
-        .map(|(k, v)| {
-            if v.is_empty() {
-                k.into_owned()
-            } else {
-                format!("{k}={v}")
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let h1 = bytes[i + 1];
+            let h2 = bytes[i + 2];
+            if let (Some(a), Some(b)) = (hex_val(h1), hex_val(h2)) {
+                out.push((a << 4) | b);
+                i += 3;
+                continue;
             }
-        })
-        .collect::<Vec<_>>()
-        .join("&")
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| input.to_string())
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn urlencoding_encode(input: &str) -> String {
@@ -650,6 +710,24 @@ mod tests {
         assert_eq!(node.vcn_host.as_deref(), Some("vpn.metrodens.site"));
         assert_eq!(node.flow.as_deref(), Some("xtls-rprx-vision"));
         assert_eq!(node.name, "SG-01 SLT");
+    }
+
+    #[test]
+    fn test_parse_vless_slt_zoom_without_vcn_param() {
+        let uri = "vless://7f3bd91d-9110-45ac-aec9-304c74e49e83@vpn.metrodens.site:443?encryption=none&type=tcp&headerType=none&security=tls&fp=chrome&sni=st1.zoom.us&alpn=h2%2Chttp%2F1.1#SLT%20Fiber%20-%20Zoom%20Meet%20Max%20%2F%20Lite-SLT-FIBER-ZOOM-VIP-%40METRODENZ-122";
+        let node = parse_vless_uri(uri).expect("should parse SLT Zoom link");
+        assert_eq!(node.address, "vpn.metrodens.site");
+        assert_eq!(node.port, 443);
+        assert_eq!(node.sni, "st1.zoom.us");
+        assert_eq!(node.transport, "tcp");
+        assert_eq!(node.tls_mode, "tls");
+        assert_eq!(node.alpn.as_deref(), Some("h2,http/1.1"));
+        assert!(node.vcn);
+        assert_eq!(node.vcn_host.as_deref(), Some("vpn.metrodens.site"));
+        assert_eq!(
+            node.name,
+            "SLT Fiber - Zoom Meet Max / Lite-SLT-FIBER-ZOOM-VIP-@METRODENZ-122"
+        );
     }
 
     #[test]

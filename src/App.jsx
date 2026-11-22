@@ -66,6 +66,7 @@ import {
   IN_TAURI,
   copyClipboard,
   invokeCmd,
+  isSnipWindowMode,
   isTrayWindowMode,
   listenEvent,
   openExternalUrl,
@@ -159,23 +160,112 @@ const SPRING_SOFT = {
 };
 
 const COLORS = {
-  stage: '#0C0A0B',
-  obsidian: '#141112',
-  surface: '#1D191A',
-  surfaceBorder: '#2E2627',
-  surfaceActive: '#3B2827',
-  surfaceActiveBorder: '#593B39',
+  stage: '#0A0708',
+  obsidian: 'rgba(18, 13, 14, 0.72)',
+  surface: 'rgba(31, 24, 26, 0.62)',
+  surfaceBorder: 'rgba(255, 224, 222, 0.11)',
+  surfaceActive: 'rgba(66, 33, 33, 0.64)',
+  surfaceActiveBorder: 'rgba(255, 110, 100, 0.34)',
   crimson: '#9B0A12',
   crimsonHover: '#B50D17',
   coral: '#FF5449',
+  neonDown: '#FF5B52',
+  neonUp: '#FFC966',
   amber: '#E6C280',
-  amberBg: '#3A2F1B',
-  taupe: '#4B3635',
+  amberBg: 'rgba(62, 47, 24, 0.72)',
+  taupe: 'rgba(79, 54, 53, 0.80)',
   taupeHover: '#5C4341',
   mint: '#6DD5B0',
   textPrimary: '#F4ECEC',
-  textMuted: '#A8999A',
+  textMuted: '#B2A1A2',
 };
+
+const GLASS_CARD = {
+  backgroundColor: COLORS.surface,
+  border: `1px solid ${COLORS.surfaceBorder}`,
+  backdropFilter: 'blur(18px) saturate(145%)',
+  WebkitBackdropFilter: 'blur(18px) saturate(145%)',
+  boxShadow: 'inset 0 1px 0 rgba(255, 228, 226, 0.10), 0 12px 28px -14px rgba(0, 0, 0, 0.68)',
+};
+
+const GLASS_ACTIVE = {
+  backgroundColor: COLORS.surfaceActive,
+  border: `1px solid ${COLORS.surfaceActiveBorder}`,
+  backdropFilter: 'blur(18px) saturate(150%)',
+  WebkitBackdropFilter: 'blur(18px) saturate(150%)',
+  boxShadow: 'inset 0 1px 0 rgba(255, 184, 178, 0.14), 0 12px 28px -12px rgba(155, 10, 18, 0.28)',
+};
+
+const GLASS_INSET = {
+  backgroundColor: COLORS.obsidian,
+  border: '1px solid rgba(255, 220, 218, 0.08)',
+  boxShadow: 'inset 0 1px 0 rgba(255, 255, 255, 0.04)',
+};
+
+const GLASS_MODAL = {
+  backgroundColor: 'rgba(29, 22, 24, 0.84)',
+  border: '1px solid rgba(255, 224, 222, 0.15)',
+  backdropFilter: 'blur(24px) saturate(155%)',
+  WebkitBackdropFilter: 'blur(24px) saturate(155%)',
+  boxShadow: 'inset 0 1px 0 rgba(255, 228, 226, 0.12), 0 28px 64px -16px rgba(0, 0, 0, 0.85)',
+};
+
+function useSmoothedNumber(target, durationMs = 260) {
+  const [val, setVal] = useState(target);
+  const currentRef = useRef(target);
+
+  useEffect(() => {
+    const startVal = currentRef.current;
+    if (Math.abs(target - startVal) < 0.0005) {
+      currentRef.current = target;
+      setVal(target);
+      return;
+    }
+    let raf = 0;
+    const t0 = performance.now();
+    const step = (now) => {
+      const p = Math.min(1, (now - t0) / durationMs);
+      const ease = 1 - Math.pow(1 - p, 3);
+      const next = startVal + (target - startVal) * ease;
+      currentRef.current = next;
+      setVal(next);
+      if (p < 1) {
+        raf = requestAnimationFrame(step);
+      }
+    };
+    raf = requestAnimationFrame(step);
+    return () => cancelAnimationFrame(raf);
+  }, [target, durationMs]);
+
+  return val;
+}
+
+function useSmoothedSeries(targetSeries, durationMs = 280) {
+  const [series, setSeries] = useState(targetSeries);
+  const curRef = useRef(targetSeries);
+
+  useEffect(() => {
+    const len = targetSeries?.length || 0;
+    if (len === 0) return;
+    const start = curRef.current && curRef.current.length === len ? [...curRef.current] : [...targetSeries];
+    let raf = 0;
+    const t0 = performance.now();
+    const step = (now) => {
+      const p = Math.min(1, (now - t0) / durationMs);
+      const ease = 1 - Math.pow(1 - p, 3);
+      const next = targetSeries.map((tgt, idx) => start[idx] + (tgt - start[idx]) * ease);
+      curRef.current = next;
+      setSeries(next);
+      if (p < 1) {
+        raf = requestAnimationFrame(step);
+      }
+    };
+    raf = requestAnimationFrame(step);
+    return () => cancelAnimationFrame(raf);
+  }, [targetSeries, durationMs]);
+
+  return series;
+}
 
 // ============================================================================
 // MATHEMATICAL SVG PATH GENERATORS
@@ -200,12 +290,14 @@ function generateWavyArcPath(
   startDeg = 135,
   sweepDeg = 270,
   waveAmp = 3.2,
-  totalWaves = 24
+  totalWaves = 24,
+  phaseOffset = 0
 ) {
   const clamped = Math.max(0, Math.min(1, fraction));
-  if (clamped < 0.008) return '';
-  const steps = Math.max(12, Math.round(180 * clamped));
+  if (clamped < 0.008) return { d: '', endPt: null };
+  const steps = Math.max(18, Math.round(200 * clamped));
   let d = '';
+  let lastPt = null;
   for (let i = 0; i <= steps; i++) {
     const t = (i / steps) * clamped;
     const deg = startDeg + t * sweepDeg;
@@ -213,12 +305,13 @@ function generateWavyArcPath(
     const endTaper =
       Math.sin(Math.min(1, (i / steps) * 6) * (Math.PI / 2)) *
       Math.sin(Math.min(1, ((steps - i) / steps) * 6) * (Math.PI / 2));
-    const r = radius + waveAmp * endTaper * Math.sin(t * totalWaves * Math.PI * 2);
+    const r = radius + waveAmp * endTaper * Math.sin(t * totalWaves * Math.PI * 2 - phaseOffset);
     const x = cx + r * Math.cos(rad);
     const y = cy + r * Math.sin(rad);
+    lastPt = { x, y };
     d += `${i === 0 ? 'M' : 'L'} ${x.toFixed(2)} ${y.toFixed(2)} `;
   }
-  return d.trim();
+  return { d: d.trim(), endPt: lastPt };
 }
 
 function generateSmoothArcPath(cx, cy, radius, startDeg = 135, sweepDeg = 270) {
@@ -246,30 +339,44 @@ function generateWaveLinePath(fillWidth, midY = 6, amplitude = 2.6, wavelength =
   return d.trim();
 }
 
-function buildSparklinePath(values, width, height, padY = 4) {
-  if (!values || values.length < 2) return '';
+function buildSparklineGeometry(values, width, height, padY = 5, padRight = 6) {
+  if (!values || values.length < 2) {
+    return { linePath: '', areaPath: '', endPt: null };
+  }
   const clean = values.map((v) => (Number.isFinite(v) && v > 0 ? v : 0));
   const peak = Math.max(...clean);
   const baseY = height - padY;
+  const endX = Math.max(4, width - padRight);
   if (peak <= 0.001) {
-    return `M 0 ${baseY.toFixed(1)} L ${width.toFixed(1)} ${baseY.toFixed(1)}`;
+    const linePath = `M 0 ${baseY.toFixed(1)} L ${endX.toFixed(1)} ${baseY.toFixed(1)}`;
+    const areaPath = `${linePath} L ${endX.toFixed(1)} ${height} L 0 ${height} Z`;
+    return { linePath, areaPath, endPt: { x: endX, y: baseY } };
   }
-  const maxVal = peak * 1.15;
+  const maxVal = peak * 1.18;
   const usableH = Math.max(4, height - padY * 2);
-  const stepX = width / (clean.length - 1);
+  const stepX = endX / (clean.length - 1);
   const clampY = (y) => Math.max(padY, Math.min(baseY, y));
   const pts = clean.map((v, i) => ({
     x: i * stepX,
     y: clampY(baseY - (v / maxVal) * usableH),
   }));
-  let d = `M ${pts[0].x.toFixed(1)} ${pts[0].y.toFixed(1)}`;
+
+  // Smooth Catmull-Rom to cubic Bezier spline so lines glide without sharp corners
+  let linePath = `M ${pts[0].x.toFixed(2)} ${pts[0].y.toFixed(2)}`;
   for (let i = 0; i < pts.length - 1; i++) {
-    const p0 = pts[i];
-    const p1 = pts[i + 1];
-    const cx = ((p0.x + p1.x) / 2).toFixed(1);
-    d += ` C ${cx} ${p0.y.toFixed(1)}, ${cx} ${p1.y.toFixed(1)}, ${p1.x.toFixed(1)} ${p1.y.toFixed(1)}`;
+    const p0 = pts[Math.max(0, i - 1)];
+    const p1 = pts[i];
+    const p2 = pts[i + 1];
+    const p3 = pts[Math.min(pts.length - 1, i + 2)];
+    const cp1x = p1.x + (p2.x - p0.x) / 6;
+    const cp1y = clampY(p1.y + (p2.y - p0.y) / 6);
+    const cp2x = p2.x - (p3.x - p1.x) / 6;
+    const cp2y = clampY(p2.y - (p3.y - p1.y) / 6);
+    linePath += ` C ${cp1x.toFixed(2)} ${cp1y.toFixed(2)}, ${cp2x.toFixed(2)} ${cp2y.toFixed(2)}, ${p2.x.toFixed(2)} ${p2.y.toFixed(2)}`;
   }
-  return d;
+  const last = pts[pts.length - 1];
+  const areaPath = `${linePath} L ${last.x.toFixed(2)} ${height} L ${pts[0].x.toFixed(2)} ${height} Z`;
+  return { linePath, areaPath, endPt: last };
 }
 
 // ============================================================================
@@ -277,9 +384,6 @@ function buildSparklinePath(values, width, height, padY = 4) {
 // ============================================================================
 const INITIAL_NODES = [];
 const INITIAL_WINDOWS_APPS = [];
-
-const SAMPLE_VLESS_URI =
-  'vless://f48e1a90-2b6c-4d19-9a77-81c450d912fa@sg04-slt.metrovpn.io:443?encryption=none&security=tls&sni=st2.zoom.us&vcn=vpn.metrodens.site&fp=chrome&type=tcp#SG-04%20%E2%80%A2%20SLT%20Ultra%20VCN';
 
 const DNS_OPTIONS = ['Cloudflare 1.1.1.1', 'Cloudflare 1.1.1.2', 'Google 8.8.8.8', 'Quad9 9.9.9.9', 'Custom DoH'];
 const MTU_OPTIONS = [1500, 1420, 1360, 1280];
@@ -335,11 +439,26 @@ function parsePreviewNode(raw, mode = 'uri') {
     }
   }
   const sniMatch = trimmed.match(/sni=([^&#]+)/i);
+  const hostMatch = trimmed.match(/@([^:/?#]+)/i);
+  const host = hostMatch ? hostMatch[1] : '';
+  const sni = sniMatch ? decodeURIComponent(sniMatch[1]) : host || 'st1.zoom.us';
+  const inferredVcn =
+    lower.includes('vcn=') ||
+    lower.includes('reality') ||
+    (host && !/^\d+\.\d+\.\d+\.\d+$/.test(host) && host.toLowerCase() !== sni.toLowerCase());
   return {
     name,
-    isp: lower.includes('dialog') ? 'Dialog' : lower.includes('mobitel') ? 'Mobitel' : 'SLT Fiber',
-    sni: sniMatch ? sniMatch[1] : 'st1.zoom.us',
-    protocol: lower.includes('vcn=') || lower.includes('reality') ? 'TCP • TLS+VCN' : 'TCP • TLS 1.3',
+    isp: lower.includes('dialog')
+      ? 'Dialog'
+      : lower.includes('mobitel')
+      ? 'Mobitel'
+      : lower.includes('hutch')
+      ? 'Hutch'
+      : lower.includes('airtel')
+      ? 'Airtel'
+      : 'SLT Fiber',
+    sni,
+    protocol: inferredVcn ? 'TCP • TLS+VCN' : 'TCP • TLS 1.3',
   };
 }
 
@@ -355,7 +474,7 @@ function useMetro() {
 }
 
 const DEFAULT_SETTINGS_STATE = {
-  systemMode: 'PROXY',
+  systemMode: 'TUN',
   tunnelProfile: 'Strict VCN',
   lanProxySharing: false,
   splitTunneling: true,
@@ -901,17 +1020,17 @@ function MetroProvider({ children }) {
     try {
       if (!IN_TAURI) {
         const mockInfo = {
-          currentVersion: '2.7.1',
-          latestVersion: '2.7.1',
+          currentVersion: '2.7.2',
+          latestVersion: '2.7.2',
           updateAvailable: false,
           releaseUrl: 'https://github.com/Metro-dens/MetroVPN-for-Windows/releases',
           downloadUrl: 'https://github.com/Metro-dens/MetroVPN-for-Windows/releases/latest/download/Metrovpn-standalone-x64.exe',
           assetName: 'Metrovpn-standalone-x64.exe',
-          title: 'Metrovpn v2.7.1',
+          title: 'Metrovpn v2.7.2',
           message: 'You are running the latest version of Metrovpn for Windows.',
         };
         setUpdateInfo(mockInfo);
-        pushToast('You are on the latest version (v2.7.1)', 'success');
+        pushToast('You are on the latest version (v2.7.2)', 'success');
         return;
       }
       const info = await invokeCmd('check_github_update');
@@ -1326,18 +1445,21 @@ function Titlebar() {
 
   return (
     <header
-      className="h-[42px] w-full flex items-center justify-between pl-3 pr-2 select-none shrink-0 border-b"
+      className="h-[42px] w-full flex items-center justify-between pl-3 pr-2 select-none shrink-0 border-b relative z-30"
       style={{
-        backgroundColor: COLORS.obsidian,
-        borderColor: '#231D1E',
+        backgroundColor: 'rgba(20, 15, 16, 0.72)',
+        backdropFilter: 'blur(20px) saturate(150%)',
+        WebkitBackdropFilter: 'blur(20px) saturate(150%)',
+        borderColor: 'rgba(255, 224, 222, 0.09)',
+        boxShadow: 'inset 0 -1px 0 rgba(255, 255, 255, 0.03)',
       }}
     >
       <div data-tauri-drag-region="" className="flex-1 flex items-center gap-2 min-w-0 h-full">
         <div
           className="w-6 h-6 rounded-[8px] flex items-center justify-center shrink-0 pointer-events-none overflow-hidden"
           style={{
-            backgroundColor: '#241B1C',
-            border: '1px solid #3B2B2C',
+            backgroundColor: 'rgba(42, 26, 28, 0.75)',
+            border: '1px solid rgba(255, 140, 130, 0.25)',
           }}
         >
           <img src={metrovpnApkIcon} alt="Metrovpn" className="w-4 h-4 object-contain" />
@@ -1350,13 +1472,12 @@ function Titlebar() {
         <span
           className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium pointer-events-none shrink-0"
           style={{
-            backgroundColor: COLORS.surface,
-            border: `1px solid ${COLORS.surfaceBorder}`,
+            ...GLASS_CARD,
             color: COLORS.textMuted,
           }}
         >
           <span className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: COLORS.coral }} />
-          v2.7.1
+          v2.7.2
         </span>
       </div>
 
@@ -1369,7 +1490,8 @@ function Titlebar() {
           style={{
             backgroundColor: COLORS.taupe,
             color: COLORS.textPrimary,
-            border: '1px solid #604645',
+            border: '1px solid rgba(255, 200, 196, 0.20)',
+            boxShadow: 'inset 0 1px 0 rgba(255, 255, 255, 0.12)',
           }}
         >
           <Plus className="w-3.5 h-3.5" strokeWidth={2.5} />
@@ -1379,11 +1501,10 @@ function Titlebar() {
         <button
           type="button"
           onClick={() => setQrModalOpen(true)}
-          title="Scan QR (Screen Capture or Camera)"
-          className="w-[28px] h-[28px] rounded-full flex items-center justify-center cursor-pointer transition-colors duration-150 hover:bg-[#2A2324]"
+          title="Scan QR (Snip Screen or Camera)"
+          className="w-[28px] h-[28px] rounded-full flex items-center justify-center cursor-pointer transition-colors duration-150 hover:bg-[#322628]"
           style={{
-            backgroundColor: COLORS.surface,
-            border: `1px solid ${COLORS.surfaceBorder}`,
+            ...GLASS_CARD,
             color: COLORS.textPrimary,
           }}
         >
@@ -1394,24 +1515,23 @@ function Titlebar() {
           type="button"
           onClick={() => setOnboardingOpen(true)}
           title="Step-by-Step Setup Guide"
-          className="w-[28px] h-[28px] rounded-full flex items-center justify-center cursor-pointer transition-colors duration-150 hover:bg-[#2A2324]"
+          className="w-[28px] h-[28px] rounded-full flex items-center justify-center cursor-pointer transition-colors duration-150 hover:bg-[#322628]"
           style={{
-            backgroundColor: COLORS.surface,
-            border: `1px solid ${COLORS.surfaceBorder}`,
+            ...GLASS_CARD,
             color: COLORS.amber,
           }}
         >
           <HelpCircle className="w-3.5 h-3.5" />
         </button>
 
-        <div className="w-px h-4 mx-0.5" style={{ backgroundColor: '#2E2627' }} />
+        <div className="w-px h-4 mx-0.5" style={{ backgroundColor: 'rgba(255, 220, 218, 0.12)' }} />
 
         <div className="flex items-center gap-0.5">
           <button
             type="button"
             title="Minimize"
             onClick={() => windowMinimize()}
-            className="w-7 h-7 rounded-[7px] flex items-center justify-center cursor-pointer transition-colors duration-150 hover:bg-[#251F20]"
+            className="w-7 h-7 rounded-[7px] flex items-center justify-center cursor-pointer transition-colors duration-150 hover:bg-[#2A2022]"
             style={{ color: COLORS.textMuted }}
           >
             <Minus className="w-3.5 h-3.5" />
@@ -1468,10 +1588,7 @@ function NavigationRail() {
   return (
     <aside
       className="w-[62px] h-full rounded-[22px] flex flex-col justify-between py-2.5 px-2 shrink-0 relative z-20 select-none"
-      style={{
-        backgroundColor: COLORS.surface,
-        border: `1px solid ${COLORS.surfaceBorder}`,
-      }}
+      style={GLASS_CARD}
     >
       <nav className="flex flex-col gap-1.5" aria-label="Main navigation">
         {NAV_ROUTES.map((item) => {
@@ -1484,11 +1601,12 @@ function NavigationRail() {
               onClick={() => setActiveRoute(item.id)}
               title={item.label}
               aria-label={item.label}
-              className="relative w-full py-2 rounded-[14px] flex flex-col items-center justify-center gap-0.5 cursor-pointer transition-colors duration-150 hover:bg-[#262021]"
+              className="relative w-full py-2 rounded-[14px] flex flex-col items-center justify-center gap-0.5 cursor-pointer transition-colors duration-150 hover:bg-[#2F2325]"
               style={{
                 backgroundColor: active ? COLORS.crimson : 'transparent',
                 color: active ? COLORS.textPrimary : COLORS.textMuted,
-                border: `1px solid ${active ? '#BC1F27' : 'transparent'}`,
+                border: `1px solid ${active ? 'rgba(255, 130, 120, 0.45)' : 'transparent'}`,
+                boxShadow: active ? '0 6px 18px -6px rgba(255, 84, 73, 0.55)' : 'none',
               }}
             >
               <Icon className="w-[17px] h-[17px] shrink-0" strokeWidth={active ? 2.25 : 1.9} />
@@ -1500,10 +1618,10 @@ function NavigationRail() {
         })}
       </nav>
 
-      <div className="flex flex-col gap-2 pt-2 border-t" style={{ borderColor: '#2A2223' }}>
+      <div className="flex flex-col gap-2 pt-2 border-t" style={{ borderColor: 'rgba(255, 224, 222, 0.08)' }}>
         <div
           className="flex flex-col items-center justify-center rounded-[12px] py-1.5 gap-1"
-          style={{ backgroundColor: '#151213' }}
+          style={GLASS_INSET}
           title={`Tunnel Status: ${statusLabel}`}
         >
           <span className="relative flex h-2.5 w-2.5 shrink-0">
@@ -1525,14 +1643,18 @@ function NavigationRail() {
           onClick={() => toggleSystemMode()}
           title={
             systemMode === 'TUN'
-              ? 'TUN Mode Active (All PC apps & games • Requires Admin) — Click to switch to System Proxy'
-              : 'System Proxy Mode Active (Browsers & chat apps • No Admin) — Click to switch to TUN Mode'
+              ? 'TUN Mode Active (All PC apps & games • Default Admin) — Click to switch to System Proxy'
+              : 'System Proxy Mode Active (Browsers & chat apps) — Click to switch to TUN Mode'
           }
           className="w-full rounded-[14px] py-2 flex flex-col items-center justify-center gap-0.5 cursor-pointer transition-colors duration-150"
-          style={{
-            backgroundColor: systemMode === 'TUN' ? COLORS.surfaceActive : '#221C1D',
-            border: `1px solid ${systemMode === 'TUN' ? COLORS.surfaceActiveBorder : COLORS.surfaceBorder}`,
-          }}
+          style={
+            systemMode === 'TUN'
+              ? GLASS_ACTIVE
+              : {
+                  ...GLASS_INSET,
+                  border: `1px solid ${COLORS.surfaceBorder}`,
+                }
+          }
         >
           <Layers className="w-3.5 h-3.5 shrink-0" style={{ color: systemMode === 'TUN' ? COLORS.coral : COLORS.amber }} />
           <span
@@ -1574,11 +1696,13 @@ function HomeScreen() {
   const isConnected = connectionStatus === 'connected';
   const isConnecting = connectionStatus === 'connecting';
 
+  const smoothDownSeries = useSmoothedSeries(downHistory, 300);
+  const smoothUpSeries = useSmoothedSeries(upHistory, 300);
   const downNow = formatThroughput(downHistory[downHistory.length - 1] || 0);
   const upNow = formatThroughput(upHistory[upHistory.length - 1] || 0);
 
-  const downSpark = useMemo(() => buildSparklinePath(downHistory, 180, 26, 3), [downHistory]);
-  const upSpark = useMemo(() => buildSparklinePath(upHistory, 180, 26, 3), [upHistory]);
+  const downGeo = useMemo(() => buildSparklineGeometry(smoothDownSeries, 180, 28, 6, 7), [smoothDownSeries]);
+  const upGeo = useMemo(() => buildSparklineGeometry(smoothUpSeries, 180, 28, 6, 7), [smoothUpSeries]);
 
   const handleCopyLocalProxy = async () => {
     const addr = `${localLanIp}:${socksPort || 10808}`;
@@ -1597,19 +1721,15 @@ function HomeScreen() {
       transition={{ duration: 0.14 }}
       className="flex flex-col gap-2.5 pb-1"
     >
-      {/* Hero Orb Card */}
+      {/* Hero Orb Glass Card */}
       <div
         className="rounded-[22px] px-4 py-3.5 flex flex-col items-center justify-center relative overflow-hidden"
-        style={{
-          backgroundColor: COLORS.surface,
-          border: `1px solid ${COLORS.surfaceBorder}`,
-        }}
+        style={GLASS_CARD}
       >
         <div
           className="inline-flex items-center gap-2 px-3 py-1 rounded-full text-[11.5px] font-semibold"
           style={{
-            backgroundColor: '#241E1F',
-            border: '1px solid #3A3031',
+            ...GLASS_INSET,
             color: COLORS.textPrimary,
           }}
         >
@@ -1666,7 +1786,7 @@ function HomeScreen() {
               type="button"
               onClick={() => openAddModal('uri')}
               className="h-[28px] px-3 rounded-full text-[11px] font-semibold cursor-pointer transition-colors duration-150 hover:bg-[#5C4341]"
-              style={{ backgroundColor: COLORS.taupe, color: COLORS.textPrimary, border: '1px solid #634947' }}
+              style={{ backgroundColor: COLORS.taupe, color: COLORS.textPrimary, border: '1px solid rgba(255,200,196,0.2)' }}
             >
               + Add Config
             </button>
@@ -1674,7 +1794,7 @@ function HomeScreen() {
               type="button"
               onClick={() => setQrModalOpen(true)}
               className="h-[28px] px-3 rounded-full text-[11px] font-semibold cursor-pointer transition-colors duration-150 hover:bg-[#2A2324]"
-              style={{ backgroundColor: '#151213', color: COLORS.textPrimary, border: `1px solid ${COLORS.surfaceBorder}` }}
+              style={{ ...GLASS_INSET, color: COLORS.textPrimary }}
             >
               Scan QR
             </button>
@@ -1682,7 +1802,7 @@ function HomeScreen() {
               type="button"
               onClick={() => setOnboardingOpen(true)}
               className="h-[28px] px-3 rounded-full text-[11px] font-semibold cursor-pointer transition-colors duration-150 hover:bg-[#2A2324]"
-              style={{ backgroundColor: '#151213', color: COLORS.amber, border: `1px solid ${COLORS.surfaceBorder}` }}
+              style={{ ...GLASS_INSET, color: COLORS.amber }}
             >
               Setup Guide
             </button>
@@ -1690,14 +1810,13 @@ function HomeScreen() {
         )}
       </div>
 
-      {/* Live Speed Pair */}
+      {/* Live Neon Speed Pair */}
       <div className="grid grid-cols-2 gap-2.5">
         <div
           className="rounded-[18px] pt-3 px-3.5 pb-0 flex flex-col justify-between overflow-hidden"
           style={{
-            backgroundColor: COLORS.surface,
-            border: `1px solid ${COLORS.surfaceBorder}`,
-            minHeight: 88,
+            ...GLASS_CARD,
+            minHeight: 90,
           }}
         >
           <div>
@@ -1707,7 +1826,7 @@ function HomeScreen() {
               </span>
               <span
                 className="w-6 h-6 rounded-full flex items-center justify-center"
-                style={{ backgroundColor: '#3A181B', border: '1px solid #632429', color: COLORS.coral }}
+                style={{ backgroundColor: 'rgba(84, 24, 29, 0.72)', border: '1px solid rgba(255, 91, 82, 0.45)', color: COLORS.neonDown }}
               >
                 <ArrowDown className="w-3.5 h-3.5" strokeWidth={2.4} />
               </span>
@@ -1719,24 +1838,46 @@ function HomeScreen() {
               >
                 {downNow.value}
               </span>
-              <span className="font-mono text-[11px] font-medium" style={{ color: COLORS.coral }}>
+              <span className="font-mono text-[11px] font-medium" style={{ color: COLORS.neonDown }}>
                 {downNow.unit}
               </span>
             </div>
           </div>
 
-          <div className="h-[26px] mt-1 -mx-3.5" style={{ width: 'calc(100% + 1.75rem)' }}>
-            <svg viewBox="0 0 180 26" preserveAspectRatio="none" className="w-full h-full block">
+          <div className="h-[28px] mt-1 -mx-3.5" style={{ width: 'calc(100% + 1.75rem)' }}>
+            <svg viewBox="0 0 180 28" preserveAspectRatio="none" className="w-full h-full block overflow-visible">
               <defs>
                 <linearGradient id="homeDownSpark" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor={COLORS.coral} stopOpacity="0.28" />
-                  <stop offset="100%" stopColor={COLORS.coral} stopOpacity="0" />
+                  <stop offset="0%" stopColor={COLORS.neonDown} stopOpacity="0.34" />
+                  <stop offset="100%" stopColor={COLORS.neonDown} stopOpacity="0" />
                 </linearGradient>
+                <filter id="neonDownGlow" x="-20%" y="-40%" width="140%" height="180%">
+                  <feGaussianBlur stdDeviation="2.1" result="blur" />
+                  <feMerge>
+                    <feMergeNode in="blur" />
+                    <feMergeNode in="SourceGraphic" />
+                  </feMerge>
+                </filter>
               </defs>
-              {downSpark && (
+              {downGeo.linePath && (
                 <>
-                  <path d={`${downSpark} L 180 26 L 0 26 Z`} fill="url(#homeDownSpark)" />
-                  <path d={downSpark} fill="none" stroke={COLORS.coral} strokeWidth="1.9" strokeLinecap="round" />
+                  <path d={downGeo.areaPath} fill="url(#homeDownSpark)" />
+                  <path
+                    d={downGeo.linePath}
+                    fill="none"
+                    stroke={COLORS.neonDown}
+                    strokeWidth="2.1"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    filter="url(#neonDownGlow)"
+                  />
+                  {downGeo.endPt && (
+                    <g filter="url(#neonDownGlow)">
+                      <circle cx={downGeo.endPt.x} cy={downGeo.endPt.y} r="4.6" fill={COLORS.neonDown} fillOpacity="0.34" />
+                      <circle cx={downGeo.endPt.x} cy={downGeo.endPt.y} r="2.7" fill={COLORS.neonDown} />
+                      <circle cx={downGeo.endPt.x} cy={downGeo.endPt.y} r="1.2" fill="#FFF2F1" />
+                    </g>
+                  )}
                 </>
               )}
             </svg>
@@ -1746,9 +1887,8 @@ function HomeScreen() {
         <div
           className="rounded-[18px] pt-3 px-3.5 pb-0 flex flex-col justify-between overflow-hidden"
           style={{
-            backgroundColor: COLORS.surface,
-            border: `1px solid ${COLORS.surfaceBorder}`,
-            minHeight: 88,
+            ...GLASS_CARD,
+            minHeight: 90,
           }}
         >
           <div>
@@ -1758,7 +1898,7 @@ function HomeScreen() {
               </span>
               <span
                 className="w-6 h-6 rounded-full flex items-center justify-center"
-                style={{ backgroundColor: COLORS.amberBg, border: '1px solid #594729', color: COLORS.amber }}
+                style={{ backgroundColor: 'rgba(72, 54, 24, 0.72)', border: '1px solid rgba(255, 201, 102, 0.42)', color: COLORS.neonUp }}
               >
                 <ArrowUp className="w-3.5 h-3.5" strokeWidth={2.4} />
               </span>
@@ -1770,24 +1910,46 @@ function HomeScreen() {
               >
                 {upNow.value}
               </span>
-              <span className="font-mono text-[11px] font-medium" style={{ color: COLORS.amber }}>
+              <span className="font-mono text-[11px] font-medium" style={{ color: COLORS.neonUp }}>
                 {upNow.unit}
               </span>
             </div>
           </div>
 
-          <div className="h-[26px] mt-1 -mx-3.5" style={{ width: 'calc(100% + 1.75rem)' }}>
-            <svg viewBox="0 0 180 26" preserveAspectRatio="none" className="w-full h-full block">
+          <div className="h-[28px] mt-1 -mx-3.5" style={{ width: 'calc(100% + 1.75rem)' }}>
+            <svg viewBox="0 0 180 28" preserveAspectRatio="none" className="w-full h-full block overflow-visible">
               <defs>
                 <linearGradient id="homeUpSpark" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor={COLORS.amber} stopOpacity="0.26" />
-                  <stop offset="100%" stopColor={COLORS.amber} stopOpacity="0" />
+                  <stop offset="0%" stopColor={COLORS.neonUp} stopOpacity="0.32" />
+                  <stop offset="100%" stopColor={COLORS.neonUp} stopOpacity="0" />
                 </linearGradient>
+                <filter id="neonUpGlow" x="-20%" y="-40%" width="140%" height="180%">
+                  <feGaussianBlur stdDeviation="2.1" result="blur" />
+                  <feMerge>
+                    <feMergeNode in="blur" />
+                    <feMergeNode in="SourceGraphic" />
+                  </feMerge>
+                </filter>
               </defs>
-              {upSpark && (
+              {upGeo.linePath && (
                 <>
-                  <path d={`${upSpark} L 180 26 L 0 26 Z`} fill="url(#homeUpSpark)" />
-                  <path d={upSpark} fill="none" stroke={COLORS.amber} strokeWidth="1.9" strokeLinecap="round" />
+                  <path d={upGeo.areaPath} fill="url(#homeUpSpark)" />
+                  <path
+                    d={upGeo.linePath}
+                    fill="none"
+                    stroke={COLORS.neonUp}
+                    strokeWidth="2.1"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    filter="url(#neonUpGlow)"
+                  />
+                  {upGeo.endPt && (
+                    <g filter="url(#neonUpGlow)">
+                      <circle cx={upGeo.endPt.x} cy={upGeo.endPt.y} r="4.6" fill={COLORS.neonUp} fillOpacity="0.34" />
+                      <circle cx={upGeo.endPt.x} cy={upGeo.endPt.y} r="2.7" fill={COLORS.neonUp} />
+                      <circle cx={upGeo.endPt.x} cy={upGeo.endPt.y} r="1.2" fill="#FFFBF0" />
+                    </g>
+                  )}
                 </>
               )}
             </svg>
@@ -1795,7 +1957,7 @@ function HomeScreen() {
         </div>
       </div>
 
-      {/* Active Server Card */}
+      {/* Active Server Glass Card */}
       <div
         role="button"
         tabIndex={0}
@@ -1805,8 +1967,8 @@ function HomeScreen() {
             activeNode ? setActiveRoute('servers') : openAddModal('uri');
           }
         }}
-        className="rounded-[18px] p-3.5 cursor-pointer flex flex-col gap-2 transition-colors duration-150 hover:border-[#734C4A]"
-        style={{ backgroundColor: COLORS.surfaceActive, border: `1px solid ${COLORS.surfaceActiveBorder}` }}
+        className="rounded-[18px] p-3.5 cursor-pointer flex flex-col gap-2 transition-colors duration-150 hover:border-[#FF7369]"
+        style={GLASS_ACTIVE}
       >
         <div className="flex items-center justify-between gap-2">
           <div className="flex items-center gap-2.5 min-w-0">
@@ -1854,7 +2016,7 @@ function HomeScreen() {
       {/* Compact Tunneling Mode & Local Proxy Footer */}
       <div
         className="rounded-[16px] px-3.5 py-2.5 flex items-center justify-between gap-2"
-        style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}
+        style={GLASS_CARD}
       >
         <div className="flex items-center gap-3 min-w-0">
           <div className="min-w-0">
@@ -1865,7 +2027,7 @@ function HomeScreen() {
               {tunnelProfile}
             </span>
           </div>
-          <div className="w-px h-6 shrink-0" style={{ backgroundColor: '#2E2627' }} />
+          <div className="w-px h-6 shrink-0" style={{ backgroundColor: 'rgba(255, 224, 222, 0.10)' }} />
           <div>
             <span className="text-[9.5px] uppercase tracking-wider block" style={{ color: COLORS.textMuted }}>
               Mode
@@ -2068,7 +2230,7 @@ function ServersScreen() {
     >
       <div
         className="rounded-[24px] px-5 py-4 flex items-center justify-between gap-4"
-        style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}
+        style={GLASS_CARD}
       >
         <div className="flex items-center gap-3.5 min-w-0">
           <span className="relative flex h-3 w-3 shrink-0">
@@ -2109,12 +2271,12 @@ function ServersScreen() {
 
       <div
         className="rounded-[24px] p-4 flex flex-col gap-3"
-        style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}
+        style={GLASS_CARD}
       >
         <div className="flex flex-wrap items-center gap-2.5">
           <div
-            className="flex-1 min-w-[230px] h-[40px] rounded-full px-4 flex items-center gap-2.5 transition-colors focus-within:border-[#593B39]"
-            style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}` }}
+            className="flex-1 min-w-[230px] h-[40px] rounded-full px-4 flex items-center gap-2.5 transition-colors focus-within:border-[#FF7369]"
+            style={GLASS_INSET}
           >
             <Search className="w-4 h-4 shrink-0" style={{ color: COLORS.textMuted }} />
             <input
@@ -2128,7 +2290,7 @@ function ServersScreen() {
             />
             <kbd
               className="hidden sm:inline-flex items-center px-2 py-0.5 rounded-full font-mono text-[10px] shrink-0"
-              style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}`, color: COLORS.textMuted }}
+              style={{ ...GLASS_CARD, color: COLORS.textMuted }}
             >
               Ctrl+K
             </kbd>
@@ -2140,7 +2302,7 @@ function ServersScreen() {
               onClick={testAllPings}
               disabled={testingAllPings}
               className="h-[34px] px-3 rounded-full text-[11.5px] font-semibold flex items-center gap-1.5 cursor-pointer transition-colors duration-150 hover:bg-[#5C4341] disabled:opacity-70"
-              style={{ backgroundColor: COLORS.taupe, color: COLORS.textPrimary, border: '1px solid #634947' }}
+              style={{ backgroundColor: COLORS.taupe, color: COLORS.textPrimary, border: '1px solid rgba(255,200,196,0.2)' }}
             >
               <Zap className={`w-3.5 h-3.5 ${testingAllPings ? 'animate-pulse' : ''}`} style={{ color: COLORS.amber }} />
               <span>{testingAllPings ? 'Testing...' : 'Test Pings'}</span>
@@ -2150,7 +2312,7 @@ function ServersScreen() {
               type="button"
               onClick={testAllPings}
               className="h-[34px] px-3 rounded-full text-[11.5px] font-semibold flex items-center gap-1.5 cursor-pointer transition-colors duration-150 hover:bg-[#1E1A1B]"
-              style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}`, color: COLORS.textPrimary }}
+              style={{ ...GLASS_INSET, border: `1px solid ${COLORS.surfaceBorder}`, color: COLORS.textPrimary }}
             >
               <span className="w-2 h-2 rounded-full" style={{ backgroundColor: COLORS.mint }} />
               <span className="font-mono tabular-nums">{onlineCount} Online</span>
@@ -2169,9 +2331,9 @@ function ServersScreen() {
                 onClick={() => setSelectedFilter(chip.id)}
                 className="h-[28px] px-2.5 rounded-full text-[11px] font-semibold inline-flex items-center gap-1.5 cursor-pointer transition-colors duration-150"
                 style={{
-                  backgroundColor: isActive ? COLORS.taupe : '#151213',
+                  backgroundColor: isActive ? COLORS.taupe : 'rgba(18, 13, 14, 0.7)',
                   color: isActive ? COLORS.textPrimary : COLORS.textMuted,
-                  border: `1px solid ${isActive ? '#684C4A' : COLORS.surfaceBorder}`,
+                  border: `1px solid ${isActive ? 'rgba(255, 195, 190, 0.25)' : COLORS.surfaceBorder}`,
                 }}
               >
                 {chip.brand ? (
@@ -2194,7 +2356,7 @@ function ServersScreen() {
       {filteredNodes.length === 0 ? (
         <div
           className="rounded-[22px] p-8 text-center flex flex-col items-center gap-2.5"
-          style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}
+          style={GLASS_CARD}
         >
           <Globe className="w-7 h-7" style={{ color: COLORS.textMuted }} />
           <p className="font-jakarta font-semibold text-[14px]" style={{ color: COLORS.textPrimary }}>
@@ -2229,11 +2391,8 @@ function ServersScreen() {
                 onKeyDown={(e) => {
                   if (e.key === 'Enter' || e.key === ' ') connectToNode(node.id);
                 }}
-                className="rounded-[20px] p-3.5 cursor-pointer flex flex-col justify-between gap-2.5 relative transition-colors duration-150 hover:border-[#684C4A]"
-                style={{
-                  backgroundColor: isActiveNode ? COLORS.surfaceActive : COLORS.surface,
-                  border: `1px solid ${isActiveNode ? COLORS.surfaceActiveBorder : COLORS.surfaceBorder}`,
-                }}
+                className="rounded-[20px] p-3.5 cursor-pointer flex flex-col justify-between gap-2.5 relative transition-colors duration-150 hover:border-[#FF7369]"
+                style={isActiveNode ? GLASS_ACTIVE : GLASS_CARD}
               >
                 <div className="flex items-start justify-between gap-2">
                   <div className="flex items-center gap-2.5 min-w-0">
@@ -2308,7 +2467,7 @@ function ServersScreen() {
                           exit={{ opacity: 0, scale: 0.96, y: -4 }}
                           transition={{ duration: 0.12 }}
                           className="absolute right-0 top-8 w-[156px] rounded-[14px] p-1 z-40 shadow-2xl"
-                          style={{ backgroundColor: '#231D1E', border: '1px solid #3D3132' }}
+                          style={GLASS_MODAL}
                         >
                           <button
                             type="button"
@@ -2497,6 +2656,24 @@ function SpeedScreen() {
     upload: 0,
   });
 
+  const smoothGaugeSpeed = useSmoothedNumber(gaugeSpeed, 280);
+  const smoothGaugeFraction = useSmoothedNumber(gaugeFraction, 300);
+  const [wavePhase, setWavePhase] = useState(0);
+
+  useEffect(() => {
+    if (!speedTestActive) return;
+    let raf = 0;
+    let last = performance.now();
+    const tick = (now) => {
+      const dt = Math.min(0.05, (now - last) / 1000);
+      last = now;
+      setWavePhase((p) => (p + dt * 4.2) % (Math.PI * 2));
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [speedTestActive]);
+
   const [bars, setBars] = useState(() => Array(22).fill(12));
 
   useEffect(() => {
@@ -2596,10 +2773,22 @@ function SpeedScreen() {
       : 'READY';
 
   const trackArcPath = useMemo(() => generateSmoothArcPath(130, 130, 102, 135, 270), []);
-  const wavyArcPath = useMemo(
-    () => generateWavyArcPath(130, 130, 102, gaugeFraction, 135, 270, 3.0, 20),
-    [gaugeFraction]
+  const wavyArc = useMemo(
+    () =>
+      generateWavyArcPath(
+        130,
+        130,
+        102,
+        smoothGaugeFraction,
+        135,
+        270,
+        speedTestActive ? 3.4 : 2.5,
+        20,
+        wavePhase
+      ),
+    [smoothGaugeFraction, speedTestActive, wavePhase]
   );
+  const gaugeStrokeColor = phase === 'upload' ? COLORS.neonUp : COLORS.neonDown;
 
   return (
     <motion.div
@@ -2613,7 +2802,7 @@ function SpeedScreen() {
       {/* Server selector */}
       <div
         className="rounded-[18px] p-3 flex items-center justify-between gap-2 relative"
-        style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}
+        style={GLASS_CARD}
       >
         <div className="flex items-center gap-2.5 min-w-0">
           <IspBadge node={testNode} size={36} isActive={Boolean(testNode)} />
@@ -2641,7 +2830,7 @@ function SpeedScreen() {
             type="button"
             onClick={() => setServerDropdownOpen((o) => !o)}
             className="h-[30px] px-3 rounded-full text-[11.5px] font-semibold flex items-center gap-1 cursor-pointer transition-colors duration-150 hover:bg-[#5C4341]"
-            style={{ backgroundColor: COLORS.taupe, color: COLORS.textPrimary, border: '1px solid #634947' }}
+            style={{ backgroundColor: COLORS.taupe, color: COLORS.textPrimary, border: '1px solid rgba(255,200,196,0.2)' }}
           >
             <span>Change</span>
             <ChevronRight className="w-3.5 h-3.5" />
@@ -2655,7 +2844,7 @@ function SpeedScreen() {
                 exit={{ opacity: 0, y: -4, scale: 0.96 }}
                 transition={{ duration: 0.12 }}
                 className="absolute right-0 top-9 w-[230px] max-h-[200px] overflow-y-auto custom-scrollbar rounded-[16px] p-1.5 z-40 shadow-2xl"
-                style={{ backgroundColor: '#231D1E', border: '1px solid #3D3132' }}
+                style={GLASS_MODAL}
               >
                 {nodes.length === 0 ? (
                   <div className="px-3 py-2 text-[11px]" style={{ color: COLORS.textMuted }}>
@@ -2689,23 +2878,42 @@ function SpeedScreen() {
         </div>
       </div>
 
-      {/* Gauge + Test Button */}
+      {/* Smooth Neon Gauge + Test Button */}
       <div
         className="rounded-[22px] px-4 py-3.5 flex flex-col items-center justify-center relative"
-        style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}
+        style={GLASS_CARD}
       >
         <div className="relative w-[196px] h-[178px] flex items-center justify-center">
           <svg viewBox="0 0 260 245" className="w-full h-full overflow-visible">
-            <path d={trackArcPath} fill="none" stroke="#2A2223" strokeWidth="8" strokeLinecap="round" />
-            {wavyArcPath && (
-              <path
-                d={wavyArcPath}
-                fill="none"
-                stroke={phase === 'upload' ? COLORS.amber : COLORS.coral}
-                strokeWidth="4.5"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              />
+            <defs>
+              <filter id="gaugeNeonGlow" x="-30%" y="-30%" width="160%" height="160%">
+                <feGaussianBlur stdDeviation="3.2" result="blur" />
+                <feMerge>
+                  <feMergeNode in="blur" />
+                  <feMergeNode in="SourceGraphic" />
+                </feMerge>
+              </filter>
+            </defs>
+            <path d={trackArcPath} fill="none" stroke="rgba(255,224,222,0.09)" strokeWidth="8" strokeLinecap="round" />
+            {wavyArc.d && (
+              <>
+                <path
+                  d={wavyArc.d}
+                  fill="none"
+                  stroke={gaugeStrokeColor}
+                  strokeWidth="4.6"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  filter="url(#gaugeNeonGlow)"
+                />
+                {wavyArc.endPt && (
+                  <g filter="url(#gaugeNeonGlow)">
+                    <circle cx={wavyArc.endPt.x} cy={wavyArc.endPt.y} r="7" fill={gaugeStrokeColor} fillOpacity="0.32" />
+                    <circle cx={wavyArc.endPt.x} cy={wavyArc.endPt.y} r="4" fill={gaugeStrokeColor} />
+                    <circle cx={wavyArc.endPt.x} cy={wavyArc.endPt.y} r="1.7" fill="#FFF7F6" />
+                  </g>
+                )}
+              </>
             )}
           </svg>
 
@@ -2713,8 +2921,8 @@ function SpeedScreen() {
             <span
               className="px-2 py-0.5 rounded-full text-[9px] font-bold tracking-[0.1em] uppercase"
               style={{
-                backgroundColor: speedTestActive ? COLORS.surfaceActive : '#262021',
-                border: `1px solid ${speedTestActive ? COLORS.surfaceActiveBorder : '#3A2F30'}`,
+                backgroundColor: speedTestActive ? COLORS.surfaceActive : 'rgba(26, 20, 21, 0.78)',
+                border: `1px solid ${speedTestActive ? COLORS.surfaceActiveBorder : 'rgba(255,224,222,0.12)'}`,
                 color: phase === 'upload' ? COLORS.amber : speedTestActive ? COLORS.coral : COLORS.textMuted,
               }}
             >
@@ -2724,7 +2932,7 @@ function SpeedScreen() {
               className="mt-1.5 font-mono tabular-nums text-[38px] font-bold leading-none tracking-[-0.03em]"
               style={{ color: COLORS.textPrimary }}
             >
-              {gaugeSpeed.toFixed(1)}
+              {smoothGaugeSpeed.toFixed(1)}
             </div>
             <span className="mt-0.5 font-mono text-[11.5px] font-medium" style={{ color: COLORS.textMuted }}>
               Mbps
@@ -2737,7 +2945,7 @@ function SpeedScreen() {
           onClick={startSpeedTest}
           disabled={speedTestActive || !testNode}
           className="-mt-1 h-[34px] px-5 rounded-full font-jakarta font-semibold text-[12.5px] flex items-center gap-2 cursor-pointer transition-colors duration-150 hover:bg-[#5C4341] disabled:opacity-60"
-          style={{ backgroundColor: COLORS.taupe, color: COLORS.textPrimary, border: '1px solid #674B49' }}
+          style={{ backgroundColor: COLORS.taupe, color: COLORS.textPrimary, border: '1px solid rgba(255,200,196,0.22)' }}
         >
           <RefreshCw className={`w-3.5 h-3.5 ${speedTestActive ? 'animate-spin' : ''}`} />
           <span>{speedTestActive ? 'Running Test...' : 'Run Speed Test'}</span>
@@ -2746,7 +2954,7 @@ function SpeedScreen() {
 
       {/* 4 Compact Stat Cards */}
       <div className="grid grid-cols-4 gap-2">
-        <div className="rounded-[14px] p-2.5" style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}>
+        <div className="rounded-[14px] p-2.5" style={GLASS_CARD}>
           <span className="text-[9px] font-bold uppercase tracking-wider block" style={{ color: COLORS.textMuted }}>
             Ping
           </span>
@@ -2758,7 +2966,7 @@ function SpeedScreen() {
           </div>
         </div>
 
-        <div className="rounded-[14px] p-2.5" style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}>
+        <div className="rounded-[14px] p-2.5" style={GLASS_CARD}>
           <span className="text-[9px] font-bold uppercase tracking-wider block" style={{ color: COLORS.textMuted }}>
             Jitter
           </span>
@@ -2770,7 +2978,7 @@ function SpeedScreen() {
           </div>
         </div>
 
-        <div className="rounded-[14px] p-2.5" style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}>
+        <div className="rounded-[14px] p-2.5" style={GLASS_CARD}>
           <span className="text-[9px] font-bold uppercase tracking-wider block" style={{ color: COLORS.coral }}>
             Down
           </span>
@@ -2779,7 +2987,7 @@ function SpeedScreen() {
           </div>
         </div>
 
-        <div className="rounded-[14px] p-2.5" style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}>
+        <div className="rounded-[14px] p-2.5" style={GLASS_CARD}>
           <span className="text-[9px] font-bold uppercase tracking-wider block" style={{ color: COLORS.amber }}>
             Up
           </span>
@@ -2790,7 +2998,7 @@ function SpeedScreen() {
       </div>
 
       {/* Live Rolling Telemetry Stream */}
-      <div className="rounded-[20px] p-3.5 flex flex-col gap-2.5" style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}>
+      <div className="rounded-[20px] p-3.5 flex flex-col gap-2.5" style={GLASS_CARD}>
         <div className="flex items-center justify-between gap-2">
           <div className="flex items-center gap-2 min-w-0">
             <div
@@ -3033,7 +3241,7 @@ function SettingsScreen() {
       {/* Clean 3-Tab Switcher */}
       <div
         className="rounded-[16px] p-1 grid grid-cols-3 gap-1 sticky top-0 z-20"
-        style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}
+        style={GLASS_CARD}
       >
         {SETTINGS_TABS.map((t) => {
           const active = activeTab === t.id;
@@ -3046,7 +3254,8 @@ function SettingsScreen() {
               style={{
                 backgroundColor: active ? COLORS.crimson : 'transparent',
                 color: active ? COLORS.textPrimary : COLORS.textMuted,
-                border: `1px solid ${active ? '#BC1F27' : 'transparent'}`,
+                border: `1px solid ${active ? 'rgba(255, 130, 120, 0.45)' : 'transparent'}`,
+                boxShadow: active ? '0 4px 14px -4px rgba(255, 84, 73, 0.5)' : 'none',
               }}
             >
               <span className="truncate">{t.label}</span>
@@ -3059,7 +3268,7 @@ function SettingsScreen() {
       {settingsNeedsReconnect && connectionStatus === 'connected' && (
         <div
           className="rounded-[16px] px-3.5 py-2.5 flex items-center justify-between gap-2"
-          style={{ backgroundColor: '#3A2F1B', border: '1px solid #6E562C' }}
+          style={{ backgroundColor: 'rgba(58, 47, 27, 0.78)', border: '1px solid rgba(230, 194, 128, 0.35)', backdropFilter: 'blur(16px)' }}
         >
           <div className="flex items-center gap-2 min-w-0">
             <AlertCircle className="w-4 h-4 shrink-0" style={{ color: COLORS.amber }} />
@@ -3082,7 +3291,7 @@ function SettingsScreen() {
       {activeTab === 'general' && (
         <div className="flex flex-col gap-3">
           {/* Tunneling Profile */}
-          <div className="rounded-[20px] p-3.5 flex flex-col gap-2.5" style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}>
+          <div className="rounded-[20px] p-3.5 flex flex-col gap-2.5" style={GLASS_CARD}>
             <div className="flex items-center justify-between">
               <span className="font-jakarta font-bold text-[13.5px]" style={{ color: COLORS.textPrimary }}>
                 Tunneling Profile
@@ -3100,10 +3309,7 @@ function SettingsScreen() {
                     type="button"
                     onClick={() => setTunnelProfile(prof.id)}
                     className="rounded-[14px] p-2.5 text-left cursor-pointer transition-colors duration-150"
-                    style={{
-                      backgroundColor: active ? COLORS.surfaceActive : COLORS.obsidian,
-                      border: `1px solid ${active ? COLORS.surfaceActiveBorder : COLORS.surfaceBorder}`,
-                    }}
+                    style={active ? GLASS_ACTIVE : GLASS_INSET}
                   >
                     <div className="font-jakarta font-bold text-[12px] truncate" style={{ color: COLORS.textPrimary }}>
                       {prof.id}
@@ -3118,7 +3324,7 @@ function SettingsScreen() {
           </div>
 
           {/* Startup & Tray Behavior */}
-          <div className="rounded-[20px] p-3.5 flex flex-col gap-3" style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}>
+          <div className="rounded-[20px] p-3.5 flex flex-col gap-3" style={GLASS_CARD}>
             <div className="flex items-center justify-between gap-3">
               <div className="min-w-0">
                 <div className="text-[12.5px] font-semibold" style={{ color: COLORS.textPrimary }}>
@@ -3295,7 +3501,7 @@ function SettingsScreen() {
       {activeTab === 'tun' && (
         <div className="flex flex-col gap-3">
           {/* Plain-English Guide: System Proxy vs TUN Mode */}
-          <div className="rounded-[20px] p-3.5 flex flex-col gap-2.5" style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}>
+          <div className="rounded-[20px] p-3.5 flex flex-col gap-2.5" style={GLASS_CARD}>
             <div className="flex items-center gap-2">
               <Info className="w-4 h-4 shrink-0" style={{ color: COLORS.amber }} />
               <span className="font-jakarta font-bold text-[13px]" style={{ color: COLORS.textPrimary }}>
@@ -3306,52 +3512,46 @@ function SettingsScreen() {
             <div className="grid grid-cols-1 gap-2">
               <button
                 type="button"
-                onClick={() => setSystemMode('PROXY')}
-                className="rounded-[14px] p-3 text-left cursor-pointer transition-colors duration-150"
-                style={{
-                  backgroundColor: systemMode === 'PROXY' ? COLORS.surfaceActive : COLORS.obsidian,
-                  border: `1px solid ${systemMode === 'PROXY' ? COLORS.surfaceActiveBorder : COLORS.surfaceBorder}`,
-                }}
-              >
-                <div className="flex items-center justify-between mb-1">
-                  <span className="font-jakarta font-bold text-[12.5px]" style={{ color: COLORS.textPrimary }}>
-                    System Proxy Mode
-                  </span>
-                  <span className="px-2 py-0.5 rounded-full text-[9.5px] font-bold" style={{ backgroundColor: '#1E332B', color: COLORS.mint }}>
-                    NO ADMIN NEEDED
-                  </span>
-                </div>
-                <p className="text-[11px] leading-relaxed" style={{ color: systemMode === 'PROXY' ? '#DFC7C6' : COLORS.textMuted }}>
-                  Best for everyday browsing. Routes Chrome, Edge, Telegram &amp; Discord instantly on fixed HTTP port <span className="font-mono">10809</span>.
-                </p>
-              </button>
-
-              <button
-                type="button"
                 onClick={() => setSystemMode('TUN')}
                 className="rounded-[14px] p-3 text-left cursor-pointer transition-colors duration-150"
-                style={{
-                  backgroundColor: systemMode === 'TUN' ? COLORS.surfaceActive : COLORS.obsidian,
-                  border: `1px solid ${systemMode === 'TUN' ? COLORS.surfaceActiveBorder : COLORS.surfaceBorder}`,
-                }}
+                style={systemMode === 'TUN' ? GLASS_ACTIVE : GLASS_INSET}
               >
                 <div className="flex items-center justify-between mb-1">
                   <span className="font-jakarta font-bold text-[12.5px]" style={{ color: COLORS.textPrimary }}>
                     TUN Mode (Full PC Tunnel)
                   </span>
                   <span className="px-2 py-0.5 rounded-full text-[9.5px] font-bold" style={{ backgroundColor: COLORS.amberBg, color: COLORS.amber }}>
-                    ADMIN ONCE • WINTUN
+                    DEFAULT • ADMIN • WINTUN
                   </span>
                 </div>
                 <p className="text-[11px] leading-relaxed" style={{ color: systemMode === 'TUN' ? '#DFC7C6' : COLORS.textMuted }}>
                   Creates a virtual network adapter (<span className="font-mono">Metrovpn-TUN</span>) so 100% of apps, games &amp; UDP traffic go through the VPN.
                 </p>
               </button>
+
+              <button
+                type="button"
+                onClick={() => setSystemMode('PROXY')}
+                className="rounded-[14px] p-3 text-left cursor-pointer transition-colors duration-150"
+                style={systemMode === 'PROXY' ? GLASS_ACTIVE : GLASS_INSET}
+              >
+                <div className="flex items-center justify-between mb-1">
+                  <span className="font-jakarta font-bold text-[12.5px]" style={{ color: COLORS.textPrimary }}>
+                    System Proxy Mode
+                  </span>
+                  <span className="px-2 py-0.5 rounded-full text-[9.5px] font-bold" style={{ backgroundColor: '#1E332B', color: COLORS.mint }}>
+                    BROWSERS &amp; CHAT
+                  </span>
+                </div>
+                <p className="text-[11px] leading-relaxed" style={{ color: systemMode === 'PROXY' ? '#DFC7C6' : COLORS.textMuted }}>
+                  Routes Chrome, Edge, Telegram &amp; Discord instantly on fixed HTTP port <span className="font-mono">10809</span> without creating a virtual adapter.
+                </p>
+              </button>
             </div>
           </div>
 
           {/* MTU & Split Tunneling */}
-          <div className="rounded-[20px] p-3.5 flex flex-col gap-3" style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}>
+          <div className="rounded-[20px] p-3.5 flex flex-col gap-3" style={GLASS_CARD}>
             <div className="flex items-center justify-between gap-2">
               <div className="min-w-0">
                 <div className="text-[12.5px] font-semibold" style={{ color: COLORS.textPrimary }}>
@@ -3369,7 +3569,7 @@ function SettingsScreen() {
                 type="button"
                 onClick={() => setAppsModalOpen(true)}
                 className="w-full h-[36px] px-3.5 rounded-[12px] flex items-center justify-between cursor-pointer transition-colors duration-150 hover:bg-[#2A2223]"
-                style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}` }}
+                style={GLASS_INSET}
               >
                 <div className="flex items-center gap-2">
                   <AppWindow className="w-4 h-4" style={{ color: COLORS.coral }} />
@@ -3383,7 +3583,7 @@ function SettingsScreen() {
               </button>
             )}
 
-            <div className="pt-2 border-t flex items-center justify-between gap-2" style={{ borderColor: '#292223' }}>
+            <div className="pt-2 border-t flex items-center justify-between gap-2" style={{ borderColor: 'rgba(255,224,222,0.08)' }}>
               <span className="text-[12px] font-semibold" style={{ color: COLORS.textPrimary }}>
                 TUN Adapter MTU
               </span>
@@ -3408,7 +3608,7 @@ function SettingsScreen() {
           </div>
 
           {/* DNS & VCN Security */}
-          <div className="rounded-[20px] p-3.5 flex flex-col gap-3" style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}>
+          <div className="rounded-[20px] p-3.5 flex flex-col gap-3" style={GLASS_CARD}>
             <div>
               <div className="text-[12.5px] font-semibold mb-2" style={{ color: COLORS.textPrimary }}>
                 DNS Resolver (Zero-Rating Safe)
@@ -3425,7 +3625,7 @@ function SettingsScreen() {
                       style={{
                         backgroundColor: active ? COLORS.taupe : COLORS.obsidian,
                         color: active ? COLORS.textPrimary : COLORS.textMuted,
-                        border: `1px solid ${active ? '#684C4A' : COLORS.surfaceBorder}`,
+                        border: `1px solid ${active ? 'rgba(255,200,196,0.28)' : COLORS.surfaceBorder}`,
                       }}
                     >
                       {opt}
@@ -3440,12 +3640,12 @@ function SettingsScreen() {
                   onChange={(e) => setCustomDohUrl(e.target.value)}
                   placeholder="https://dns.quad9.net/dns-query"
                   className="mt-2 w-full h-[34px] rounded-[10px] px-2.5 font-mono text-[11.5px] focus:outline-none"
-                  style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}`, color: COLORS.textPrimary }}
+                  style={{ ...GLASS_INSET, color: COLORS.textPrimary }}
                 />
               )}
             </div>
 
-            <div className="flex items-center justify-between gap-3 pt-2 border-t" style={{ borderColor: '#292223' }}>
+            <div className="flex items-center justify-between gap-3 pt-2 border-t" style={{ borderColor: 'rgba(255,224,222,0.08)' }}>
               <div className="min-w-0">
                 <div className="text-[12.5px] font-semibold" style={{ color: COLORS.textPrimary }}>
                   Strict VCN Cert Pinning
@@ -3463,18 +3663,18 @@ function SettingsScreen() {
       {/* TAB 3: ABOUT & GUIDE */}
       {activeTab === 'about' && (
         <div className="flex flex-col gap-3">
-          <div className="rounded-[20px] p-4 flex flex-col gap-3.5" style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}>
+          <div className="rounded-[20px] p-4 flex flex-col gap-3.5" style={GLASS_CARD}>
             <div className="flex items-center gap-3">
               <div
                 className="w-11 h-11 rounded-[14px] flex items-center justify-center overflow-hidden shrink-0"
-                style={{ backgroundColor: '#241B1C', border: '1px solid #443132' }}
+                style={{ backgroundColor: 'rgba(42, 26, 28, 0.78)', border: '1px solid rgba(255, 160, 150, 0.25)' }}
               >
                 <img src={metrovpnApkIcon} alt="Metrovpn" className="w-7 h-7 object-contain" />
               </div>
               <div className="min-w-0">
                 <img src={metrovpnWordmark} alt="Metrovpn" className="h-[20px] w-auto object-contain mb-0.5" />
                 <div className="font-mono text-[11px] truncate" style={{ color: COLORS.textMuted }}>
-                  v2.7.1 • Xray v26.11.9 • Fixed :10808/:10809
+                  v2.7.2 • Xray v26.11.9 • Fixed :10808/:10809
                 </div>
               </div>
             </div>
@@ -3675,7 +3875,7 @@ function AddConfigModal() {
             transition={{ duration: 0.16 }}
             onClick={(e) => e.stopPropagation()}
             className="w-full max-w-[440px] rounded-[22px] p-4 shadow-2xl"
-            style={{ backgroundColor: COLORS.surface, border: '1px solid #3D3132' }}
+            style={GLASS_MODAL}
           >
             <div className="flex items-center justify-between mb-3.5">
               <div className="flex items-center gap-2.5">
@@ -3705,29 +3905,15 @@ function AddConfigModal() {
             </div>
 
             <div className="flex flex-col gap-2.5">
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  onClick={handleClipboardPaste}
-                  className="flex-1 h-[34px] px-3 rounded-[11px] text-[11.5px] font-semibold flex items-center justify-center gap-1.5 cursor-pointer transition-colors duration-150 hover:bg-[#5C4341]"
-                  style={{ backgroundColor: COLORS.taupe, color: COLORS.textPrimary, border: '1px solid #634947' }}
-                >
-                  <ClipboardPaste className="w-3.5 h-3.5" />
-                  <span>Paste from Clipboard</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setUriText(SAMPLE_VLESS_URI);
-                    setErrorMsg('');
-                  }}
-                  className="h-[34px] px-3 rounded-[11px] text-[11px] font-semibold flex items-center gap-1 cursor-pointer"
-                  style={{ backgroundColor: COLORS.amberBg, color: COLORS.amber }}
-                >
-                  <Sparkles className="w-3 h-3" />
-                  <span>Sample</span>
-                </button>
-              </div>
+              <button
+                type="button"
+                onClick={handleClipboardPaste}
+                className="w-full h-[34px] px-3 rounded-[11px] text-[11.5px] font-semibold flex items-center justify-center gap-1.5 cursor-pointer transition-colors duration-150 hover:bg-[#5C4341]"
+                style={{ backgroundColor: COLORS.taupe, color: COLORS.textPrimary, border: '1px solid rgba(255,200,196,0.2)' }}
+              >
+                <ClipboardPaste className="w-3.5 h-3.5" />
+                <span>Paste from Clipboard</span>
+              </button>
 
               <textarea
                 rows={4}
@@ -3736,9 +3922,9 @@ function AddConfigModal() {
                   setUriText(e.target.value);
                   setErrorMsg('');
                 }}
-                placeholder="vless://uuid@host:443?security=tls&sni=st1.zoom.us&vcn=vpn.metrodens.site#NodeName"
-                className="w-full rounded-[14px] p-3 font-mono text-[11px] leading-relaxed resize-none focus:outline-none focus:border-[#593B39]"
-                style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}`, color: COLORS.textPrimary }}
+                placeholder="vless://uuid@host:443?security=tls&sni=st1.zoom.us#NodeName"
+                className="w-full rounded-[14px] p-3 font-mono text-[11px] leading-relaxed resize-none focus:outline-none focus:border-[#FF7369]"
+                style={{ ...GLASS_INSET, color: COLORS.textPrimary }}
               />
 
               {parsedUri && (
@@ -3922,20 +4108,53 @@ function QrScannerModal() {
     };
   }, [qrModalOpen, scanTab, stopCamera, importDecodedQr]);
 
+  useEffect(() => {
+    if (!IN_TAURI) return undefined;
+    let unsubResult = null;
+    let unsubCancel = null;
+    let active = true;
+
+    (async () => {
+      try {
+        unsubResult = await listenEvent('vpn://snip-result', async (payload) => {
+          if (!active) return;
+          setCapturing(false);
+          if (payload?.ok && payload?.text) {
+            setDecodedUri(payload.text);
+            await importDecodedQr(payload.text);
+          } else if (payload?.error) {
+            setErrorMsg(String(payload.error));
+          }
+        });
+        unsubCancel = await listenEvent('vpn://snip-cancelled', () => {
+          if (!active) return;
+          setCapturing(false);
+        });
+      } catch {
+        // ignore listener setup error
+      }
+    })();
+
+    return () => {
+      active = false;
+      if (typeof unsubResult === 'function') unsubResult();
+      if (typeof unsubCancel === 'function') unsubCancel();
+    };
+  }, [importDecodedQr]);
+
   const handleScreenCaptureQr = async () => {
     setErrorMsg('');
+    setDecodedUri('');
     setCapturing(true);
     try {
       if (!IN_TAURI) {
-        setErrorMsg('Screen Capture QR requires the Windows desktop app.');
+        setErrorMsg('Mouse Snip Screen QR requires the Windows desktop app.');
+        setCapturing(false);
         return;
       }
-      const qrText = await invokeCmd('scan_screen_qr', { hideWindow: true });
-      setDecodedUri(qrText);
-      await importDecodedQr(qrText);
+      await invokeCmd('start_screen_snip');
     } catch (err) {
       setErrorMsg(String(err));
-    } finally {
       setCapturing(false);
     }
   };
@@ -3948,7 +4167,7 @@ function QrScannerModal() {
           animate={{ opacity: 1 }}
           exit={{ opacity: 0 }}
           className="absolute inset-0 z-50 flex items-center justify-center p-3"
-          style={{ backgroundColor: 'rgba(12, 10, 11, 0.80)', backdropFilter: 'blur(5px)' }}
+          style={{ backgroundColor: 'rgba(12, 10, 11, 0.78)', backdropFilter: 'blur(6px)' }}
           onClick={() => setQrModalOpen(false)}
         >
           <motion.div
@@ -3958,7 +4177,7 @@ function QrScannerModal() {
             transition={{ duration: 0.16 }}
             onClick={(e) => e.stopPropagation()}
             className="w-full max-w-[430px] rounded-[22px] p-4 shadow-2xl"
-            style={{ backgroundColor: COLORS.surface, border: '1px solid #3D3132' }}
+            style={GLASS_MODAL}
           >
             <div className="flex items-center justify-between mb-3">
               <div className="flex items-center gap-2.5">
@@ -3973,7 +4192,7 @@ function QrScannerModal() {
                     Scan QR Config
                   </h3>
                   <p className="text-[11px]" style={{ color: COLORS.textMuted }}>
-                    Capture screen QR or point webcam at a QR code
+                    Snip QR region on screen or scan with webcam
                   </p>
                 </div>
               </div>
@@ -3987,10 +4206,10 @@ function QrScannerModal() {
               </button>
             </div>
 
-            {/* Strictly 2 QR Modes: Screen Capture & Camera */}
+            {/* Strictly 2 QR Modes: Screen Snip & Camera */}
             <div
               className="grid grid-cols-2 p-1 rounded-[14px] mb-3.5 gap-1"
-              style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}` }}
+              style={GLASS_INSET}
             >
               <button
                 type="button"
@@ -4027,7 +4246,7 @@ function QrScannerModal() {
             {scanTab === 'screen' && (
               <div
                 className="rounded-[16px] p-5 flex flex-col items-center text-center gap-3"
-                style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}` }}
+                style={GLASS_INSET}
               >
                 <div
                   className="w-12 h-12 rounded-[15px] flex items-center justify-center"
@@ -4037,10 +4256,10 @@ function QrScannerModal() {
                 </div>
                 <div>
                   <p className="text-[13px] font-semibold" style={{ color: COLORS.textPrimary }}>
-                    {capturing ? 'Scanning your screen...' : 'Scan Any QR Visible on Screen'}
+                    {capturing ? 'Drag across the QR code on screen...' : 'Snip QR Area With Your Mouse'}
                   </p>
-                  <p className="text-[11px] mt-1 leading-relaxed max-w-[300px]" style={{ color: COLORS.textMuted }}>
-                    Keep the QR code open on Telegram or browser. Metrovpn hides briefly, captures your desktop, and imports automatically.
+                  <p className="text-[11px] mt-1 leading-relaxed max-w-[310px]" style={{ color: COLORS.textMuted }}>
+                    Works like Windows Snipping Tool: click below, then drag a box around any QR code on your desktop or browser and release to import.
                   </p>
                 </div>
                 <button
@@ -4051,7 +4270,7 @@ function QrScannerModal() {
                   style={{ backgroundColor: COLORS.crimson, color: COLORS.textPrimary, border: '1px solid #BC1F27' }}
                 >
                   <ScanLine className="w-3.5 h-3.5" />
-                  <span>{capturing ? 'Capturing...' : 'Capture Screen & Scan'}</span>
+                  <span>{capturing ? 'Snipping Tool Active...' : 'Snip QR from Screen'}</span>
                 </button>
               </div>
             )}
@@ -4059,7 +4278,7 @@ function QrScannerModal() {
             {scanTab === 'camera' && (
               <div
                 className="rounded-[16px] p-3 flex flex-col items-center gap-2.5"
-                style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}` }}
+                style={GLASS_INSET}
               >
                 <div className="relative w-full h-[210px] rounded-[12px] overflow-hidden bg-black flex items-center justify-center">
                   <video ref={videoRef} playsInline muted className="w-full h-full object-cover" />
@@ -4099,6 +4318,232 @@ function QrScannerModal() {
         </motion.div>
       )}
     </AnimatePresence>
+  );
+}
+
+// ============================================================================
+// FULLSCREEN MOUSE SNIPPING OVERLAY WINDOW (?window=snip)
+// ============================================================================
+function SnipOverlayView() {
+  const [previewUrl, setPreviewUrl] = useState('');
+  const [dragStart, setDragStart] = useState(null);
+  const [dragCurrent, setDragCurrent] = useState(null);
+  const [submitting, setSubmitting] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    let unsub = null;
+
+    if (IN_TAURI) {
+      invokeCmd('get_snip_preview')
+        .then((url) => {
+          if (active && url) setPreviewUrl(url);
+        })
+        .catch(() => {});
+
+      listenEvent('vpn://snip-ready', (url) => {
+        if (!active) return;
+        setDragStart(null);
+        setDragCurrent(null);
+        setSubmitting(false);
+        if (url) setPreviewUrl(url);
+      })
+        .then((fn) => {
+          unsub = fn;
+        })
+        .catch(() => {});
+    }
+
+    const onKeyDown = (e) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        setDragStart(null);
+        setDragCurrent(null);
+        if (IN_TAURI) invokeCmd('cancel_screen_snip').catch(() => {});
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      active = false;
+      window.removeEventListener('keydown', onKeyDown);
+      if (typeof unsub === 'function') unsub();
+    };
+  }, []);
+
+  const selRect = useMemo(() => {
+    if (!dragStart || !dragCurrent) return null;
+    const x = Math.min(dragStart.x, dragCurrent.x);
+    const y = Math.min(dragStart.y, dragCurrent.y);
+    const w = Math.abs(dragCurrent.x - dragStart.x);
+    const h = Math.abs(dragCurrent.y - dragStart.y);
+    return { x, y, w, h };
+  }, [dragStart, dragCurrent]);
+
+  const handleCancel = (e) => {
+    if (e) e.preventDefault();
+    setDragStart(null);
+    setDragCurrent(null);
+    if (IN_TAURI) invokeCmd('cancel_screen_snip').catch(() => {});
+  };
+
+  const handlePointerDown = (e) => {
+    if (submitting) return;
+    if (e.button === 2) {
+      handleCancel(e);
+      return;
+    }
+    if (e.button !== 0) return;
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      // ignore pointer capture fallback
+    }
+    const pt = { x: e.clientX, y: e.clientY };
+    setDragStart(pt);
+    setDragCurrent(pt);
+  };
+
+  const handlePointerMove = (e) => {
+    if (!dragStart || submitting) return;
+    setDragCurrent({ x: e.clientX, y: e.clientY });
+  };
+
+  const handlePointerUp = async (e) => {
+    if (!dragStart || submitting) return;
+    try {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    } catch {
+      // ignore
+    }
+    const x = Math.min(dragStart.x, e.clientX);
+    const y = Math.min(dragStart.y, e.clientY);
+    const w = Math.abs(e.clientX - dragStart.x);
+    const h = Math.abs(e.clientY - dragStart.y);
+    setDragStart(null);
+    setDragCurrent(null);
+
+    if (w < 12 || h < 12) return;
+    const vw = window.innerWidth || 1;
+    const vh = window.innerHeight || 1;
+    setSubmitting(true);
+    try {
+      if (IN_TAURI) {
+        await invokeCmd('finish_screen_snip', {
+          xRatio: x / vw,
+          yRatio: y / vh,
+          wRatio: w / vw,
+          hRatio: h / vh,
+        });
+      }
+    } catch {
+      // error emitted back to main window
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div
+      className="fixed inset-0 w-screen h-screen overflow-hidden select-none cursor-crosshair bg-black"
+      onPointerDown={handlePointerDown}
+      onPointerMove={handlePointerMove}
+      onPointerUp={handlePointerUp}
+      onContextMenu={handleCancel}
+    >
+      {previewUrl && (
+        <img
+          src={previewUrl}
+          alt="Desktop snip surface"
+          draggable={false}
+          className="w-full h-full object-fill pointer-events-none select-none"
+        />
+      )}
+
+      {!selRect ? (
+        <div
+          className="fixed inset-0 pointer-events-none"
+          style={{ backgroundColor: 'rgba(10, 7, 9, 0.52)' }}
+        />
+      ) : (
+        <>
+          <div
+            className="fixed left-0 right-0 top-0 pointer-events-none"
+            style={{ height: selRect.y, backgroundColor: 'rgba(10, 7, 9, 0.58)' }}
+          />
+          <div
+            className="fixed left-0 right-0 bottom-0 pointer-events-none"
+            style={{ top: selRect.y + selRect.h, backgroundColor: 'rgba(10, 7, 9, 0.58)' }}
+          />
+          <div
+            className="fixed left-0 pointer-events-none"
+            style={{
+              top: selRect.y,
+              height: selRect.h,
+              width: selRect.x,
+              backgroundColor: 'rgba(10, 7, 9, 0.58)',
+            }}
+          />
+          <div
+            className="fixed right-0 pointer-events-none"
+            style={{
+              top: selRect.y,
+              height: selRect.h,
+              left: selRect.x + selRect.w,
+              backgroundColor: 'rgba(10, 7, 9, 0.58)',
+            }}
+          />
+
+          <div
+            className="fixed pointer-events-none"
+            style={{
+              left: selRect.x,
+              top: selRect.y,
+              width: selRect.w,
+              height: selRect.h,
+              border: '1.5px solid #FF5449',
+              boxShadow: '0 0 18px rgba(255, 84, 73, 0.55), inset 0 0 0 1px rgba(255, 255, 255, 0.35)',
+            }}
+          >
+            <div className="absolute -top-0.5 -left-0.5 w-3 h-3 border-t-2 border-l-2 border-white" />
+            <div className="absolute -top-0.5 -right-0.5 w-3 h-3 border-t-2 border-r-2 border-white" />
+            <div className="absolute -bottom-0.5 -left-0.5 w-3 h-3 border-b-2 border-l-2 border-white" />
+            <div className="absolute -bottom-0.5 -right-0.5 w-3 h-3 border-b-2 border-r-2 border-white" />
+
+            <div
+              className="absolute left-0 px-2 py-0.5 rounded-full font-mono text-[10.5px] font-semibold whitespace-nowrap"
+              style={{
+                top: selRect.y > 28 ? -24 : selRect.h + 6,
+                backgroundColor: 'rgba(18, 13, 14, 0.88)',
+                border: '1px solid rgba(255, 84, 73, 0.55)',
+                color: '#F4ECEC',
+              }}
+            >
+              {Math.round(selRect.w)} × {Math.round(selRect.h)} px
+            </div>
+          </div>
+        </>
+      )}
+
+      {/* Top Glass HUD */}
+      <div
+        className="fixed top-4 left-1/2 -translate-x-1/2 z-20 flex items-center gap-3 px-4 py-2 rounded-full shadow-2xl"
+        style={GLASS_MODAL}
+        onPointerDown={(e) => e.stopPropagation()}
+      >
+        <ScanLine className="w-4 h-4 shrink-0" style={{ color: COLORS.coral }} />
+        <span className="text-[12px] font-semibold whitespace-nowrap" style={{ color: COLORS.textPrimary }}>
+          Drag mouse around the QR code &amp; release to scan
+        </span>
+        <button
+          type="button"
+          onClick={handleCancel}
+          className="px-2.5 py-0.5 rounded-full text-[11px] font-semibold cursor-pointer hover:bg-[#3A2224]"
+          style={{ backgroundColor: 'rgba(255, 84, 73, 0.18)', color: COLORS.coral, border: '1px solid rgba(255, 84, 73, 0.4)' }}
+        >
+          Cancel (Esc)
+        </button>
+      </div>
+    </div>
   );
 }
 
@@ -4645,9 +5090,9 @@ function OnboardingGuideModal() {
       actionLabel: null,
     },
     {
-      stepLabel: 'Step 3 of 4 • System Proxy vs TUN',
-      title: 'Choose How Windows Routes Traffic',
-      body: 'System Proxy routes browsers & Telegram with no Admin prompt. TUN Mode routes every app, game & CLI tool on your PC (asks Admin once) and lets you bypass specific .exe apps.',
+      stepLabel: 'Step 3 of 4 • TUN Mode vs System Proxy',
+      title: 'How Windows Routes Traffic',
+      body: 'TUN Mode is enabled by default so every app, game & CLI tool on your PC goes through the VPN automatically. You can also switch to System Proxy anytime for browsers & chat apps only.',
       showModeToggle: true,
     },
     {
@@ -4670,9 +5115,8 @@ function OnboardingGuideModal() {
           transition={{ duration: 0.16 }}
           className="absolute inset-x-3 bottom-3 z-50 rounded-[20px] p-4 shadow-2xl"
           style={{
-            backgroundColor: '#1B1617',
+            ...GLASS_MODAL,
             border: `1.5px solid ${COLORS.coral}`,
-            boxShadow: '0 20px 50px rgba(0,0,0,0.85)',
           }}
         >
           <div className="flex items-start justify-between gap-2 mb-1.5">
@@ -4704,19 +5148,6 @@ function OnboardingGuideModal() {
             <div className="grid grid-cols-2 gap-2 mb-3">
               <button
                 type="button"
-                onClick={() => setSystemMode('PROXY')}
-                className="py-1.5 px-2.5 rounded-[12px] text-[11px] font-semibold cursor-pointer text-left"
-                style={{
-                  backgroundColor: systemMode === 'PROXY' ? COLORS.crimson : COLORS.obsidian,
-                  color: COLORS.textPrimary,
-                  border: `1px solid ${systemMode === 'PROXY' ? '#BC1F27' : COLORS.surfaceBorder}`,
-                }}
-              >
-                <div>System Proxy</div>
-                <div className="text-[9.5px] opacity-80">Browsers • No Admin</div>
-              </button>
-              <button
-                type="button"
                 onClick={() => setSystemMode('TUN')}
                 className="py-1.5 px-2.5 rounded-[12px] text-[11px] font-semibold cursor-pointer text-left"
                 style={{
@@ -4726,7 +5157,20 @@ function OnboardingGuideModal() {
                 }}
               >
                 <div>TUN Mode</div>
-                <div className="text-[9.5px] opacity-80">All Apps/Games • Admin</div>
+                <div className="text-[9.5px] opacity-80">Default • Full PC &amp; Games</div>
+              </button>
+              <button
+                type="button"
+                onClick={() => setSystemMode('PROXY')}
+                className="py-1.5 px-2.5 rounded-[12px] text-[11px] font-semibold cursor-pointer text-left"
+                style={{
+                  backgroundColor: systemMode === 'PROXY' ? COLORS.crimson : COLORS.obsidian,
+                  color: COLORS.textPrimary,
+                  border: `1px solid ${systemMode === 'PROXY' ? '#BC1F27' : COLORS.surfaceBorder}`,
+                }}
+              >
+                <div>System Proxy</div>
+                <div className="text-[9.5px] opacity-80">Browsers &amp; Chat Apps</div>
               </button>
             </div>
           )}
@@ -5383,14 +5827,22 @@ function DesktopStage() {
     }
   };
 
+  const ambientBackground =
+    connectionStatus === 'connected'
+      ? 'radial-gradient(circle at 62% 28%, rgba(109, 213, 176, 0.16) 0%, transparent 52%), radial-gradient(circle at 18% 82%, rgba(155, 10, 18, 0.22) 0%, transparent 54%), radial-gradient(circle at 86% 86%, rgba(230, 194, 128, 0.09) 0%, transparent 45%), #0D090A'
+      : 'radial-gradient(circle at 58% 24%, rgba(190, 22, 34, 0.22) 0%, transparent 54%), radial-gradient(circle at 16% 78%, rgba(120, 22, 28, 0.16) 0%, transparent 50%), radial-gradient(circle at 88% 85%, rgba(230, 194, 128, 0.08) 0%, transparent 42%), #0D090A';
+
   if (IN_TAURI) {
     return (
       <div
         className="w-screen h-screen relative flex flex-col overflow-hidden"
-        style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}` }}
+        style={{
+          background: ambientBackground,
+          border: `1px solid ${COLORS.surfaceBorder}`,
+        }}
       >
         <Titlebar />
-        <div className="flex-1 flex gap-2.5 p-2.5 min-h-0 overflow-hidden">
+        <div className="flex-1 flex gap-2.5 p-2.5 min-h-0 overflow-hidden relative z-10">
           <NavigationRail />
           <main className="flex-1 min-w-0 h-full overflow-y-auto overflow-x-hidden pr-0.5 custom-scrollbar">
             <AnimatePresence mode="wait">{renderScreen()}</AnimatePresence>
@@ -5415,7 +5867,7 @@ function DesktopStage() {
       style={{
         backgroundColor: COLORS.stage,
         backgroundImage:
-          'radial-gradient(circle at 20% 18%, rgba(89, 44, 44, 0.16) 0%, transparent 46%), radial-gradient(circle at 82% 84%, rgba(58, 47, 27, 0.12) 0%, transparent 42%)',
+          'radial-gradient(circle at 20% 18%, rgba(89, 44, 44, 0.18) 0%, transparent 46%), radial-gradient(circle at 82% 84%, rgba(58, 47, 27, 0.14) 0%, transparent 42%)',
       }}
     >
       <AnimatePresence mode="wait">
@@ -5428,13 +5880,13 @@ function DesktopStage() {
             transition={{ duration: 0.16 }}
             className="relative flex flex-col overflow-hidden w-full max-w-[520px] h-[620px] max-h-[calc(100vh-70px)] rounded-[14px]"
             style={{
-              backgroundColor: COLORS.obsidian,
+              background: ambientBackground,
               border: `1px solid ${COLORS.surfaceBorder}`,
-              boxShadow: '0 36px 90px -18px rgba(4, 2, 3, 0.88), 0 0 0 1px rgba(244, 236, 236, 0.04) inset',
+              boxShadow: '0 36px 90px -18px rgba(4, 2, 3, 0.88), 0 0 0 1px rgba(255, 228, 226, 0.08) inset',
             }}
           >
             <Titlebar />
-            <div className="flex-1 flex gap-2.5 p-2.5 min-h-0 overflow-hidden">
+            <div className="flex-1 flex gap-2.5 p-2.5 min-h-0 overflow-hidden relative z-10">
               <NavigationRail />
               <main className="flex-1 min-w-0 h-full overflow-y-auto overflow-x-hidden pr-0.5 custom-scrollbar">
                 <AnimatePresence mode="wait">{renderScreen()}</AnimatePresence>
@@ -5457,11 +5909,11 @@ function DesktopStage() {
             exit={{ opacity: 0, y: 8 }}
             transition={SPRING}
             className="rounded-[24px] px-7 py-6 flex flex-col items-center text-center gap-3 max-w-[380px]"
-            style={{ backgroundColor: '#171314', border: `1px solid ${COLORS.surfaceBorder}` }}
+            style={GLASS_CARD}
           >
             <div
               className="w-12 h-12 rounded-[16px] flex items-center justify-center"
-              style={{ backgroundColor: '#251B1C', border: '1px solid #3E2E2F' }}
+              style={{ backgroundColor: 'rgba(42, 26, 28, 0.78)', border: '1px solid rgba(255, 160, 150, 0.25)' }}
             >
               <WolfEmblem className="w-7 h-7" />
             </div>
@@ -5491,7 +5943,7 @@ function DesktopStage() {
             whileTap={{ scale: 0.96 }}
             onClick={restoreFromTray}
             className="h-[34px] px-3.5 rounded-full flex items-center gap-2 text-[11.5px] font-semibold cursor-pointer shadow-lg"
-            style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}`, color: COLORS.textPrimary }}
+            style={{ ...GLASS_CARD, color: COLORS.textPrimary }}
           >
             <Monitor className="w-3.5 h-3.5" style={{ color: COLORS.coral }} />
             <span>Open Window</span>
@@ -5503,11 +5955,11 @@ function DesktopStage() {
           transition={SPRING}
           onClick={() => setTrayFlyoutOpen((v) => !v)}
           className="h-[34px] px-3.5 rounded-full flex items-center gap-2.5 cursor-pointer shadow-xl select-none"
-          style={{
-            backgroundColor: trayFlyoutOpen ? COLORS.surfaceActive : '#1B1718',
-            border: `1px solid ${trayFlyoutOpen ? COLORS.surfaceActiveBorder : '#33292A'}`,
-            color: COLORS.textPrimary,
-          }}
+          style={
+            trayFlyoutOpen
+              ? { ...GLASS_ACTIVE, color: COLORS.textPrimary }
+              : { ...GLASS_CARD, color: COLORS.textPrimary }
+          }
         >
           <div className="relative flex items-center justify-center">
             <WolfEmblem className="w-4 h-4" />
@@ -5577,13 +6029,14 @@ class MetroErrorBoundary extends React.Component {
 
 export default function App() {
   const isTray = isTrayWindowMode();
+  const isSnip = isSnipWindowMode();
 
   return (
     <>
       <style>{`
         body {
           margin: 0;
-          background-color: ${isTray ? 'transparent' : '#0C0A0B'};
+          background-color: ${isTray ? 'transparent' : '#0A0708'};
           font-family: 'Segoe UI Variable Text', 'Segoe UI Variable', 'Segoe UI', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
           color: #F4ECEC;
           -webkit-font-smoothing: antialiased;
@@ -5610,24 +6063,28 @@ export default function App() {
           background: transparent;
         }
         .custom-scrollbar::-webkit-scrollbar-thumb {
-          background: #2E2627;
+          background: rgba(255, 224, 222, 0.14);
           border-radius: 999px;
         }
         .custom-scrollbar::-webkit-scrollbar-thumb:hover {
-          background: #4B3635;
+          background: rgba(255, 84, 73, 0.42);
         }
       `}</style>
 
       <MetroErrorBoundary>
-        <MetroProvider>
-          {isTray ? (
-            <div className="w-[320px] h-[420px] overflow-hidden bg-transparent">
-              <TrayFlyoutCard standalone={true} />
-            </div>
-          ) : (
-            <DesktopStage />
-          )}
-        </MetroProvider>
+        {isSnip ? (
+          <SnipOverlayView />
+        ) : (
+          <MetroProvider>
+            {isTray ? (
+              <div className="w-[320px] h-[420px] overflow-hidden bg-transparent">
+                <TrayFlyoutCard standalone={true} />
+              </div>
+            ) : (
+              <DesktopStage />
+            )}
+          </MetroProvider>
+        )}
       </MetroErrorBoundary>
     </>
   );

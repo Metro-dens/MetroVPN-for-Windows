@@ -352,11 +352,22 @@ fn build_proxy_outbound(node: &ServerNode, settings: &AppSettings) -> Value {
             vec!["h2".to_string(), "http/1.1".to_string()]
         };
 
-        let has_vcn_host = node
+        let inferred_vcn_host = node
             .vcn_host
-            .as_ref()
-            .map(|h| !h.trim().is_empty())
-            .unwrap_or(false);
+            .as_deref()
+            .map(str::trim)
+            .filter(|h| !h.is_empty())
+            .or_else(|| {
+                if !node.allow_insecure
+                    && node.address.parse::<std::net::IpAddr>().is_err()
+                    && !node.address.eq_ignore_ascii_case(effective_sni)
+                {
+                    Some(node.address.as_str())
+                } else {
+                    None
+                }
+            });
+        let has_vcn_host = inferred_vcn_host.is_some();
         let allow_insecure = if has_vcn_host && settings.cert_pinning {
             false
         } else {
@@ -370,10 +381,10 @@ fn build_proxy_outbound(node: &ServerNode, settings: &AppSettings) -> Value {
             "alpn": alpn_list
         });
 
-        // Always apply verifyPeerCertByName when node has vcn_host & cert_pinning is enabled (even in TLS Frag or Standard profile!)
-        if let Some(vcn_host) = &node.vcn_host {
-            if !vcn_host.trim().is_empty() && settings.cert_pinning {
-                tls_obj["verifyPeerCertByName"] = json!(vcn_host.trim());
+        // Always apply verifyPeerCertByName when node has explicit or inferred VCN host & cert_pinning is enabled
+        if let Some(vcn_host) = inferred_vcn_host {
+            if settings.cert_pinning {
+                tls_obj["verifyPeerCertByName"] = json!(vcn_host);
             }
         }
         stream_settings["tlsSettings"] = tls_obj;
@@ -521,5 +532,21 @@ mod tests {
         );
         let frag = outbounds.iter().find(|o| o["tag"] == "fragment-out").unwrap();
         assert_eq!(frag["settings"]["fragment"]["length"], "20-40");
+    }
+
+    #[test]
+    fn test_xray_config_infers_vcn_for_spoofed_sni_domain() {
+        let node = parse_vless_uri("vless://7f3bd91d-9110-45ac-aec9-304c74e49e83@vpn.metrodens.site:443?encryption=none&type=tcp&headerType=none&security=tls&fp=chrome&sni=st1.zoom.us&alpn=h2%2Chttp%2F1.1#SLT%20Fiber%20-%20Zoom%20Meet%20Max%20%2F%20Lite-SLT-FIBER-ZOOM-VIP-%40METRODENZ-122").unwrap();
+        let settings = AppSettings::default();
+        let cfg = build_xray_config(&node, &settings, SOCKS_PORT, HTTP_PORT, true);
+        let proxy = &cfg["outbounds"][0];
+        let tls = &proxy["streamSettings"]["tlsSettings"];
+        assert_eq!(tls["serverName"], "st1.zoom.us");
+        assert_eq!(tls["verifyPeerCertByName"], "vpn.metrodens.site");
+        assert_eq!(tls["allowInsecure"], false);
+        assert_eq!(tls["fingerprint"], "chrome");
+        assert_eq!(tls["alpn"], json!(["h2", "http/1.1"]));
+        assert_eq!(proxy["streamSettings"]["network"], "tcp");
+        assert_eq!(proxy["streamSettings"]["tcpSettings"]["header"]["type"], "none");
     }
 }

@@ -13,12 +13,14 @@ use tauri::{
     Manager, PhysicalPosition, RunEvent, WindowEvent,
 };
 use vpn_manager::{
-    add_custom_windows_app, check_github_update, clear_logs, connect_internal, connect_server,
-    decode_qr_image, delete_server, disconnect, download_and_install_update, emit_status,
-    get_logs, get_settings, get_status, import_subscription, import_uri, is_admin, list_servers,
-    quit_app, reconnect_active, refresh_local_ip, reset_settings, restart_as_admin, scan_screen_qr,
-    scan_windows_apps, sync_all_quotas, sync_node_quota, sync_node_quota_internal, toggle_star,
-    update_all_subscriptions, update_server, update_settings, AppState,
+    add_custom_windows_app, cancel_screen_snip, check_github_update, clear_logs,
+    connect_internal, connect_server, decode_qr_image, delete_server, disconnect,
+    download_and_install_update, emit_status, finish_screen_snip, get_logs, get_settings,
+    get_snip_preview, get_status, import_subscription, import_uri, is_admin, list_servers,
+    quit_app, reconnect_active, refresh_local_ip, reset_settings, restart_as_admin,
+    scan_screen_qr, scan_windows_apps, start_screen_snip, sync_all_quotas, sync_node_quota,
+    sync_node_quota_internal, toggle_star, update_all_subscriptions, update_server,
+    update_settings, AppState,
 };
 
 fn toggle_tray_flyout(app: &tauri::AppHandle) {
@@ -258,6 +260,17 @@ pub fn run() {
                         let _ = window.hide();
                     }
                 }
+                "snip" => {
+                    if let WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        let _ = window.hide();
+                        if let Some(main_win) = window.app_handle().get_webview_window("main") {
+                            let _ = main_win.show();
+                            let _ = main_win.unminimize();
+                            let _ = main_win.set_focus();
+                        }
+                    }
+                }
                 _ => {}
             }
         })
@@ -267,6 +280,10 @@ pub fn run() {
             update_all_subscriptions,
             decode_qr_image,
             scan_screen_qr,
+            start_screen_snip,
+            get_snip_preview,
+            finish_screen_snip,
+            cancel_screen_snip,
             list_servers,
             update_server,
             delete_server,

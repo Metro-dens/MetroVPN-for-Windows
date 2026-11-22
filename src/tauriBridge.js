@@ -115,3 +115,8 @@ export function isTrayWindowMode() {
   if (typeof window === 'undefined') return false;
   return new URLSearchParams(window.location.search).get('window') === 'tray';
 }
+
+export function isSnipWindowMode() {
+  if (typeof window === 'undefined') return false;
+  return new URLSearchParams(window.location.search).get('window') === 'snip';
+}

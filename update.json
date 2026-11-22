@@ -1,8 +1,8 @@
 {
-  "versionCode": 271,
-  "versionName": "2.7.1",
-  "title": "Metrovpn v2.7.1 Update Available",
-  "message": "Fixed Windows TUN Mode (tun2socks v2.7.0 POSIX --device/--proxy/--mtu flags causing exit code 2), pinned Metrovpn-TUN routing table by interface index, pre-resolved server domains into Xray DNS hosts to prevent TUN bootstrap loops, and deduplicated error notifications.",
-  "downloadUrl": "https://github.com/Metro-dens/MetroVPN-for-Windows/releases/latest/download/Metrovpn_2.7.1_x64-setup.exe",
+  "versionCode": 272,
+  "versionName": "2.7.2",
+  "title": "Metrovpn v2.7.2 Update Available",
+  "message": "Always launches elevated as Administrator with TUN Mode set as default, fixes TCP+TLS spoofed-SNI links without explicit VCN params, upgrades Screen QR capture to a mouse-drag Snipping Tool overlay, removes the Sample button, adds smooth neon telemetry lines with endpoint dots + smoother speedometer, and brings Android frosted glassmorphism.",
+  "downloadUrl": "https://github.com/Metro-dens/MetroVPN-for-Windows/releases/latest/download/Metrovpn_2.7.2_x64-setup.exe",
   "mandatory": false
 }

@@ -457,11 +457,20 @@ function MetroProvider({ children }) {
   }, [settingsState]);
 
   const pushToast = useCallback((message, tone = 'neutral') => {
+    const clean = String(message || '').trim();
+    if (!clean) return;
+    const norm = clean.replace(/^Connection failed:\s*/i, '');
     const id = `${Date.now()}-${Math.random()}`;
-    setToasts((prev) => [...prev.slice(-2), { id, message, tone }]);
+    setToasts((prev) => {
+      const deduped = prev.filter((t) => {
+        const prevNorm = String(t.message || '').trim().replace(/^Connection failed:\s*/i, '');
+        return prevNorm !== norm;
+      });
+      return [...deduped.slice(-2), { id, message: clean, tone }];
+    });
     setTimeout(() => {
       setToasts((prev) => prev.filter((t) => t.id !== id));
-    }, 3200);
+    }, 3600);
   }, []);
 
   const appendLog = useCallback((tag, msg) => {
@@ -892,17 +901,17 @@ function MetroProvider({ children }) {
     try {
       if (!IN_TAURI) {
         const mockInfo = {
-          currentVersion: '2.7.0',
-          latestVersion: '2.7.0',
+          currentVersion: '2.7.1',
+          latestVersion: '2.7.1',
           updateAvailable: false,
           releaseUrl: 'https://github.com/Metro-dens/MetroVPN-for-Windows/releases',
           downloadUrl: 'https://github.com/Metro-dens/MetroVPN-for-Windows/releases/latest/download/Metrovpn-standalone-x64.exe',
           assetName: 'Metrovpn-standalone-x64.exe',
-          title: 'Metrovpn v2.7.0',
+          title: 'Metrovpn v2.7.1',
           message: 'You are running the latest version of Metrovpn for Windows.',
         };
         setUpdateInfo(mockInfo);
-        pushToast('You are on the latest version (v2.7.0)', 'success');
+        pushToast('You are on the latest version (v2.7.1)', 'success');
         return;
       }
       const info = await invokeCmd('check_github_update');
@@ -1347,7 +1356,7 @@ function Titlebar() {
           }}
         >
           <span className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: COLORS.coral }} />
-          v2.7
+          v2.7.1
         </span>
       </div>
 
@@ -3465,7 +3474,7 @@ function SettingsScreen() {
               <div className="min-w-0">
                 <img src={metrovpnWordmark} alt="Metrovpn" className="h-[20px] w-auto object-contain mb-0.5" />
                 <div className="font-mono text-[11px] truncate" style={{ color: COLORS.textMuted }}>
-                  v2.7.0 • Xray v26.11.9 • Fixed :10808/:10809
+                  v2.7.1 • Xray v26.11.9 • Fixed :10808/:10809
                 </div>
               </div>
             </div>

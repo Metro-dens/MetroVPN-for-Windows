@@ -447,7 +447,27 @@ pub async fn connect_internal(
     let http_port = HTTP_PORT;
 
     // Build and write runtime Xray config.json
-    let runtime_cfg = build_xray_config(&node, &settings, socks_port, http_port, true);
+    let mut runtime_cfg = build_xray_config(&node, &settings, socks_port, http_port, true);
+
+    // Pre-resolve server domain IPv4 into Xray dns.hosts when in TUN mode so Xray never hits a DNS bootstrap loop
+    if mode_norm == "TUN" && node.address.parse::<IpAddr>().is_err() {
+        if let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&(node.address.as_str(), node.port)) {
+            let v4s: Vec<String> = addrs
+                .filter_map(|a| match a {
+                    SocketAddr::V4(v4) => Some(v4.ip().to_string()),
+                    _ => None,
+                })
+                .collect();
+            if !v4s.is_empty() {
+                if let Some(dns_obj) = runtime_cfg.get_mut("dns").and_then(|d| d.as_object_mut()) {
+                    let mut hosts = serde_json::Map::new();
+                    hosts.insert(node.address.clone(), serde_json::json!(v4s));
+                    dns_obj.insert("hosts".to_string(), serde_json::Value::Object(hosts));
+                }
+            }
+        }
+    }
+
     let config_path = app_data_dir.join("xray-runtime.json");
     let cfg_pretty = serde_json::to_string_pretty(&runtime_cfg)
         .map_err(|e| format!("Failed to serialize Xray config: {e}"))?;
@@ -521,28 +541,50 @@ pub async fn connect_internal(
             }
         };
 
-        // Ensure wintun.dll exists in tun2socks working directory
+        // Ensure wintun.dll exists next to tun2socks.exe (required by Windows LOAD_LIBRARY_SEARCH_APPLICATION_DIR).
+        // If the install directory is read-only, stage both into writable %AppData%\...\core.
+        let mut effective_tun_bin = tun_bin.clone();
         let wintun_src = res_dir.join("wintun.dll");
         if let Some(tun_dir) = tun_bin.parent() {
             let wintun_dst = tun_dir.join("wintun.dll");
             if wintun_src.exists() && !wintun_dst.exists() {
-                let _ = std::fs::copy(&wintun_src, &wintun_dst);
+                if let Err(err) = std::fs::copy(&wintun_src, &wintun_dst) {
+                    let stage_dir = app_data_dir.join("core");
+                    let _ = std::fs::create_dir_all(&stage_dir);
+                    let staged_bin = stage_dir.join("tun2socks.exe");
+                    let staged_dll = stage_dir.join("wintun.dll");
+                    if std::fs::copy(&tun_bin, &staged_bin).is_ok()
+                        && std::fs::copy(&wintun_src, &staged_dll).is_ok()
+                    {
+                        effective_tun_bin = staged_bin;
+                    } else {
+                        state.push_log(
+                            Some(&app),
+                            "Warning",
+                            &format!("Could not copy wintun.dll next to tun2socks.exe: {err}"),
+                        );
+                    }
+                }
             }
         }
 
         let mtu_str = settings.mtu.to_string();
         let proxy_arg = format!("socks5://127.0.0.1:{socks_port}");
+        let tun_cwd = effective_tun_bin.parent().unwrap_or(&res_dir);
+        // tun2socks v2.7.0 uses spf13/pflag: long flags MUST use double-dashes (--device, --proxy, --mtu)
         let mut tun_child = spawn_hidden_process(
-            &tun_bin,
+            &effective_tun_bin,
             &[
-                "-device",
+                "--device",
                 "tun://Metrovpn-TUN",
-                "-proxy",
+                "--proxy",
                 &proxy_arg,
-                "-mtu",
+                "--mtu",
                 &mtu_str,
+                "--loglevel",
+                "warn",
             ],
-            Some(&res_dir),
+            Some(tun_cwd),
             None,
         )?;
         pipe_child_logs(&mut tun_child, app.clone(), state.clone(), "[TUN] ");
@@ -550,7 +592,21 @@ pub async fn connect_internal(
         tokio::time::sleep(Duration::from_millis(900)).await;
         if let Ok(Some(exit_status)) = tun_child.try_wait() {
             let _ = xray_child.kill();
-            let msg = format!("tun2socks exited early ({exit_status}) — ensure Wintun driver is allowed");
+            let last_tun_err = state
+                .inner
+                .lock()
+                .ok()
+                .and_then(|g| {
+                    g.logs
+                        .iter()
+                        .rev()
+                        .find(|l| l.msg.starts_with("[TUN] "))
+                        .map(|l| l.msg.clone())
+                });
+            let msg = match last_tun_err {
+                Some(detail) => format!("tun2socks exited ({exit_status}): {detail}"),
+                None => format!("tun2socks exited early ({exit_status}) — ensure Wintun driver is allowed"),
+            };
             if let Ok(mut g) = state.inner.lock() {
                 g.status = "Error".into();
                 g.error_message = Some(msg.clone());

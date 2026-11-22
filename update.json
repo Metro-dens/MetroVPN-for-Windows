@@ -1,8 +1,8 @@
 {
-  "versionCode": 270,
-  "versionName": "2.7.0",
-  "title": "Metrovpn v2.7.0 Update Available",
-  "message": "Synced 3x-ui inbound data quota (/api/quota?uuid=...), locked fixed SOCKS5 (10808) & HTTP (10809) ports, fixed main connect ring center rotation, improved Xray & Wintun reliability, and added one-click auto-updater.",
-  "downloadUrl": "https://github.com/Metro-dens/MetroVPN-for-Windows/releases/latest/download/Metrovpn_2.7.0_x64-setup.exe",
+  "versionCode": 271,
+  "versionName": "2.7.1",
+  "title": "Metrovpn v2.7.1 Update Available",
+  "message": "Fixed Windows TUN Mode (tun2socks v2.7.0 POSIX --device/--proxy/--mtu flags causing exit code 2), pinned Metrovpn-TUN routing table by interface index, pre-resolved server domains into Xray DNS hosts to prevent TUN bootstrap loops, and deduplicated error notifications.",
+  "downloadUrl": "https://github.com/Metro-dens/MetroVPN-for-Windows/releases/latest/download/Metrovpn_2.7.1_x64-setup.exe",
   "mandatory": false
 }

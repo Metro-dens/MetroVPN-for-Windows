@@ -381,15 +381,41 @@ mod win_impl {
             }
         }
 
+        // Resolve Metrovpn-TUN interface index so Windows binds split-default routes explicitly to the TUN adapter
+        let tun_if_out = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!("(Get-NetIPInterface -InterfaceAlias '{interface_name}' -AddressFamily IPv4 | Select-Object -First 1).ifIndex"),
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+        let tun_if_idx = tun_if_out
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()));
+
         // Route all IPv4 traffic via split-default prefix into Metrovpn-TUN
-        let _ = Command::new("route")
-            .args(["add", "0.0.0.0", "mask", "128.0.0.0", "198.18.0.2", "metric", "5"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output();
-        let _ = Command::new("route")
-            .args(["add", "128.0.0.0", "mask", "128.0.0.0", "198.18.0.2", "metric", "5"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output();
+        if let Some(ref idx) = tun_if_idx {
+            let _ = Command::new("route")
+                .args(["add", "0.0.0.0", "mask", "128.0.0.0", "198.18.0.2", "metric", "5", "if", idx])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output();
+            let _ = Command::new("route")
+                .args(["add", "128.0.0.0", "mask", "128.0.0.0", "198.18.0.2", "metric", "5", "if", idx])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output();
+        } else {
+            let _ = Command::new("route")
+                .args(["add", "0.0.0.0", "mask", "128.0.0.0", "198.18.0.2", "metric", "5"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output();
+            let _ = Command::new("route")
+                .args(["add", "128.0.0.0", "mask", "128.0.0.0", "198.18.0.2", "metric", "5"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output();
+        }
 
         Ok(pinned_ips)
     }

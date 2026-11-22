@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: "Release tag to create (e.g. v2.7.0)"
+        description: "Release tag to create (e.g. v2.7.1)"
         required: true
-        default: "v2.7.0"
+        default: "v2.7.1"
         type: string
       draft:
         description: "Create as a draft release (hidden until published)"
@@ -76,12 +76,11 @@ jobs:
             - **`Metrovpn-windows-x64-portable.zip`** — Portable folder archive with all binaries side-by-side.
             - **`SHA256SUMS.txt`** — SHA-256 verification checksums (`Get-FileHash <file> -Algorithm SHA256`).
 
-            ### What's New in v2.7.0
-            - **3x-ui Inbound Data Quota Sync (`ClientQuotaFetcher` Parity):** Queries `/api/quota?uuid=<uuid>` across your VCN host, WebSocket Host, server address, and `vpn.metrodens.site` (plus direct IP+SNI override for dedicated VPS nodes), routed over local HTTP proxy `127.0.0.1:10809` when connected.
-            - **Fixed SOCKS5 (`10808`) & HTTP (`10809`) Inbound Ports:** Locked to the same fixed ports as MetroVPN for Android (`XrayConfigBuilder`).
-            - **Fixed-Position Rotating Connect Ring:** The outer wavy connect ring stays anchored at its exact center and rotates smoothly in place without off-center wobble.
-            - **Reliable Xray & TUN Connectivity:** Matches Android's zero-rating-safe plain IP DNS configuration, explicit `socks-in`/`http-in` -> `proxy` routing rule, VCN `verifyPeerCertByName` across all profiles, WebSocket `host` fallback (`wsHost` -> `vcn` -> `sni`), stale `xray.exe`/`tun2socks.exe` cleanup before connect, and resilient Wintun interface polling.
-            - **Built-in Auto-Update Downloader & Installer:** Checks GitHub Releases & `update.json` on startup or on demand, streams the latest Windows installer with a live progress bar, and launches the update automatically.
+            ### What's New in v2.7.1
+            - **Fixed Windows TUN Mode (`tun2socks` exit code 2):** Switched `tun2socks v2.7.0` launch flags to POSIX double-dash syntax (`--device`, `--proxy`, `--mtu`, `--loglevel`) required by `spf13/pflag`, and set working directory next to `wintun.dll`.
+            - **Hardened Wintun Routing & DNS:** Routes `0.0.0.0/1` and `128.0.0.0/1` explicitly via the `Metrovpn-TUN` interface index (`if <idx>`), and pre-resolves domain server addresses into Xray's `dns.hosts` in TUN mode to prevent DNS bootstrap loops.
+            - **Cleaner Error Diagnostics:** Captures the last `[TUN]` log line when `tun2socks` exits early and deduplicates stacked error toast banners.
+            - **Includes all `v2.7.0` improvements:** 3x-ui inbound data quota sync (`/api/quota?uuid=...`), fixed SOCKS5 (`10808`) & HTTP (`10809`) ports, fixed-center rotating connect ring, and built-in auto-updater.
 
             > **SmartScreen Note:** If Windows Defender SmartScreen prompts on an unsigned build, verify the SHA-256 checksum against `SHA256SUMS.txt` and click **More info → Run anyway**.
           releaseDraft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft || false }}

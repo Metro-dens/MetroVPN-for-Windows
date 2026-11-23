@@ -113,7 +113,7 @@ pub fn parse_vless_uri(raw: &str) -> Result<ServerNode, String> {
     let name = parsed
         .fragment()
         .filter(|f| !f.is_empty())
-        .map(|f| urlencoding_decode(f))
+        .map(urlencoding_decode)
         .unwrap_or_else(|| format!("{address}:{port}"));
 
     let raw_transport = params
@@ -184,6 +184,13 @@ pub fn parse_vless_uri(raw: &str) -> Result<ServerNode, String> {
         .or_else(|| params.get("insecure"))
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
+    let pinned_cert_sha256 = params
+        .get("pcs")
+        .or_else(|| params.get("pinsha256"))
+        .or_else(|| params.get("pinnedpeercertsha256"))
+        .cloned()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
 
     let isp = infer_isp(&name, &sni);
     let region = infer_region(&name, &address);
@@ -219,6 +226,7 @@ pub fn parse_vless_uri(raw: &str) -> Result<ServerNode, String> {
         seed,
         encryption,
         allow_insecure,
+        pinned_cert_sha256,
         ping: None,
         quota_used_gb: 0.0,
         quota_total_gb: 0.0,
@@ -304,6 +312,21 @@ pub fn parse_vmess_uri(raw: &str) -> Result<ServerNode, String> {
         .to_string();
     let vcn_host = obj["vcn"].as_str().filter(|s| !s.is_empty()).map(String::from);
     let vcn = vcn_host.is_some();
+    let allow_insecure = obj["allowInsecure"]
+        .as_bool()
+        .or_else(|| obj["insecure"].as_bool())
+        .or_else(|| {
+            obj["allowInsecure"]
+                .as_str()
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        })
+        .unwrap_or(false);
+    let pinned_cert_sha256 = obj["pcs"]
+        .as_str()
+        .or_else(|| obj["pinnedPeerCertSha256"].as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
 
     let isp = infer_isp(&name, &sni);
     let region = infer_region(&name, &address);
@@ -338,7 +361,8 @@ pub fn parse_vmess_uri(raw: &str) -> Result<ServerNode, String> {
         extra: None,
         seed: None,
         encryption,
-        allow_insecure: false,
+        allow_insecure,
+        pinned_cert_sha256,
         ping: None,
         quota_used_gb: 0.0,
         quota_total_gb: 0.0,
@@ -383,7 +407,7 @@ pub fn parse_trojan_uri(raw: &str) -> Result<ServerNode, String> {
     let name = parsed
         .fragment()
         .filter(|f| !f.is_empty())
-        .map(|f| urlencoding_decode(f))
+        .map(urlencoding_decode)
         .unwrap_or_else(|| format!("{address}:{port}"));
 
     let raw_transport = params
@@ -442,6 +466,13 @@ pub fn parse_trojan_uri(raw: &str) -> Result<ServerNode, String> {
         .or_else(|| params.get("insecure"))
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
+    let pinned_cert_sha256 = params
+        .get("pcs")
+        .or_else(|| params.get("pinsha256"))
+        .or_else(|| params.get("pinnedpeercertsha256"))
+        .cloned()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
 
     let isp = infer_isp(&name, &sni);
     let region = infer_region(&name, &address);
@@ -477,6 +508,7 @@ pub fn parse_trojan_uri(raw: &str) -> Result<ServerNode, String> {
         seed,
         encryption: None,
         allow_insecure,
+        pinned_cert_sha256,
         ping: None,
         quota_used_gb: 0.0,
         quota_total_gb: 0.0,
@@ -583,6 +615,11 @@ pub fn parse_xray_json(raw: &str) -> Result<ServerNode, String> {
         .map(String::from);
     let vcn = vcn_host.is_some()
         || stream.and_then(|s| s["vcn"].as_str()) == Some("strict");
+    let pinned_cert_sha256 = tls_settings
+        .and_then(|t| t["pinnedPeerCertSha256"].as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
 
     let isp = obj["isp"]
         .as_str()
@@ -653,6 +690,7 @@ pub fn parse_xray_json(raw: &str) -> Result<ServerNode, String> {
         allow_insecure: tls_settings
             .and_then(|t| t["allowInsecure"].as_bool())
             .unwrap_or(false),
+        pinned_cert_sha256,
         ping: None,
         quota_used_gb: 0.0,
         quota_total_gb: 0.0,
@@ -699,6 +737,8 @@ pub fn normalize_saved_node(node: &mut ServerNode) {
         node.extra = fresh.extra;
         node.seed = fresh.seed;
         node.encryption = fresh.encryption;
+        node.allow_insecure = fresh.allow_insecure;
+        node.pinned_cert_sha256 = fresh.pinned_cert_sha256;
     } else {
         if node.transport.eq_ignore_ascii_case("raw") {
             node.transport = "tcp".to_string();

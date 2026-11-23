@@ -49,6 +49,8 @@ pub struct ServerNode {
     pub encryption: Option<String>,
     #[serde(default)]
     pub allow_insecure: bool,
+    #[serde(default)]
+    pub pinned_cert_sha256: Option<String>,
     pub ping: Option<u64>,
     #[serde(rename = "quotaUsedGB")]
     pub quota_used_gb: f64,

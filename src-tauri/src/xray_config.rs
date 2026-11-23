@@ -5,12 +5,40 @@ pub const SOCKS_PORT: u16 = 10808;
 pub const HTTP_PORT: u16 = 10809;
 pub const STATS_API_PORT: u16 = 10085;
 
+#[derive(Debug, Default, Clone, Copy)]
+pub struct XrayBuildOverrides<'a> {
+    /// Pre-resolved server IPv4 used in TUN mode so Xray dials the pinned `/32`
+    /// host route directly instead of triggering an OS DNS loop through Wintun.
+    pub dial_ip_override: Option<&'a str>,
+    /// Runtime-probed leaf certificate SHA-256 hex used in place of Xray 26.x's
+    /// removed `"allowInsecure": true` option (`pinnedPeerCertSha256`).
+    pub cert_pin_override: Option<&'a str>,
+}
+
 pub fn build_xray_config(
     node: &ServerNode,
     settings: &AppSettings,
     req_socks_port: u16,
     req_http_port: u16,
     enable_api: bool,
+) -> Value {
+    build_xray_config_with_overrides(
+        node,
+        settings,
+        req_socks_port,
+        req_http_port,
+        enable_api,
+        XrayBuildOverrides::default(),
+    )
+}
+
+pub fn build_xray_config_with_overrides(
+    node: &ServerNode,
+    settings: &AppSettings,
+    req_socks_port: u16,
+    req_http_port: u16,
+    enable_api: bool,
+    overrides: XrayBuildOverrides<'_>,
 ) -> Value {
     let socks_port = if enable_api { SOCKS_PORT } else { req_socks_port };
     let http_port = if enable_api { HTTP_PORT } else { req_http_port };
@@ -40,17 +68,24 @@ pub fn build_xray_config(
         json!({ "enabled": false })
     };
 
+    let mut socks_settings = json!({
+        "auth": "noauth",
+        "udp": settings.udp_enabled,
+        "userLevel": 8
+    });
+    if settings.udp_enabled {
+        // Explicit UDP bind IP guarantees SOCKS5 UDP ASSOCIATE (used by tun2socks for DNS)
+        // returns a routable loopback address instead of 0.0.0.0 when LAN sharing is enabled.
+        socks_settings["ip"] = json!("127.0.0.1");
+    }
+
     let mut inbounds = vec![
         json!({
             "tag": "socks-in",
             "listen": listen_addr,
             "port": socks_port,
             "protocol": "socks",
-            "settings": {
-                "auth": "noauth",
-                "udp": true,
-                "userLevel": 8
-            },
+            "settings": socks_settings,
             "sniffing": sniffing_socks
         }),
         json!({
@@ -78,10 +113,16 @@ pub fn build_xray_config(
         }));
     }
 
-    let proxy_outbound = build_proxy_outbound(node, settings);
+    let security_is_tls = {
+        let s = node.tls_mode.trim().to_lowercase();
+        s.is_empty() || s == "tls" || s == "xtls"
+    };
+    let use_tls_frag = settings.tunnel_profile == "TLS Frag" && security_is_tls;
+
+    let proxy_outbound = build_proxy_outbound(node, settings, overrides, use_tls_frag);
     let mut outbounds = vec![proxy_outbound];
 
-    if settings.tunnel_profile == "TLS Frag" {
+    if use_tls_frag {
         let packets = if settings.fragment_packets.trim().is_empty() {
             "tlshello"
         } else {
@@ -189,23 +230,10 @@ pub fn build_xray_config(
             }));
         }
 
-        if settings.split_tunneling {
-            let bypassed_exes: Vec<String> = settings
-                .windows_apps
-                .iter()
-                .filter(|a| a.bypassed)
-                .map(|a| a.exe.clone())
-                .collect();
-            if !bypassed_exes.is_empty() {
-                routing_rules.push(json!({
-                    "type": "field",
-                    "process": bypassed_exes,
-                    "outboundTag": "direct"
-                }));
-            }
-        }
-
-        // Explicit final catch-all rule matching Android XrayConfigBuilder.kt
+        // Explicit final catch-all rule: forward all remaining traffic into the VPN proxy.
+        // Because domainStrategy is "AsIs", domain destinations go straight to the remote VPN
+        // server without Xray attempting direct host UDP:53 lookups (which deadlock in Windows TUN mode
+        // and fail on Sri Lanka ISP zero-rating packages).
         routing_rules.push(json!({
             "type": "field",
             "inboundTag": ["socks-in", "http-in"],
@@ -229,7 +257,7 @@ pub fn build_xray_config(
         "inbounds": inbounds,
         "outbounds": outbounds,
         "routing": {
-            "domainStrategy": "IPIfNonMatch",
+            "domainStrategy": "AsIs",
             "rules": routing_rules
         }
     });
@@ -293,15 +321,96 @@ fn build_dns_servers(settings: &AppSettings) -> Vec<Value> {
     }
 }
 
-fn build_proxy_outbound(node: &ServerNode, settings: &AppSettings) -> Value {
-    if let Some(mut raw) = node.raw_outbound.clone() {
-        raw["tag"] = json!("proxy");
-        if settings.tunnel_profile == "TLS Frag" {
-            if let Some(ss) = raw.get_mut("streamSettings") {
-                ss["sockopt"] = json!({ "dialerProxy": "fragment-out" });
+fn is_valid_domain_name(candidate: &str) -> bool {
+    let c = candidate.trim();
+    !c.is_empty() && c.parse::<std::net::IpAddr>().is_err() && !c.contains('/') && !c.contains(' ')
+}
+
+fn push_unique_domain(list: &mut Vec<String>, raw: &str) {
+    let clean = raw.trim();
+    if is_valid_domain_name(clean) && !list.iter().any(|x| x.eq_ignore_ascii_case(clean)) {
+        list.push(clean.to_string());
+    }
+}
+
+fn sanitize_raw_outbound_for_xray26(
+    mut raw: Value,
+    overrides: XrayBuildOverrides<'_>,
+    use_tls_frag: bool,
+) -> Value {
+    raw["tag"] = json!("proxy");
+
+    // Xray-core v26.x removed allowInsecure: true (exit 23); replace with pinnedPeerCertSha256 if available
+    if let Some(ss) = raw.get_mut("streamSettings") {
+        if let Some(tls) = ss.get_mut("tlsSettings").and_then(|v| v.as_object_mut()) {
+            tls.remove("allowInsecure");
+            if let Some(pin) = overrides.cert_pin_override.filter(|p| !p.trim().is_empty()) {
+                tls.insert("pinnedPeerCertSha256".to_string(), json!(pin.trim()));
+                tls.remove("verifyPeerCertByName");
             }
         }
-        return raw;
+        if ss.get("network").and_then(|v| v.as_str()) == Some("http") {
+            let path = ss
+                .get("httpSettings")
+                .and_then(|h| h.get("path"))
+                .and_then(|p| p.as_str())
+                .unwrap_or("/")
+                .to_string();
+            let host = ss
+                .get("httpSettings")
+                .and_then(|h| h.get("host"))
+                .and_then(|arr| arr.as_array())
+                .and_then(|a| a.first())
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            ss["network"] = json!("xhttp");
+            if let Some(obj) = ss.as_object_mut() {
+                obj.remove("httpSettings");
+            }
+            let mut xh = json!({ "path": path, "mode": "stream-one" });
+            if !host.is_empty() {
+                xh["host"] = json!(host);
+            }
+            ss["xhttpSettings"] = xh;
+        }
+        if use_tls_frag {
+            ss["sockopt"] = json!({ "dialerProxy": "fragment-out" });
+        }
+    }
+
+    if let Some(dial_ip) = overrides.dial_ip_override.filter(|ip| !ip.trim().is_empty()) {
+        if let Some(vnext) = raw
+            .get_mut("settings")
+            .and_then(|s| s.get_mut("vnext"))
+            .and_then(|v| v.as_array_mut())
+        {
+            if let Some(first) = vnext.first_mut() {
+                first["address"] = json!(dial_ip);
+            }
+        }
+        if let Some(servers) = raw
+            .get_mut("settings")
+            .and_then(|s| s.get_mut("servers"))
+            .and_then(|v| v.as_array_mut())
+        {
+            if let Some(first) = servers.first_mut() {
+                first["address"] = json!(dial_ip);
+            }
+        }
+    }
+
+    raw
+}
+
+fn build_proxy_outbound(
+    node: &ServerNode,
+    settings: &AppSettings,
+    overrides: XrayBuildOverrides<'_>,
+    use_tls_frag: bool,
+) -> Value {
+    if let Some(raw) = node.raw_outbound.clone() {
+        return sanitize_raw_outbound_for_xray26(raw, overrides, use_tls_frag);
     }
 
     let uri_lower = node.uri.to_lowercase();
@@ -325,7 +434,9 @@ fn build_proxy_outbound(node: &ServerNode, settings: &AppSettings) -> Value {
         }
     };
     let transport = transport_owned.as_str();
-    let stream_network = if transport == "splithttp" {
+    // Xray-core v26.x removed legacy "http" (H2) transport; migrate h2/http -> xhttp stream-one
+    let is_legacy_h2 = transport == "h2" || transport == "http";
+    let stream_network = if transport == "splithttp" || is_legacy_h2 {
         "xhttp"
     } else {
         transport
@@ -360,55 +471,83 @@ fn build_proxy_outbound(node: &ServerNode, settings: &AppSettings) -> Value {
             "spiderX": node.spider_x.clone().unwrap_or_else(|| "/".into())
         });
     } else if security == "tls" {
-        let alpn_list: Vec<String> = if let Some(alpn) = &node.alpn {
-            alpn.split(',')
+        let alpn_list: Vec<String> = if transport == "ws" || transport == "httpupgrade" {
+            // ALWAYS force http/1.1 on WebSocket & HTTPUpgrade transports to prevent HTTP/2 400
+            // upgrade rejections even if the imported URI mistakenly included alpn=h2,http/1.1.
+            vec!["http/1.1".to_string()]
+        } else if let Some(alpn) = &node.alpn {
+            let parsed: Vec<String> = alpn
+                .split(',')
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
-                .collect()
-        } else if transport == "ws" || transport == "httpupgrade" {
-            // Avoid HTTP/2 upgrade mismatch on WebSocket & HTTPUpgrade transports
-            vec!["http/1.1".to_string()]
+                .collect();
+            if parsed.is_empty() {
+                if transport == "grpc" {
+                    vec!["h2".to_string()]
+                } else {
+                    vec!["h2".to_string(), "http/1.1".to_string()]
+                }
+            } else {
+                parsed
+            }
+        } else if transport == "grpc" {
+            vec!["h2".to_string()]
         } else {
             vec!["h2".to_string(), "http/1.1".to_string()]
         };
 
-        let explicit_vcn_host = node
-            .vcn_host
-            .as_deref()
+        // Resolve certificate pin (explicit pcs= from URI OR runtime-probed leaf SHA-256 for
+        // allowInsecure=1 / self-signed / IP-only TLS nodes).
+        // IMPORTANT: NEVER emit "allowInsecure": true because Xray-core v26.11.9 removed it and
+        // hard-exits with code 23 if present!
+        let effective_pin: Option<String> = overrides
+            .cert_pin_override
             .map(str::trim)
-            .filter(|h| !h.is_empty())
-            .map(str::to_string);
-
-        // If no explicit vcn= parameter was supplied on a domain+TLS link where server address != SNI,
-        // allow either the address domain cert (e.g. direct spoofed-SNI servers) OR the SNI domain cert
-        // (e.g. CDN / Cloudflare / reverse proxies) using Xray's comma-separated verifyPeerCertByName.
-        let verify_peer_names: Option<String> = explicit_vcn_host.or_else(|| {
-            if !node.allow_insecure
-                && node.address.parse::<std::net::IpAddr>().is_err()
-                && !node.address.eq_ignore_ascii_case(effective_sni)
-            {
-                Some(format!("{},{}", node.address, effective_sni))
-            } else {
-                None
-            }
-        });
-
-        let has_vcn_pin = node.vcn && verify_peer_names.is_some();
-        let allow_insecure = if has_vcn_pin && settings.cert_pinning {
-            false
-        } else {
-            node.allow_insecure || settings.allow_insecure_fallback
-        };
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                node.pinned_cert_sha256
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            });
 
         let mut tls_obj = json!({
             "serverName": effective_sni,
-            "allowInsecure": allow_insecure,
             "fingerprint": fp,
             "alpn": alpn_list
         });
 
-        if let Some(peer_names) = verify_peer_names {
-            if settings.cert_pinning {
+        if let Some(pin_hex) = effective_pin {
+            tls_obj["pinnedPeerCertSha256"] = json!(pin_hex);
+        } else {
+            let explicit_vcn_host = node
+                .vcn_host
+                .as_deref()
+                .map(str::trim)
+                .filter(|h| !h.is_empty())
+                .map(str::to_string);
+
+            let verify_peer_names: Option<String> = explicit_vcn_host.or_else(|| {
+                let mut candidates = Vec::new();
+                push_unique_domain(&mut candidates, &node.address);
+                if let Some(h) = &node.host {
+                    push_unique_domain(&mut candidates, h);
+                }
+                push_unique_domain(&mut candidates, effective_sni);
+
+                if candidates.len() >= 2
+                    || (candidates.len() == 1
+                        && !candidates[0].eq_ignore_ascii_case(effective_sni))
+                {
+                    Some(candidates.join(","))
+                } else {
+                    None
+                }
+            });
+
+            if let Some(peer_names) = verify_peer_names {
                 tls_obj["verifyPeerCertByName"] = json!(peer_names);
             }
         }
@@ -455,9 +594,10 @@ fn build_proxy_outbound(node: &ServerNode, settings: &AppSettings) -> Value {
             stream_settings["httpupgradeSettings"] = hu;
         }
         "xhttp" => {
+            let default_mode = if is_legacy_h2 { "stream-one" } else { "auto" };
             let mut xh = json!({
                 "path": path_str,
-                "mode": node.mode.as_deref().filter(|m| !m.trim().is_empty()).unwrap_or("auto")
+                "mode": node.mode.as_deref().filter(|m| !m.trim().is_empty()).unwrap_or(default_mode)
             });
             if !host_header.is_empty() {
                 xh["host"] = json!(host_header);
@@ -468,18 +608,6 @@ fn build_proxy_outbound(node: &ServerNode, settings: &AppSettings) -> Value {
                 }
             }
             stream_settings["xhttpSettings"] = xh;
-        }
-        "h2" | "http" => {
-            stream_settings["network"] = json!("http");
-            let hosts = if host_header.is_empty() {
-                Vec::<String>::new()
-            } else {
-                vec![host_header.to_string()]
-            };
-            stream_settings["httpSettings"] = json!({
-                "path": path_str,
-                "host": hosts
-            });
         }
         "tcp" => {
             let header_t = node
@@ -546,11 +674,17 @@ fn build_proxy_outbound(node: &ServerNode, settings: &AppSettings) -> Value {
         _ => {}
     }
 
-    if settings.tunnel_profile == "TLS Frag" {
+    if use_tls_frag {
         stream_settings["sockopt"] = json!({
             "dialerProxy": "fragment-out"
         });
     }
+
+    let dial_address = overrides
+        .dial_ip_override
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(node.address.as_str());
 
     let has_vision_flow = node
         .flow
@@ -564,7 +698,7 @@ fn build_proxy_outbound(node: &ServerNode, settings: &AppSettings) -> Value {
             "protocol": "vmess",
             "settings": {
                 "vnext": [{
-                    "address": node.address,
+                    "address": dial_address,
                     "port": node.port,
                     "users": [{
                         "id": node.uuid,
@@ -582,7 +716,7 @@ fn build_proxy_outbound(node: &ServerNode, settings: &AppSettings) -> Value {
             "protocol": "trojan",
             "settings": {
                 "servers": [{
-                    "address": node.address,
+                    "address": dial_address,
                     "port": node.port,
                     "password": node.uuid,
                     "level": 8
@@ -597,7 +731,10 @@ fn build_proxy_outbound(node: &ServerNode, settings: &AppSettings) -> Value {
             "level": 8
         });
         if let Some(flow) = &node.flow {
-            if !flow.is_empty() && transport == "tcp" {
+            if !flow.is_empty()
+                && transport == "tcp"
+                && (security == "tls" || security == "reality")
+            {
                 user["flow"] = json!(flow);
             }
         }
@@ -606,7 +743,7 @@ fn build_proxy_outbound(node: &ServerNode, settings: &AppSettings) -> Value {
             "protocol": "vless",
             "settings": {
                 "vnext": [{
-                    "address": node.address,
+                    "address": dial_address,
                     "port": node.port,
                     "users": [user]
                 }]
@@ -615,7 +752,7 @@ fn build_proxy_outbound(node: &ServerNode, settings: &AppSettings) -> Value {
         })
     };
 
-    if settings.mux_enabled && !has_vision_flow {
+    if settings.mux_enabled && !has_vision_flow && stream_network != "xhttp" {
         outbound["mux"] = json!({
             "enabled": true,
             "concurrency": settings.mux_concurrency.clamp(1, 32)
@@ -641,14 +778,14 @@ mod tests {
         let cfg = build_xray_config(&node, &settings, SOCKS_PORT, HTTP_PORT, true);
         let inbounds = cfg["inbounds"].as_array().unwrap();
         assert_eq!(inbounds[0]["listen"], "0.0.0.0");
+        assert_eq!(inbounds[0]["settings"]["ip"], "127.0.0.1");
         assert_eq!(inbounds[2]["port"], STATS_API_PORT);
+        assert_eq!(cfg["routing"]["domainStrategy"], "AsIs");
 
         let proxy = &cfg["outbounds"][0];
-        assert_eq!(
-            proxy["streamSettings"]["tlsSettings"]["verifyPeerCertByName"],
-            "vpn.metrodens.site"
-        );
-        assert_eq!(proxy["streamSettings"]["tlsSettings"]["allowInsecure"], false);
+        let tls = &proxy["streamSettings"]["tlsSettings"];
+        assert_eq!(tls["verifyPeerCertByName"], "vpn.metrodens.site");
+        assert!(tls.get("allowInsecure").is_none());
     }
 
     #[test]
@@ -669,18 +806,64 @@ mod tests {
     }
 
     #[test]
-    fn test_xray_config_infers_vcn_for_spoofed_sni_domain() {
+    fn test_xray_config_infers_vcn_for_spoofed_sni_domain_and_tun_dial_ip() {
         let node = parse_vless_uri("vless://7f3bd91d-9110-45ac-aec9-304c74e49e83@vpn.metrodens.site:443?encryption=none&type=tcp&headerType=none&security=tls&fp=chrome&sni=st1.zoom.us&alpn=h2%2Chttp%2F1.1#SLT%20Fiber%20-%20Zoom%20Meet%20Max%20%2F%20Lite-SLT-FIBER-ZOOM-VIP-%40METRODENZ-122").unwrap();
         let settings = AppSettings::default();
-        let cfg = build_xray_config(&node, &settings, SOCKS_PORT, HTTP_PORT, true);
+        let cfg = build_xray_config_with_overrides(
+            &node,
+            &settings,
+            SOCKS_PORT,
+            HTTP_PORT,
+            true,
+            XrayBuildOverrides {
+                dial_ip_override: Some("185.100.10.20"),
+                cert_pin_override: None,
+            },
+        );
         let proxy = &cfg["outbounds"][0];
         let tls = &proxy["streamSettings"]["tlsSettings"];
+        assert_eq!(proxy["settings"]["vnext"][0]["address"], "185.100.10.20");
         assert_eq!(tls["serverName"], "st1.zoom.us");
         assert_eq!(tls["verifyPeerCertByName"], "vpn.metrodens.site,st1.zoom.us");
-        assert_eq!(tls["allowInsecure"], false);
+        assert!(tls.get("allowInsecure").is_none());
         assert_eq!(tls["fingerprint"], "chrome");
         assert_eq!(tls["alpn"], json!(["h2", "http/1.1"]));
         assert_eq!(proxy["streamSettings"]["network"], "tcp");
         assert_eq!(proxy["streamSettings"]["tcpSettings"]["header"]["type"], "none");
+    }
+
+    #[test]
+    fn test_xray_config_never_emits_allow_insecure_and_supports_cert_pin() {
+        let node = parse_vless_uri("vless://11111111-2222-3333-4444-555555555555@170.114.52.22:443?type=ws&host=zoom.metrodens.site&path=%2F&security=tls&sni=zoom.metrodens.site&alpn=h2,http/1.1&allowInsecure=1#CF-WS").unwrap();
+        let settings = AppSettings::default();
+        let cfg = build_xray_config_with_overrides(
+            &node,
+            &settings,
+            SOCKS_PORT,
+            HTTP_PORT,
+            true,
+            XrayBuildOverrides {
+                dial_ip_override: None,
+                cert_pin_override: Some("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"),
+            },
+        );
+        let tls = &cfg["outbounds"][0]["streamSettings"]["tlsSettings"];
+        assert!(tls.get("allowInsecure").is_none());
+        assert_eq!(
+            tls["pinnedPeerCertSha256"],
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+        );
+        assert_eq!(tls["alpn"], json!(["http/1.1"]));
+    }
+
+    #[test]
+    fn test_xray_config_migrates_h2_to_xhttp_stream_one() {
+        let node = parse_vless_uri("vless://11111111-2222-3333-4444-555555555555@vpn.metrodens.site:443?type=h2&path=%2Fh2&security=tls&sni=vpn.metrodens.site#H2-Node").unwrap();
+        let settings = AppSettings::default();
+        let cfg = build_xray_config(&node, &settings, SOCKS_PORT, HTTP_PORT, true);
+        let ss = &cfg["outbounds"][0]["streamSettings"];
+        assert_eq!(ss["network"], "xhttp");
+        assert_eq!(ss["xhttpSettings"]["mode"], "stream-one");
+        assert_eq!(ss["xhttpSettings"]["path"], "/h2");
     }
 }

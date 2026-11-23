@@ -2227,7 +2227,7 @@ dependencies = [
 
 [[package]]
 name = "metrovpn"
-version = "2.7.3"
+version = "2.7.4"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -2239,8 +2239,10 @@ dependencies = [
  "image",
  "reqwest 0.12.28",
  "rqrr",
+ "rustls",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tauri",
  "tauri-build",
  "tauri-plugin-autostart",
@@ -2249,6 +2251,7 @@ dependencies = [
  "tauri-plugin-shell",
  "tauri-plugin-store",
  "tokio",
+ "tokio-rustls",
  "url",
  "uuid",
  "windows-sys 0.59.0",

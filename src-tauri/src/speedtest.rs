@@ -1,6 +1,7 @@
 use crate::models::{SpeedTestHistoryEntry, SpeedTestProgress};
+use crate::tls_probe::resolve_cert_pin_for_node;
 use crate::vpn_manager::{resolve_resource_dir, resolve_sidecar_path, AppState};
-use crate::xray_config::build_xray_config;
+use crate::xray_config::{build_xray_config_with_overrides, XrayBuildOverrides};
 use chrono::Local;
 use futures_util::StreamExt;
 use std::process::{Child, Command, Stdio};
@@ -74,7 +75,18 @@ pub async fn run_speed_test(
             .and_then(|l| l.local_addr().ok())
             .map(|a| a.port())
             .unwrap_or(10819);
-        let cfg = build_xray_config(&target_node, &settings, test_socks, test_http, false);
+        let cert_pin = resolve_cert_pin_for_node(&target_node, &settings, None).await;
+        let cfg = build_xray_config_with_overrides(
+            &target_node,
+            &settings,
+            test_socks,
+            test_http,
+            false,
+            XrayBuildOverrides {
+                dial_ip_override: None,
+                cert_pin_override: cert_pin.as_deref(),
+            },
+        );
         let cfg_path = app_data_dir.join("xray-speedtest.json");
         let json = serde_json::to_string_pretty(&cfg)
             .map_err(|e| format!("Failed to serialize speedtest config: {e}"))?;
@@ -93,18 +105,28 @@ pub async fn run_speed_test(
             use std::os::windows::process::CommandExt;
             cmd.creation_flags(crate::network_win::CREATE_NO_WINDOW);
         }
-        let child = cmd
+        let mut child = cmd
             .spawn()
             .map_err(|e| format!("Failed to start temporary Xray speedtest core: {e}"))?;
 
-        for _ in 0..20 {
+        let mut ready = false;
+        for _ in 0..40 {
+            if let Ok(Some(status)) = child.try_wait() {
+                return Err(format!("Temporary Xray speedtest core exited early ({status})"));
+            }
             if tokio::net::TcpStream::connect(("127.0.0.1", test_socks))
                 .await
                 .is_ok()
             {
+                ready = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(60)).await;
+        }
+        if !ready {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("Temporary Xray speedtest core timed out opening local SOCKS5 port".into());
         }
         (TempXrayGuard(Some(child)), test_socks)
     };

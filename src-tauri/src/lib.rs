@@ -3,6 +3,7 @@ pub mod network_win;
 pub mod parser;
 pub mod ping;
 pub mod speedtest;
+pub mod tls_probe;
 pub mod vpn_manager;
 pub mod xray_config;
 pub mod xray_stats;
@@ -20,7 +21,7 @@ use vpn_manager::{
     quit_app, reconnect_active, refresh_local_ip, reset_settings, restart_as_admin,
     scan_screen_qr, scan_windows_apps, start_screen_snip, sync_all_quotas,
     sync_all_quotas_internal, sync_node_quota, toggle_star, update_all_subscriptions,
-    update_server, update_settings, AppState,
+    update_server, update_settings, verify_tunnel, AppState,
 };
 
 fn toggle_tray_flyout(app: &tauri::AppHandle) {
@@ -289,6 +290,7 @@ pub fn run() {
             connect_server,
             disconnect,
             reconnect_active,
+            verify_tunnel,
             get_status,
             get_settings,
             update_settings,

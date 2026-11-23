@@ -1,6 +1,7 @@
 use crate::models::{AppSettings, PingResult, ServerNode};
+use crate::tls_probe::resolve_cert_pin_for_node;
 use crate::vpn_manager::{resolve_resource_dir, resolve_sidecar_path, AppState};
-use crate::xray_config::build_xray_config;
+use crate::xray_config::{build_xray_config_with_overrides, XrayBuildOverrides};
 use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -40,7 +41,18 @@ async fn measure_http_204_ping(
     settings: &AppSettings,
 ) -> Option<u64> {
     let (socks_port, http_port) = find_two_free_ports()?;
-    let cfg = build_xray_config(node, settings, socks_port, http_port, false);
+    let cert_pin = resolve_cert_pin_for_node(node, settings, None).await;
+    let cfg = build_xray_config_with_overrides(
+        node,
+        settings,
+        socks_port,
+        http_port,
+        false,
+        XrayBuildOverrides {
+            dial_ip_override: None,
+            cert_pin_override: cert_pin.as_deref(),
+        },
+    );
     let cfg_path = app_data_dir.join(format!("ping-{}.json", Uuid::new_v4().simple()));
     let json = serde_json::to_string(&cfg).ok()?;
     std::fs::write(&cfg_path, json).ok()?;
@@ -58,11 +70,16 @@ async fn measure_http_204_ping(
 
     let child = cmd.spawn().ok()?;
     let guard_path = cfg_path.clone();
-    let _guard = TempPingXrayGuard(Some(child), guard_path);
+    let mut guard = TempPingXrayGuard(Some(child), guard_path);
 
-    // Wait briefly until local test SOCKS5 port accepts connections (up to 900ms)
+    // Wait up to 2500ms (accounting for Windows Defender cold scans) with early-exit bailout
     let mut ready = false;
-    for _ in 0..18 {
+    for _ in 0..50 {
+        if let Some(ref mut c) = guard.0 {
+            if matches!(c.try_wait(), Ok(Some(_))) {
+                return None;
+            }
+        }
         if TcpStream::connect(("127.0.0.1", socks_port)).await.is_ok() {
             ready = true;
             break;

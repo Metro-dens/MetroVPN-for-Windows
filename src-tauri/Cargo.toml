@@ -1,6 +1,6 @@
 [package]
 name = "metrovpn"
-version = "2.7.3"
+version = "2.7.4"
 description = "Metrovpn Desktop — High-contrast Crimson Void VPN client powered by Xray-core"
 authors = ["Metro Dens"]
 edition = "2021"
@@ -30,6 +30,9 @@ serde_json = "1"
 url = "2"
 base64 = "0.22"
 reqwest = { version = "0.12", default-features = false, features = ["socks", "rustls-tls", "stream", "json"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+sha2 = "0.10"
 futures-util = "0.3"
 h2 = "0.4"
 http = "1"

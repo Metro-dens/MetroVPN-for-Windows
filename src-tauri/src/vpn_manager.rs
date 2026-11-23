@@ -12,7 +12,10 @@ use crate::network_win::{
 use crate::parser::{
     decode_qr_from_bytes, decode_qr_from_rgba, fetch_subscription, normalize_saved_node, parse_any,
 };
-use crate::xray_config::{build_xray_config, HTTP_PORT, SOCKS_PORT, STATS_API_PORT};
+use crate::tls_probe::{node_needs_auto_cert_pin, resolve_cert_pin_for_node};
+use crate::xray_config::{
+    build_xray_config_with_overrides, XrayBuildOverrides, HTTP_PORT, SOCKS_PORT, STATS_API_PORT,
+};
 use crate::xray_stats::query_xray_stats;
 use base64::engine::general_purpose::STANDARD as BASE64_STD;
 use base64::Engine as _;
@@ -291,16 +294,35 @@ fn ensure_standalone_core(app_data_dir: &Path) {
         ("geosite.dat", include_bytes!("../embedded/geosite.dat.gz")),
     ];
 
+    let version_stamp_path = core_dir.join(".core-version");
+    let current_ver = env!("CARGO_PKG_VERSION");
+    let needs_upgrade = std::fs::read_to_string(&version_stamp_path)
+        .map(|v| v.trim() != current_ver)
+        .unwrap_or(true);
+
+    if needs_upgrade {
+        kill_stale_core_processes();
+    }
+
+    let mut all_ok = true;
     for (name, gz_bytes) in embedded {
         let dest = core_dir.join(name);
-        if dest.exists() {
+        if !needs_upgrade && dest.exists() {
             continue;
         }
         let mut decoder = GzDecoder::new(*gz_bytes);
         let mut out = Vec::new();
         if decoder.read_to_end(&mut out).is_ok() {
-            let _ = std::fs::write(&dest, out);
+            if std::fs::write(&dest, out).is_err() {
+                all_ok = false;
+            }
+        } else {
+            all_ok = false;
         }
+    }
+
+    if all_ok {
+        let _ = std::fs::write(&version_stamp_path, current_ver);
     }
 }
 
@@ -469,28 +491,95 @@ pub async fn connect_internal(
     let socks_port = SOCKS_PORT;
     let http_port = HTTP_PORT;
 
-    // Build and write runtime Xray config.json
-    let mut runtime_cfg = build_xray_config(&node, &settings, socks_port, http_port, true);
-
-    // Pre-resolve server domain IPv4s ONCE for both Xray dns.hosts and Windows gateway route pinning
+    // Pre-resolve server domain IPv4s ONCE before starting Xray or modifying Windows routes.
+    // In TUN mode, passing the resolved IPv4 directly as vnext[0].address eliminates any
+    // Windows OS DNS lookup loop while preserving the domain in SNI/VCN/Host headers.
     let pre_resolved_ipv4s: Vec<String> = if node.address.parse::<IpAddr>().is_err() {
-        std::net::ToSocketAddrs::to_socket_addrs(&(node.address.as_str(), node.port))
-            .map(|addrs| {
-                let mut ips = Vec::new();
-                for addr in addrs {
-                    if let SocketAddr::V4(v4) = addr {
-                        let ip = v4.ip().to_string();
-                        if !ips.contains(&ip) {
-                            ips.push(ip);
+        let addr_clone = node.address.clone();
+        let port = node.port;
+        tokio::task::spawn_blocking(move || {
+            std::net::ToSocketAddrs::to_socket_addrs(&(addr_clone.as_str(), port))
+                .map(|addrs| {
+                    let mut ips = Vec::new();
+                    for addr in addrs {
+                        if let SocketAddr::V4(v4) = addr {
+                            let ip = v4.ip().to_string();
+                            if !ips.contains(&ip) {
+                                ips.push(ip);
+                            }
                         }
                     }
-                }
-                ips
-            })
-            .unwrap_or_default()
+                    ips
+                })
+                .unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default()
     } else {
         vec![node.address.clone()]
     };
+
+    let dial_ip_override: Option<&str> = if mode_norm == "TUN"
+        && node.address.parse::<IpAddr>().is_err()
+        && !pre_resolved_ipv4s.is_empty()
+    {
+        Some(pre_resolved_ipv4s[0].as_str())
+    } else {
+        None
+    };
+
+    if let Some(resolved_ip) = dial_ip_override {
+        state.push_log(
+            Some(&app),
+            "DNS",
+            &format!("Pre-resolved {} -> {} for direct TUN dial", node.address, resolved_ip),
+        );
+    }
+
+    // Xray-core v26.11.9 removed "allowInsecure": true (exit 23). When a node requests
+    // allowInsecure=1, Allow Insecure Fallback, or IP-only TLS without VCN, probe the
+    // server's leaf X.509 SHA-256 over TLS and emit pinnedPeerCertSha256 instead.
+    let cert_pin_override = if node_needs_auto_cert_pin(&node, &settings) {
+        state.push_log(
+            Some(&app),
+            "TLS",
+            "Probing server leaf certificate SHA-256 for Xray v26.11.9 pinnedPeerCertSha256...",
+        );
+        match resolve_cert_pin_for_node(&node, &settings, dial_ip_override).await {
+            Some(pin) => {
+                let short_pin = &pin[..pin.len().min(16)];
+                state.push_log(
+                    Some(&app),
+                    "TLS",
+                    &format!("Pinned server leaf certificate SHA-256 ({short_pin}...)"),
+                );
+                Some(pin)
+            }
+            None => {
+                state.push_log(
+                    Some(&app),
+                    "Warning",
+                    "TLS leaf certificate probe did not respond; continuing with standard TLS verification",
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Build and write runtime Xray config.json
+    let mut runtime_cfg = build_xray_config_with_overrides(
+        &node,
+        &settings,
+        socks_port,
+        http_port,
+        true,
+        XrayBuildOverrides {
+            dial_ip_override,
+            cert_pin_override: cert_pin_override.as_deref(),
+        },
+    );
 
     if mode_norm == "TUN" && node.address.parse::<IpAddr>().is_err() && !pre_resolved_ipv4s.is_empty() {
         if let Some(dns_obj) = runtime_cfg.get_mut("dns").and_then(|d| d.as_object_mut()) {
@@ -519,6 +608,12 @@ pub async fn connect_internal(
     };
     let res_dir = resolve_resource_dir(&app);
 
+    let log_count_before = state
+        .inner
+        .lock()
+        .map(|g| g.logs.len())
+        .unwrap_or(0);
+
     let cfg_str = config_path.to_string_lossy().to_string();
     let mut xray_child =
         match spawn_hidden_process(&xray_bin, &["run", "-c", &cfg_str], Some(&app_data_dir), Some(&res_dir)) {
@@ -535,11 +630,27 @@ pub async fn connect_internal(
 
     pipe_child_logs(&mut xray_child, app.clone(), state.clone(), "");
 
-    // Wait up to 1800ms for Xray to bind local SOCKS5 (10808) & HTTP (10809) ports and verify it didn't exit early
+    // Wait up to 2500ms for Xray to bind local SOCKS5 (10808) & HTTP (10809) ports and verify it didn't exit early
     let mut xray_ready = false;
-    for _ in 0..36 {
+    for _ in 0..50 {
         if let Ok(Some(exit_status)) = xray_child.try_wait() {
-            let msg = format!("Xray-core exited prematurely ({exit_status})");
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            let last_xray_err = state.inner.lock().ok().and_then(|g| {
+                g.logs
+                    .iter()
+                    .skip(log_count_before)
+                    .rev()
+                    .find(|l| {
+                        let lc = l.msg.to_lowercase();
+                        lc.contains("failed") || lc.contains("error") || lc.contains("invalid")
+                    })
+                    .or_else(|| g.logs.back())
+                    .map(|l| l.msg.clone())
+            });
+            let msg = match last_xray_err {
+                Some(detail) => format!("Xray-core exited ({exit_status}): {detail}"),
+                None => format!("Xray-core exited prematurely ({exit_status})"),
+            };
             if let Ok(mut g) = state.inner.lock() {
                 g.status = "Error".into();
                 g.error_message = Some(msg.clone());
@@ -723,6 +834,69 @@ pub async fn connect_internal(
     send_windows_connected_notification(&node.name, &mode_norm);
     spawn_telemetry_loop(app.clone(), state.clone(), gen);
 
+    // Post-connect real traffic verification (detects silent TLS/x509/UUID/ISP blocks immediately)
+    let app_v = app.clone();
+    let state_v = state.clone();
+    let test_url = settings.latency_test_url.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        let still_same_gen = state_v
+            .inner
+            .lock()
+            .map(|g| g.telemetry_generation == gen && g.status == "Connected")
+            .unwrap_or(false);
+        if !still_same_gen {
+            return;
+        }
+        match verify_tunnel_probe(&test_url).await {
+            Ok(ms) => {
+                state_v.push_log(
+                    Some(&app_v),
+                    "VCN",
+                    &format!("Live TLS tunnel verified OK (HTTP 204 in {ms} ms)"),
+                );
+            }
+            Err(probe_err) => {
+                // Inspect recent Xray stderr logs to surface exact TLS/x509 cause
+                let tls_hint = state_v.inner.lock().ok().and_then(|g| {
+                    g.logs.iter().rev().take(25).find_map(|l| {
+                        let lc = l.msg.to_lowercase();
+                        if lc.contains("peer cert is invalid")
+                            || lc.contains("x509:")
+                            || lc.contains("failed to verify certificate")
+                            || lc.contains("certificate is valid for")
+                        {
+                            Some("TLS certificate mismatch — enable 'Allow Insecure Fallback' in Settings or verify VCN host".to_string())
+                        } else if lc.contains("remote error: tls:") || lc.contains("tls: ") {
+                            Some(format!("TLS handshake error: {}", l.msg))
+                        } else if lc.contains("invalid user") || lc.contains("rejected") {
+                            Some(format!("Server rejected credentials: {}", l.msg))
+                        } else {
+                            None
+                        }
+                    })
+                });
+                let diag = tls_hint.unwrap_or_else(|| {
+                    format!("Tunnel check warning ({probe_err}) — open Logs for details")
+                });
+                state_v.push_log(Some(&app_v), "Warning", &diag);
+                let should_emit = if let Ok(mut g) = state_v.inner.lock() {
+                    if g.telemetry_generation == gen && g.status == "Connected" {
+                        g.error_message = Some(diag);
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if should_emit {
+                    emit_status(&app_v, &state_v);
+                }
+            }
+        }
+    });
+
     // Automatically sync 3x-ui inbound client quota for ALL VLESS nodes 500ms after tunnel is up
     let app_q = app.clone();
     let state_q = state.clone();
@@ -740,6 +914,58 @@ pub async fn connect_internal(
         elapsed_secs: 0,
         local_lan_ip: get_active_lan_ipv4(),
     })
+}
+
+async fn verify_tunnel_probe(test_url_raw: &str) -> Result<u64, String> {
+    let url = if test_url_raw.trim().is_empty() {
+        "https://www.gstatic.com/generate_204"
+    } else {
+        test_url_raw.trim()
+    };
+    let proxy = reqwest::Proxy::all(format!("socks5h://127.0.0.1:{SOCKS_PORT}"))
+        .map_err(|e| format!("SOCKS5 proxy error: {e}"))?;
+    let client = reqwest::Client::builder()
+        .proxy(proxy)
+        .timeout(Duration::from_secs(6))
+        .build()
+        .map_err(|e| format!("HTTP client error: {e}"))?;
+
+    let start = Instant::now();
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("{e}"))?;
+    let code = resp.status().as_u16();
+    if code == 204 || (200..400).contains(&code) {
+        Ok(start.elapsed().as_millis().max(1) as u64)
+    } else {
+        Err(format!("HTTP {code}"))
+    }
+}
+
+#[tauri::command]
+pub async fn verify_tunnel(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<u64, String> {
+    let (is_connected, test_url) = {
+        let guard = state.inner.lock().map_err(|_| "State lock poisoned")?;
+        (
+            guard.status == "Connected",
+            guard.store.settings.latency_test_url.clone(),
+        )
+    };
+    if !is_connected {
+        return Err("VPN is not connected".into());
+    }
+    let ms = verify_tunnel_probe(&test_url).await?;
+    state.push_log(
+        Some(&app),
+        "VCN",
+        &format!("Manual tunnel self-test passed (HTTP 204 in {ms} ms)"),
+    );
+    Ok(ms)
 }
 
 fn spawn_telemetry_loop(app: AppHandle, state: AppState, generation: u64) {
@@ -796,7 +1022,7 @@ fn spawn_telemetry_loop(app: AppHandle, state: AppState, generation: u64) {
                         quota_now = Some(node.quota_used_gb);
                     }
                 }
-                if delta_bytes > 0 && ticks % 10 == 0 {
+                if delta_bytes > 0 && ticks.is_multiple_of(10) {
                     save_store(&guard.store_path, &guard.store);
                 }
                 quota_now
@@ -805,7 +1031,7 @@ fn spawn_telemetry_loop(app: AppHandle, state: AppState, generation: u64) {
             };
 
             // Re-sync 3x-ui server quotas across ALL nodes every 45 seconds while connected
-            if ticks % 45 == 0 {
+            if ticks.is_multiple_of(45) {
                 let app_c = app.clone();
                 let st_c = state.clone();
                 tauri::async_runtime::spawn(async move {
@@ -984,9 +1210,9 @@ pub async fn update_server(
         .iter_mut()
         .find(|s| s.id == id)
         .ok_or_else(|| "Server not found".to_string())?;
-    node.name = name;
-    node.isp = isp;
-    node.sni = sni;
+    node.name = name.trim().to_string();
+    node.isp = isp.trim().to_string();
+    node.sni = sni.trim().to_string();
     let updated = node.clone();
     save_store(&guard.store_path, &guard.store);
     Ok(updated)
@@ -1133,9 +1359,11 @@ pub async fn reset_settings(
         let mut guard = state.inner.lock().map_err(|_| "State lock poisoned")?;
         let active_id = guard.store.settings.active_node_id.clone();
         let onboarding_done = guard.store.settings.onboarding_completed;
-        let mut defaults = AppSettings::default();
-        defaults.active_node_id = active_id;
-        defaults.onboarding_completed = onboarding_done;
+        let defaults = AppSettings {
+            active_node_id: active_id,
+            onboarding_completed: onboarding_done,
+            ..AppSettings::default()
+        };
         guard.store.settings = defaults.clone();
         save_store(&guard.store_path, &guard.store);
         defaults
@@ -1840,11 +2068,10 @@ pub async fn download_and_install_update(
                         break;
                     }
                     downloaded += chunk.len() as u64;
-                    let pct = if total_bytes > 0 {
-                        ((downloaded * 100) / total_bytes).min(100) as u8
-                    } else {
-                        ((downloaded / (1024 * 350)).min(95) as u8).max(5)
-                    };
+                    let pct = (downloaded.saturating_mul(100))
+                        .checked_div(total_bytes)
+                        .map(|p| p.min(100) as u8)
+                        .unwrap_or_else(|| ((downloaded / (1024 * 350)).min(95) as u8).max(5));
                     if pct != last_pct || last_emit.elapsed() >= Duration::from_millis(200) {
                         last_pct = pct;
                         last_emit = Instant::now();

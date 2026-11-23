@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: "Release tag to create (e.g. v2.7.3)"
+        description: "Release tag to create (e.g. v2.7.4)"
         required: true
-        default: "v2.7.3"
+        default: "v2.7.4"
         type: string
       draft:
         description: "Create as a draft release (hidden until published)"
@@ -72,16 +72,16 @@ jobs:
             ### Downloads
             - **`Metrovpn_*_x64-setup.exe`** — Recommended NSIS Windows Installer (desktop/Start Menu shortcuts, WebView2 runtime check, clean uninstaller).
             - **`Metrovpn_*_x64_en-US.msi`** — WiX Windows Installer package.
-            - **`Metrovpn-standalone-x64.exe`** — Single-file portable executable (auto-extracts `xray.exe`, `tun2socks.exe`, `wintun.dll`, `geoip.dat`, and `geosite.dat` to `%AppData%\site.metrodens.metrovpn\core\` on first launch).
+            - **`Metrovpn-standalone-x64.exe`** — Single-file portable executable (auto-extracts & version-upgrades `xray.exe`, `tun2socks.exe`, `wintun.dll`, `geoip.dat`, and `geosite.dat` in `%AppData%\site.metrodens.metrovpn\core\`).
             - **`Metrovpn-windows-x64-portable.zip`** — Portable folder archive with all binaries side-by-side.
             - **`SHA256SUMS.txt`** — SHA-256 verification checksums (`Get-FileHash <file> -Algorithm SHA256`).
 
-            ### What's New in v2.7.3
-            - **Native Windows Notification Only on Connect:** Removed all annoying floating in-app toast popups; displays a single clean Windows notification when the VPN tunnel connects.
-            - **Manual Connect After Adding Configs:** Replaced **Add & Connect** with **Add** in both URI import and QR scan so you connect manually whenever ready.
-            - **Servers Tab Overlap & Active Indicator Fix:** Fixed dropdown menu z-index stacking behind sibling glass cards, clearly highlights the **CONNECTED** server in emerald, and displays exact protocol types (`TCP+TLS`, `TCP+TLS+VCN`, `WS+TLS`, `gRPC+TLS`, `XHTTP+TLS`, `HTTPUpgrade+TLS`, `TCP+REALITY`, Trojan, VMess).
-            - **Full Non-VCN Support + Multi-IP TUN Fix:** Fixed TLS certificate verification (`verifyPeerCertByName` comma-list support for domain + SNI/CDN certs), added XHTTP/HTTPUpgrade/H2/mKCP/TCP-HTTP/gRPC-multi/Trojan support, and synchronized TUN DNS hosts with Windows gateway routes.
-            - **Automatic Quota Sync Across Every VLESS Node:** Concurrently auto-syncs 3x-ui data quota for all servers on launch, connect, Servers tab open, and periodically in the background.
+            ### What's New in v2.7.4 (Critical TLS & Windows TUN Fix)
+            - **Fixed Xray-core v26.11.9 TLS Crash (`allowInsecure` Removal):** Upstream Xray-core v26.x removed `"allowInsecure": true` (causing instant exit code 23 crashes). Metrovpn now omits `allowInsecure`, parses `pcs=`/`pinsha256=`, and automatically probes the server's leaf X.509 SHA-256 over TLS (`pinnedPeerCertSha256`) for `allowInsecure=1`, Allow Insecure Fallback, and IP-only TLS links across Connect, Ping, and Speed Test.
+            - **Fixed Windows TUN Mode DNS & Routing Deadlocks:** Pre-resolves domain servers to direct IPv4s in TUN mode (preserving SNI/VCN/Host), switches Xray routing `domainStrategy` to `AsIs` (preventing local UDP:53 loops on Windows TUN and Sri Lanka ISP zero-rating packages), binds `socks-in` UDP IP explicitly for `tun2socks` DNS, uses Win32 `GetBestRoute` + interface-index pinning (Wi-Fi/Ethernet/PPPoE/USB tethering/WSL safe), sets `Metrovpn-TUN` `metric=1`, and checks route command exit statuses.
+            - **Fixed Protocol & Transport Edge Cases:** Forces `alpn: ["http/1.1"]` on WebSocket & HTTPUpgrade (preventing HTTP/2 400 rejections), migrates removed legacy `h2`/`http` transport to `xhttp` (`stream-one`), includes `host` in `verifyPeerCertByName` candidates, and guards `flow` / `TLS Frag` / `mux`.
+            - **Live Post-Connect TLS Tunnel Verification & Diagnostics:** Automatically verifies HTTP 204 over the active tunnel and surfaces exact `x509`/TLS/Xray errors with a 1-click **Logs** button on the Home screen.
+            - **Fixed Standalone `.exe` Core Upgrades + Full Lint/Audit Pass:** Version-stamps `%AppData%\...\core\.core-version` so upgrading `Metrovpn-standalone-x64.exe` always updates bundled core binaries; 0 Rust Clippy warnings (`-D warnings`) and 0 ESLint errors.
 
             > **SmartScreen Note:** If Windows Defender SmartScreen prompts on an unsigned build, verify the SHA-256 checksum against `SHA256SUMS.txt` and click **More info → Run anyway**.
           releaseDraft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft || false }}

@@ -48,6 +48,7 @@ mod win_impl {
         GetDIBits, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
         SRCCOPY,
     };
+    use windows_sys::Win32::NetworkManagement::IpHelper::{GetBestRoute, MIB_IPFORWARDROW};
     use windows_sys::Win32::Networking::WinInet::{
         InternetSetOptionW, INTERNET_OPTION_REFRESH, INTERNET_OPTION_SETTINGS_CHANGED,
     };
@@ -203,7 +204,7 @@ mod win_impl {
         let attempts = if is_relaunch { 30 } else { 1 };
         for _ in 0..attempts {
             let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
-            if handle != std::ptr::null_mut() {
+            if !handle.is_null() {
                 let err = unsafe { GetLastError() };
                 if err != ERROR_ALREADY_EXISTS {
                     let _ = SINGLE_INSTANCE_HANDLE.set(handle as isize);
@@ -221,7 +222,7 @@ mod win_impl {
         let title = to_wide("Metrovpn");
         unsafe {
             let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
-            if hwnd != std::ptr::null_mut() {
+            if !hwnd.is_null() {
                 ShowWindow(hwnd, SW_RESTORE);
                 SetForegroundWindow(hwnd);
             }
@@ -262,6 +263,60 @@ mod win_impl {
             .output();
     }
 
+    fn query_best_physical_route(target_ipv4: Option<&str>) -> Option<(String, u32)> {
+        let dst_ip: std::net::Ipv4Addr = target_ipv4
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| std::net::Ipv4Addr::new(1, 1, 1, 1));
+        let dst_u32 = u32::from_ne_bytes(dst_ip.octets());
+        let mut row: MIB_IPFORWARDROW = unsafe { std::mem::zeroed() };
+        let rc = unsafe { GetBestRoute(dst_u32, 0, &mut row) };
+        if rc == 0 && row.dwForwardIfIndex > 0 {
+            let gw_ip = std::net::Ipv4Addr::from(row.dwForwardNextHop.to_ne_bytes());
+            let gw_str = gw_ip.to_string();
+            if gw_str != "198.18.0.2" {
+                return Some((gw_str, row.dwForwardIfIndex));
+            }
+        }
+        None
+    }
+
+    fn lookup_interface_index_by_alias(alias: &str) -> Option<u32> {
+        let out = Command::new("netsh")
+            .args(["interface", "ipv4", "show", "interfaces"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.ends_with(alias) {
+                if let Some(first_tok) = trimmed.split_whitespace().next() {
+                    if let Ok(idx) = first_tok.parse::<u32>() {
+                        if idx > 0 {
+                            return Some(idx);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn run_route_checked(args: &[&str], label: &str) -> Result<(), String> {
+        let out = Command::new("route")
+            .args(args)
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map_err(|e| format!("Failed to invoke route ({label}): {e}"))?;
+        if out.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let detail = if !stderr.is_empty() { stderr } else { stdout };
+        Err(format!("Windows route command failed ({label}): {detail}"))
+    }
+
     pub fn configure_tun_interface(
         interface_name: &str,
         server_host: &str,
@@ -273,21 +328,35 @@ mod win_impl {
         // Clean up any leftover TUN routes before querying physical default gateway
         teardown_tun_routes(&[]);
 
-        // Resolve physical default gateway before adding split default route
-        let gw_output = Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' | Where-Object { $_.NextHop -ne '0.0.0.0' -and $_.NextHop -ne '198.18.0.2' -and $_.InterfaceAlias -ne 'Metrovpn-TUN' } | Sort-Object RouteMetric | Select-Object -First 1).NextHop",
-            ])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-            .map_err(|e| format!("Failed to query default gateway: {e}"))?;
-        let mut orig_gw = String::from_utf8_lossy(&gw_output.stdout).trim().to_string();
+        // 1. Instant, adapter-accurate Win32 GetBestRoute lookup (handles Wi-Fi, Ethernet, PPPoE,
+        //    USB Tethering, Cellular WWAN, and Hyper-V/WSL/Docker virtual adapters accurately).
+        let first_server_ip = pre_resolved_ips.first().map(|s| s.as_str());
+        let (mut orig_gw, mut orig_if_idx) = match query_best_physical_route(first_server_ip) {
+            Some((gw, if_idx)) => (gw, Some(if_idx)),
+            None => (String::new(), None),
+        };
+
+        // Fallback via PowerShell sorted by combined RouteMetric + InterfaceMetric
+        if orig_gw.is_empty() {
+            if let Ok(gw_output) = Command::new("powershell")
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "$r = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' | Where-Object { $_.NextHop -ne '198.18.0.2' -and $_.InterfaceAlias -ne 'Metrovpn-TUN' } | Sort-Object { $_.RouteMetric + $_.InterfaceMetric } | Select-Object -First 1; if ($r) { \"$($r.NextHop)|$($r.ifIndex)\" }",
+                ])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output()
+            {
+                let text = String::from_utf8_lossy(&gw_output.stdout).trim().to_string();
+                if let Some((gw, idx_str)) = text.split_once('|') {
+                    orig_gw = gw.trim().to_string();
+                    orig_if_idx = idx_str.trim().parse::<u32>().ok();
+                }
+            }
+        }
 
         if orig_gw.is_empty() {
-            // Fast fallback via `route print 0.0.0.0` in case PowerShell Get-NetRoute is slow or restricted
             if let Ok(rp) = Command::new("route")
                 .args(["print", "0.0.0.0"])
                 .creation_flags(CREATE_NO_WINDOW)
@@ -298,7 +367,7 @@ mod win_impl {
                     let parts: Vec<&str> = line.split_whitespace().collect();
                     if parts.len() >= 4 && parts[0] == "0.0.0.0" && parts[1] == "0.0.0.0" {
                         let gw = parts[2];
-                        if gw != "0.0.0.0" && gw != "198.18.0.2" && gw.contains('.') {
+                        if gw != "198.18.0.2" && gw.contains('.') {
                             orig_gw = gw.to_string();
                             break;
                         }
@@ -307,9 +376,9 @@ mod win_impl {
             }
         }
 
-        // Poll up to 10 times (2.5s total) for Wintun adapter to finish registering in Windows TCP/IP stack
+        // Poll up to 12 times (3.0s total) for Wintun adapter to finish registering in Windows TCP/IP stack
         let mut addr_assigned = false;
-        for _ in 0..10 {
+        for _ in 0..12 {
             if let Ok(out) = Command::new("netsh")
                 .args([
                     "interface",
@@ -336,6 +405,21 @@ mod win_impl {
         if !addr_assigned {
             return Err("Wintun virtual adapter 'Metrovpn-TUN' did not come online in time".into());
         }
+
+        // Give Metrovpn-TUN highest priority (metric=1) so Windows sends DNS queries through the tunnel
+        // instead of leaking to the physical ISP adapter via Smart Multi-Homed Name Resolution.
+        let _ = Command::new("netsh")
+            .args([
+                "interface",
+                "ipv4",
+                "set",
+                "interface",
+                &format!("interface={interface_name}"),
+                "metric=1",
+                "store=active",
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
 
         let _ = Command::new("netsh")
             .args([
@@ -364,71 +448,104 @@ mod win_impl {
             .creation_flags(CREATE_NO_WINDOW)
             .output();
 
-        // Pin direct host routes for ALL pre-resolved server IPv4s so TUN traffic never loops
-        let mut pinned_ips = Vec::new();
-        if !orig_gw.is_empty() {
-            for ip in pre_resolved_ips {
-                let clean = ip.trim();
-                if !clean.is_empty() && !pinned_ips.iter().any(|x| x == clean) {
-                    let _ = Command::new("route")
-                        .args(["add", clean, "mask", "255.255.255.255", &orig_gw, "metric", "1"])
-                        .creation_flags(CREATE_NO_WINDOW)
-                        .output();
-                    pinned_ips.push(clean.to_string());
-                }
+        // Collect all server IPv4s to pin directly via physical gateway + interface index
+        let mut target_ips: Vec<String> = Vec::new();
+        for ip in pre_resolved_ips {
+            let clean = ip.trim();
+            if !clean.is_empty() && !target_ips.iter().any(|x| x == clean) {
+                target_ips.push(clean.to_string());
             }
-            if pinned_ips.is_empty() {
-                if let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&(server_host, server_port)) {
-                    for addr in addrs {
-                        if let std::net::SocketAddr::V4(v4) = addr {
-                            let ip = v4.ip().to_string();
-                            if !pinned_ips.contains(&ip) {
-                                let _ = Command::new("route")
-                                    .args(["add", &ip, "mask", "255.255.255.255", &orig_gw, "metric", "1"])
-                                    .creation_flags(CREATE_NO_WINDOW)
-                                    .output();
-                                pinned_ips.push(ip);
-                            }
+        }
+        if target_ips.is_empty() {
+            if let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&(server_host, server_port)) {
+                for addr in addrs {
+                    if let std::net::SocketAddr::V4(v4) = addr {
+                        let ip = v4.ip().to_string();
+                        if !target_ips.contains(&ip) {
+                            target_ips.push(ip);
                         }
                     }
                 }
             }
         }
 
-        // Resolve Metrovpn-TUN interface index so Windows binds split-default routes explicitly to the TUN adapter
-        let tun_if_out = Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                &format!("(Get-NetIPInterface -InterfaceAlias '{interface_name}' -AddressFamily IPv4 | Select-Object -First 1).ifIndex"),
-            ])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output();
-        let tun_if_idx = tun_if_out
-            .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()));
+        let mut pinned_ips = Vec::new();
+        if !orig_gw.is_empty() {
+            let orig_if_str = orig_if_idx.map(|i| i.to_string());
+            for ip in &target_ips {
+                let _ = Command::new("route")
+                    .args(["delete", ip, "mask", "255.255.255.255"])
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .output();
 
-        // Route all IPv4 traffic via split-default prefix into Metrovpn-TUN
+                let pinned_ok = if let Some(ref idx) = orig_if_str {
+                    Command::new("route")
+                        .args([
+                            "add",
+                            ip,
+                            "mask",
+                            "255.255.255.255",
+                            &orig_gw,
+                            "metric",
+                            "1",
+                            "if",
+                            idx,
+                        ])
+                        .creation_flags(CREATE_NO_WINDOW)
+                        .output()
+                        .map(|o| o.status.success())
+                        .unwrap_or(false)
+                } else {
+                    false
+                };
+
+                if !pinned_ok {
+                    let _ = Command::new("route")
+                        .args(["add", ip, "mask", "255.255.255.255", &orig_gw, "metric", "1"])
+                        .creation_flags(CREATE_NO_WINDOW)
+                        .output();
+                }
+                pinned_ips.push(ip.clone());
+            }
+        }
+
+        // Resolve Metrovpn-TUN interface index instantly via Win32 IP Helper (PowerShell fallback)
+        let tun_if_idx: Option<String> = lookup_interface_index_by_alias(interface_name)
+            .map(|i| i.to_string())
+            .or_else(|| {
+                Command::new("powershell")
+                    .args([
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-Command",
+                        &format!("(Get-NetIPInterface -InterfaceAlias '{interface_name}' -AddressFamily IPv4 | Select-Object -First 1).ifIndex"),
+                    ])
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .output()
+                    .ok()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+            });
+
+        // Route all IPv4 traffic via split-default prefix into Metrovpn-TUN and verify success
         if let Some(ref idx) = tun_if_idx {
-            let _ = Command::new("route")
-                .args(["add", "0.0.0.0", "mask", "128.0.0.0", "198.18.0.2", "metric", "5", "if", idx])
-                .creation_flags(CREATE_NO_WINDOW)
-                .output();
-            let _ = Command::new("route")
-                .args(["add", "128.0.0.0", "mask", "128.0.0.0", "198.18.0.2", "metric", "5", "if", idx])
-                .creation_flags(CREATE_NO_WINDOW)
-                .output();
+            run_route_checked(
+                &["add", "0.0.0.0", "mask", "128.0.0.0", "198.18.0.2", "metric", "5", "if", idx],
+                "TUN 0.0.0.0/1",
+            )?;
+            run_route_checked(
+                &["add", "128.0.0.0", "mask", "128.0.0.0", "198.18.0.2", "metric", "5", "if", idx],
+                "TUN 128.0.0.0/1",
+            )?;
         } else {
-            let _ = Command::new("route")
-                .args(["add", "0.0.0.0", "mask", "128.0.0.0", "198.18.0.2", "metric", "5"])
-                .creation_flags(CREATE_NO_WINDOW)
-                .output();
-            let _ = Command::new("route")
-                .args(["add", "128.0.0.0", "mask", "128.0.0.0", "198.18.0.2", "metric", "5"])
-                .creation_flags(CREATE_NO_WINDOW)
-                .output();
+            run_route_checked(
+                &["add", "0.0.0.0", "mask", "128.0.0.0", "198.18.0.2", "metric", "5"],
+                "TUN 0.0.0.0/1",
+            )?;
+            run_route_checked(
+                &["add", "128.0.0.0", "mask", "128.0.0.0", "198.18.0.2", "metric", "5"],
+                "TUN 128.0.0.0/1",
+            )?;
         }
 
         Ok(pinned_ips)
@@ -768,7 +885,7 @@ mod win_impl {
                 return Err("GetDIBits failed to read captured pixels".into());
             }
 
-            for chunk in buf.chunks_exact_mut(4) {
+            for chunk in buf.as_chunks_mut::<4>().0 {
                 chunk.swap(0, 2); // BGRA -> RGBA
                 chunk[3] = 255;
             }

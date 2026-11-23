@@ -6,14 +6,18 @@ use crate::network_win::{
     backup_file_path, capture_virtual_screen_rgba, capture_virtual_screen_with_bounds,
     configure_tun_interface, enable_system_proxy, get_active_lan_ipv4, is_elevated,
     kill_stale_core_processes, relaunch_as_admin, restore_system_proxy,
-    scan_installed_windows_apps, teardown_tun_routes, CREATE_NO_WINDOW,
+    scan_installed_windows_apps, send_windows_connected_notification, teardown_tun_routes,
+    CREATE_NO_WINDOW,
 };
-use crate::parser::{decode_qr_from_bytes, decode_qr_from_rgba, fetch_subscription, parse_any};
+use crate::parser::{
+    decode_qr_from_bytes, decode_qr_from_rgba, fetch_subscription, normalize_saved_node, parse_any,
+};
 use crate::xray_config::{build_xray_config, HTTP_PORT, SOCKS_PORT, STATS_API_PORT};
 use crate::xray_stats::query_xray_stats;
 use base64::engine::general_purpose::STANDARD as BASE64_STD;
 use base64::Engine as _;
 use chrono::Local;
+use futures_util::future::join_all;
 use futures_util::StreamExt;
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Cursor, Write};
@@ -74,11 +78,17 @@ impl AppState {
         let recovered = restore_system_proxy(&backup_path).unwrap_or(false);
 
         let mut store = load_store(&store_path);
+        let before_servers = store.servers.clone();
+        for srv in &mut store.servers {
+            normalize_saved_node(srv);
+        }
         // Always enforce fixed SOCKS5 (10808) & HTTP (10809) ports matching Android XrayConfigBuilder
         store.settings.socks_port = SOCKS_PORT;
         store.settings.http_port = HTTP_PORT;
         if store.servers.is_empty() && store.settings.active_node_id.is_some() {
             store.settings.active_node_id = None;
+        }
+        if store.servers != before_servers || store.servers.is_empty() {
             save_store(&store_path, &store);
         }
 
@@ -462,22 +472,31 @@ pub async fn connect_internal(
     // Build and write runtime Xray config.json
     let mut runtime_cfg = build_xray_config(&node, &settings, socks_port, http_port, true);
 
-    // Pre-resolve server domain IPv4 into Xray dns.hosts when in TUN mode so Xray never hits a DNS bootstrap loop
-    if mode_norm == "TUN" && node.address.parse::<IpAddr>().is_err() {
-        if let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&(node.address.as_str(), node.port)) {
-            let v4s: Vec<String> = addrs
-                .filter_map(|a| match a {
-                    SocketAddr::V4(v4) => Some(v4.ip().to_string()),
-                    _ => None,
-                })
-                .collect();
-            if !v4s.is_empty() {
-                if let Some(dns_obj) = runtime_cfg.get_mut("dns").and_then(|d| d.as_object_mut()) {
-                    let mut hosts = serde_json::Map::new();
-                    hosts.insert(node.address.clone(), serde_json::json!(v4s));
-                    dns_obj.insert("hosts".to_string(), serde_json::Value::Object(hosts));
+    // Pre-resolve server domain IPv4s ONCE for both Xray dns.hosts and Windows gateway route pinning
+    let pre_resolved_ipv4s: Vec<String> = if node.address.parse::<IpAddr>().is_err() {
+        std::net::ToSocketAddrs::to_socket_addrs(&(node.address.as_str(), node.port))
+            .map(|addrs| {
+                let mut ips = Vec::new();
+                for addr in addrs {
+                    if let SocketAddr::V4(v4) = addr {
+                        let ip = v4.ip().to_string();
+                        if !ips.contains(&ip) {
+                            ips.push(ip);
+                        }
+                    }
                 }
-            }
+                ips
+            })
+            .unwrap_or_default()
+    } else {
+        vec![node.address.clone()]
+    };
+
+    if mode_norm == "TUN" && node.address.parse::<IpAddr>().is_err() && !pre_resolved_ipv4s.is_empty() {
+        if let Some(dns_obj) = runtime_cfg.get_mut("dns").and_then(|d| d.as_object_mut()) {
+            let mut hosts = serde_json::Map::new();
+            hosts.insert(node.address.clone(), serde_json::json!(pre_resolved_ipv4s));
+            dns_obj.insert("hosts".to_string(), serde_json::Value::Object(hosts));
         }
     }
 
@@ -634,7 +653,14 @@ pub async fn connect_internal(
             "Quad9 9.9.9.9" => "9.9.9.9",
             _ => "1.1.1.1",
         };
-        pinned_ips = match configure_tun_interface("Metrovpn-TUN", &node.address, dns_ip, settings.mtu) {
+        pinned_ips = match configure_tun_interface(
+            "Metrovpn-TUN",
+            &node.address,
+            node.port,
+            &pre_resolved_ipv4s,
+            dns_ip,
+            settings.mtu,
+        ) {
             Ok(ips) => ips,
             Err(e) => {
                 let _ = tun_child.kill();
@@ -694,15 +720,15 @@ pub async fn connect_internal(
     };
 
     emit_status(&app, &state);
+    send_windows_connected_notification(&node.name, &mode_norm);
     spawn_telemetry_loop(app.clone(), state.clone(), gen);
 
-    // Automatically sync 3x-ui inbound client quota 500ms after tunnel is up (matching Android MainViewModel)
+    // Automatically sync 3x-ui inbound client quota for ALL VLESS nodes 500ms after tunnel is up
     let app_q = app.clone();
     let state_q = state.clone();
-    let node_id_q = server_id.clone();
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(Duration::from_millis(500)).await;
-        let _ = sync_node_quota_internal(&app_q, &state_q, &node_id_q).await;
+        let _ = sync_all_quotas_internal(&app_q, &state_q).await;
     });
 
     let guard = state.inner.lock().map_err(|_| "State lock poisoned")?;
@@ -724,7 +750,7 @@ fn spawn_telemetry_loop(app: AppHandle, state: AppState, generation: u64) {
             interval.tick().await;
             ticks = ticks.wrapping_add(1);
 
-            let (still_active, elapsed, prev_down, prev_up, active_id_opt) = {
+            let (still_active, elapsed, prev_down, prev_up) = {
                 let Ok(guard) = state.inner.lock() else {
                     break;
                 };
@@ -739,7 +765,6 @@ fn spawn_telemetry_loop(app: AppHandle, state: AppState, generation: u64) {
                         .unwrap_or(0),
                     guard.last_down_bytes,
                     guard.last_up_bytes,
-                    guard.store.settings.active_node_id.clone(),
                 )
             };
 
@@ -779,15 +804,13 @@ fn spawn_telemetry_loop(app: AppHandle, state: AppState, generation: u64) {
                 None
             };
 
-            // Re-sync 3x-ui server quota every 45 seconds while connected
+            // Re-sync 3x-ui server quotas across ALL nodes every 45 seconds while connected
             if ticks % 45 == 0 {
-                if let Some(active_id) = active_id_opt {
-                    let app_c = app.clone();
-                    let st_c = state.clone();
-                    tauri::async_runtime::spawn(async move {
-                        let _ = sync_node_quota_internal(&app_c, &st_c, &active_id).await;
-                    });
-                }
+                let app_c = app.clone();
+                let st_c = state.clone();
+                tauri::async_runtime::spawn(async move {
+                    let _ = sync_all_quotas_internal(&app_c, &st_c).await;
+                });
             }
 
             let payload = TelemetryPayload {
@@ -821,8 +844,11 @@ pub async fn import_uri(
         for n in nodes.iter().rev() {
             guard.store.servers.insert(0, n.clone());
         }
-        if let Some(first) = nodes.first() {
-            guard.store.settings.active_node_id = Some(first.id.clone());
+        let is_tunnel_busy = guard.status == "Connected" || guard.status == "Connecting";
+        if !is_tunnel_busy || guard.store.settings.active_node_id.is_none() {
+            if let Some(first) = nodes.first() {
+                guard.store.settings.active_node_id = Some(first.id.clone());
+            }
         }
         save_store(&guard.store_path, &guard.store);
     }
@@ -832,13 +858,15 @@ pub async fn import_uri(
         &format!("Imported {} tunnel node(s) into Metrovpn store", nodes.len()),
     );
 
-    // Sync 3x-ui inbound client quota for newly imported nodes in the background
+    // Sync 3x-ui inbound client quota concurrently for newly imported nodes
     let app_q = app.clone();
     let st_q = state.inner().clone();
     tauri::async_runtime::spawn(async move {
-        for id in imported_ids {
-            let _ = sync_node_quota_internal(&app_q, &st_q, &id).await;
-        }
+        let tasks: Vec<_> = imported_ids
+            .iter()
+            .map(|id| sync_node_quota_internal(&app_q, &st_q, id))
+            .collect();
+        let _ = join_all(tasks).await;
     });
 
     Ok(nodes)
@@ -1461,20 +1489,29 @@ pub async fn sync_node_quota(
     sync_node_quota_internal(&app, state.inner(), &id).await
 }
 
-#[tauri::command]
-pub async fn sync_all_quotas(
-    app: AppHandle,
-    state: State<'_, AppState>,
+pub async fn sync_all_quotas_internal(
+    app: &AppHandle,
+    state: &AppState,
 ) -> Result<Vec<ServerNode>, String> {
     let ids: Vec<String> = {
         let guard = state.inner.lock().map_err(|_| "State lock poisoned")?;
         guard.store.servers.iter().map(|s| s.id.clone()).collect()
     };
-    for id in ids {
-        let _ = sync_node_quota_internal(&app, state.inner(), &id).await;
-    }
+    let tasks: Vec<_> = ids
+        .iter()
+        .map(|id| sync_node_quota_internal(app, state, id))
+        .collect();
+    let _ = join_all(tasks).await;
     let guard = state.inner.lock().map_err(|_| "State lock poisoned")?;
     Ok(guard.store.servers.clone())
+}
+
+#[tauri::command]
+pub async fn sync_all_quotas(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Vec<ServerNode>, String> {
+    sync_all_quotas_internal(&app, state.inner()).await
 }
 
 // ============================================================================

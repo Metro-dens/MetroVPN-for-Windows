@@ -65,19 +65,25 @@ fn infer_isp(name: &str, sni: &str) -> String {
     }
 }
 
-fn format_protocol_label(transport: &str, tls_mode: &str, vcn: bool) -> String {
-    let tr = match transport.to_lowercase().as_str() {
-        "ws" => "WS",
-        "grpc" => "gRPC",
-        "httpupgrade" => "HTTPUpgrade",
-        "xhttp" => "XHTTP",
-        _ => "TCP",
+pub fn format_protocol_label(transport: &str, tls_mode: &str, vcn: bool) -> String {
+    let tr_lc = transport.trim().to_lowercase();
+    let tr = match tr_lc.as_str() {
+        "ws" => "WS".to_string(),
+        "grpc" => "gRPC".to_string(),
+        "httpupgrade" => "HTTPUpgrade".to_string(),
+        "xhttp" | "splithttp" => "XHTTP".to_string(),
+        "h2" | "http" => "H2".to_string(),
+        "kcp" => "mKCP".to_string(),
+        "quic" => "QUIC".to_string(),
+        "" | "tcp" | "raw" => "TCP".to_string(),
+        other => other.to_uppercase(),
     };
-    match tls_mode.to_lowercase().as_str() {
-        "reality" => format!("{tr} • Reality"),
-        "tls" if vcn => format!("{tr} • TLS+VCN"),
-        "tls" => format!("{tr} • TLS 1.3"),
-        _ => format!("{tr} • Plain"),
+    match tls_mode.trim().to_lowercase().as_str() {
+        "reality" => format!("{tr}+REALITY"),
+        "tls" if vcn => format!("{tr}+TLS+VCN"),
+        "tls" => format!("{tr}+TLS"),
+        "" | "none" => tr,
+        other => format!("{tr}+{}", other.to_uppercase()),
     }
 }
 
@@ -94,6 +100,8 @@ pub fn parse_vless_uri(raw: &str) -> Result<ServerNode, String> {
     let address = parsed
         .host_str()
         .ok_or_else(|| "VLESS URI missing server address".to_string())?
+        .trim_start_matches('[')
+        .trim_end_matches(']')
         .to_string();
     let port = parsed.port().unwrap_or(443);
 
@@ -108,15 +116,28 @@ pub fn parse_vless_uri(raw: &str) -> Result<ServerNode, String> {
         .map(|f| urlencoding_decode(f))
         .unwrap_or_else(|| format!("{address}:{port}"));
 
-    let transport = params
+    let raw_transport = params
         .get("type")
         .or_else(|| params.get("network"))
-        .cloned()
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "tcp".into());
-    let tls_mode = params
+    let transport = if raw_transport == "raw" {
+        "tcp".to_string()
+    } else {
+        raw_transport
+    };
+
+    let raw_tls_mode = params
         .get("security")
-        .cloned()
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
         .unwrap_or_else(|| if port == 443 { "tls".into() } else { "none".into() });
+    let tls_mode = if raw_tls_mode == "xtls" {
+        "tls".to_string()
+    } else {
+        raw_tls_mode
+    };
 
     let sni = params
         .get("sni")
@@ -130,25 +151,8 @@ pub fn parse_vless_uri(raw: &str) -> Result<ServerNode, String> {
         .or_else(|| params.get("verifypeercertbyname"))
         .cloned()
         .filter(|v| !v.is_empty());
-    let explicit_allow_insecure = params
-        .get("allowinsecure")
-        .or_else(|| params.get("insecure"))
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    let implicit_vcn_host = if vcn_param.is_none()
-        && tls_mode.eq_ignore_ascii_case("tls")
-        && !explicit_allow_insecure
-        && address.parse::<std::net::IpAddr>().is_err()
-        && !address.eq_ignore_ascii_case(&sni)
-    {
-        Some(address.clone())
-    } else {
-        None
-    };
-    let vcn = vcn_param.is_some() || implicit_vcn_host.is_some() || tls_mode == "reality";
-    let vcn_host = vcn_param
-        .filter(|v| v != "strict" && v != "1" && v != "true")
-        .or(implicit_vcn_host);
+    let explicit_vcn = vcn_param.is_some();
+    let vcn_host = vcn_param.filter(|v| v != "strict" && v != "1" && v != "true");
 
     let fingerprint = params
         .get("fp")
@@ -166,6 +170,15 @@ pub fn parse_vless_uri(raw: &str) -> Result<ServerNode, String> {
         .get("servicename")
         .cloned()
         .filter(|s| !s.is_empty());
+    let header_type = params
+        .get("headertype")
+        .cloned()
+        .filter(|s| !s.is_empty());
+    let mode = params.get("mode").cloned().filter(|s| !s.is_empty());
+    let authority = params.get("authority").cloned().filter(|s| !s.is_empty());
+    let extra = params.get("extra").cloned().filter(|s| !s.is_empty());
+    let seed = params.get("seed").cloned().filter(|s| !s.is_empty());
+    let encryption = params.get("encryption").cloned().filter(|s| !s.is_empty());
     let allow_insecure = params
         .get("allowinsecure")
         .or_else(|| params.get("insecure"))
@@ -174,7 +187,7 @@ pub fn parse_vless_uri(raw: &str) -> Result<ServerNode, String> {
 
     let isp = infer_isp(&name, &sni);
     let region = infer_region(&name, &address);
-    let protocol = format_protocol_label(&transport, &tls_mode, vcn);
+    let protocol = format_protocol_label(&transport, &tls_mode, explicit_vcn);
 
     Ok(ServerNode {
         id: format!("node-{}", Uuid::new_v4().simple()),
@@ -188,7 +201,7 @@ pub fn parse_vless_uri(raw: &str) -> Result<ServerNode, String> {
         protocol,
         transport,
         tls_mode,
-        vcn,
+        vcn: explicit_vcn,
         vcn_host,
         fingerprint,
         alpn,
@@ -199,6 +212,12 @@ pub fn parse_vless_uri(raw: &str) -> Result<ServerNode, String> {
         path,
         host,
         service_name,
+        header_type,
+        mode,
+        authority,
+        extra,
+        seed,
+        encryption,
         allow_insecure,
         ping: None,
         quota_used_gb: 0.0,
@@ -248,12 +267,17 @@ pub fn parse_vmess_uri(raw: &str) -> Result<ServerNode, String> {
         .map(|s| s.to_string())
         .unwrap_or_else(|| format!("{address}:{port}"));
 
-    let transport = obj["net"]
+    let raw_transport = obj["net"]
         .as_str()
+        .map(|s| s.trim().to_lowercase())
         .filter(|s| !s.is_empty())
-        .unwrap_or("tcp")
-        .to_string();
-    let tls_raw = obj["tls"].as_str().unwrap_or("");
+        .unwrap_or_else(|| "tcp".to_string());
+    let transport = if raw_transport == "raw" {
+        "tcp".to_string()
+    } else {
+        raw_transport
+    };
+    let tls_raw = obj["tls"].as_str().unwrap_or("").trim();
     let tls_mode = if tls_raw.eq_ignore_ascii_case("tls") {
         "tls".to_string()
     } else {
@@ -268,6 +292,11 @@ pub fn parse_vmess_uri(raw: &str) -> Result<ServerNode, String> {
     let host = obj["host"].as_str().filter(|s| !s.is_empty()).map(String::from);
     let path = obj["path"].as_str().filter(|s| !s.is_empty()).map(String::from);
     let alpn = obj["alpn"].as_str().filter(|s| !s.is_empty()).map(String::from);
+    let header_type = obj["type"]
+        .as_str()
+        .filter(|s| !s.is_empty() && *s != "none")
+        .map(String::from);
+    let encryption = obj["scy"].as_str().filter(|s| !s.is_empty()).map(String::from);
     let fingerprint = obj["fp"]
         .as_str()
         .filter(|s| !s.is_empty())
@@ -278,7 +307,7 @@ pub fn parse_vmess_uri(raw: &str) -> Result<ServerNode, String> {
 
     let isp = infer_isp(&name, &sni);
     let region = infer_region(&name, &address);
-    let protocol = format_protocol_label(&transport, &tls_mode, vcn);
+    let protocol = format!("VMess • {}", format_protocol_label(&transport, &tls_mode, vcn));
 
     Ok(ServerNode {
         id: format!("node-{}", Uuid::new_v4().simple()),
@@ -303,7 +332,151 @@ pub fn parse_vmess_uri(raw: &str) -> Result<ServerNode, String> {
         path,
         host,
         service_name: None,
+        header_type,
+        mode: None,
+        authority: None,
+        extra: None,
+        seed: None,
+        encryption,
         allow_insecure: false,
+        ping: None,
+        quota_used_gb: 0.0,
+        quota_total_gb: 0.0,
+        quota_up_bytes: 0,
+        quota_down_bytes: 0,
+        quota_total_bytes: 0,
+        quota_expiry_ms: 0,
+        quota_enabled: true,
+        quota_email: String::new(),
+        quota_updated_at_ms: 0,
+        starred: false,
+        online: false,
+        ip: address,
+        uri: trimmed.to_string(),
+        raw_outbound: None,
+    })
+}
+
+pub fn parse_trojan_uri(raw: &str) -> Result<ServerNode, String> {
+    let trimmed = raw.trim();
+    if !trimmed.to_lowercase().starts_with("trojan://") {
+        return Err("Not a trojan:// URI".into());
+    }
+    let parsed = Url::parse(trimmed).map_err(|e| format!("Invalid Trojan URI: {e}"))?;
+    let password = urlencoding_decode(parsed.username());
+    if password.is_empty() {
+        return Err("Trojan URI missing password".into());
+    }
+    let address = parsed
+        .host_str()
+        .ok_or_else(|| "Trojan URI missing server address".to_string())?
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_string();
+    let port = parsed.port().unwrap_or(443);
+
+    let params: HashMap<String, String> = parsed
+        .query_pairs()
+        .map(|(k, v)| (k.to_lowercase(), v.to_string()))
+        .collect();
+
+    let name = parsed
+        .fragment()
+        .filter(|f| !f.is_empty())
+        .map(|f| urlencoding_decode(f))
+        .unwrap_or_else(|| format!("{address}:{port}"));
+
+    let raw_transport = params
+        .get("type")
+        .or_else(|| params.get("network"))
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "tcp".into());
+    let transport = if raw_transport == "raw" {
+        "tcp".to_string()
+    } else {
+        raw_transport
+    };
+
+    let tls_mode = params
+        .get("security")
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "tls".into());
+
+    let sni = params
+        .get("sni")
+        .or_else(|| params.get("servername"))
+        .or_else(|| params.get("peer"))
+        .cloned()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| address.clone());
+
+    let vcn_param = params
+        .get("vcn")
+        .or_else(|| params.get("verifypeercertbyname"))
+        .cloned()
+        .filter(|v| !v.is_empty());
+    let explicit_vcn = vcn_param.is_some();
+    let vcn_host = vcn_param.filter(|v| v != "strict" && v != "1" && v != "true");
+
+    let fingerprint = params
+        .get("fp")
+        .cloned()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "chrome".into());
+    let alpn = params.get("alpn").cloned().filter(|s| !s.is_empty());
+    let public_key = params.get("pbk").cloned().filter(|s| !s.is_empty());
+    let short_id = params.get("sid").cloned().filter(|s| !s.is_empty());
+    let spider_x = params.get("spx").cloned().filter(|s| !s.is_empty());
+    let path = params.get("path").cloned().filter(|s| !s.is_empty());
+    let host = params.get("host").cloned().filter(|s| !s.is_empty());
+    let service_name = params.get("servicename").cloned().filter(|s| !s.is_empty());
+    let header_type = params.get("headertype").cloned().filter(|s| !s.is_empty());
+    let mode = params.get("mode").cloned().filter(|s| !s.is_empty());
+    let authority = params.get("authority").cloned().filter(|s| !s.is_empty());
+    let extra = params.get("extra").cloned().filter(|s| !s.is_empty());
+    let seed = params.get("seed").cloned().filter(|s| !s.is_empty());
+    let allow_insecure = params
+        .get("allowinsecure")
+        .or_else(|| params.get("insecure"))
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    let isp = infer_isp(&name, &sni);
+    let region = infer_region(&name, &address);
+    let protocol = format!("Trojan • {}", format_protocol_label(&transport, &tls_mode, explicit_vcn));
+
+    Ok(ServerNode {
+        id: format!("node-{}", Uuid::new_v4().simple()),
+        name,
+        region,
+        isp,
+        address: address.clone(),
+        port,
+        uuid: password,
+        sni,
+        protocol,
+        transport,
+        tls_mode,
+        vcn: explicit_vcn,
+        vcn_host,
+        fingerprint,
+        alpn,
+        flow: None,
+        public_key,
+        short_id,
+        spider_x,
+        path,
+        host,
+        service_name,
+        header_type,
+        mode,
+        authority,
+        extra,
+        seed,
+        encryption: None,
+        allow_insecure,
         ping: None,
         quota_used_gb: 0.0,
         quota_total_gb: 0.0,
@@ -352,14 +525,21 @@ pub fn parse_xray_json(raw: &str) -> Result<ServerNode, String> {
     let stream = target_outbound
         .get("streamSettings")
         .or_else(|| obj.get("streamSettings"));
-    let transport = stream
+    let raw_transport = stream
         .and_then(|s| s["network"].as_str())
         .unwrap_or("tcp")
-        .to_string();
+        .trim()
+        .to_lowercase();
+    let transport = if raw_transport == "raw" {
+        "tcp".to_string()
+    } else {
+        raw_transport
+    };
     let tls_mode = stream
         .and_then(|s| s["security"].as_str())
         .unwrap_or("tls")
-        .to_string();
+        .trim()
+        .to_lowercase();
 
     let vnext = target_outbound
         .get("settings")
@@ -402,8 +582,7 @@ pub fn parse_xray_json(raw: &str) -> Result<ServerNode, String> {
         .and_then(|t| t["verifyPeerCertByName"].as_str())
         .map(String::from);
     let vcn = vcn_host.is_some()
-        || stream.and_then(|s| s["vcn"].as_str()) == Some("strict")
-        || tls_mode == "reality";
+        || stream.and_then(|s| s["vcn"].as_str()) == Some("strict");
 
     let isp = obj["isp"]
         .as_str()
@@ -465,6 +644,12 @@ pub fn parse_xray_json(raw: &str) -> Result<ServerNode, String> {
             .and_then(|s| s.get("grpcSettings"))
             .and_then(|g| g["serviceName"].as_str())
             .map(String::from),
+        header_type: None,
+        mode: None,
+        authority: None,
+        extra: None,
+        seed: None,
+        encryption: None,
         allow_insecure: tls_settings
             .and_then(|t| t["allowInsecure"].as_bool())
             .unwrap_or(false),
@@ -488,6 +673,44 @@ pub fn parse_xray_json(raw: &str) -> Result<ServerNode, String> {
             None
         },
     })
+}
+
+pub fn normalize_saved_node(node: &mut ServerNode) {
+    let lower_uri = node.uri.trim().to_lowercase();
+    let reparsed = if lower_uri.starts_with("vless://") {
+        parse_vless_uri(&node.uri).ok()
+    } else if lower_uri.starts_with("vmess://") {
+        parse_vmess_uri(&node.uri).ok()
+    } else if lower_uri.starts_with("trojan://") {
+        parse_trojan_uri(&node.uri).ok()
+    } else {
+        None
+    };
+
+    if let Some(fresh) = reparsed {
+        node.transport = fresh.transport;
+        node.tls_mode = fresh.tls_mode;
+        node.vcn = fresh.vcn;
+        node.vcn_host = fresh.vcn_host;
+        node.protocol = fresh.protocol;
+        node.header_type = fresh.header_type;
+        node.mode = fresh.mode;
+        node.authority = fresh.authority;
+        node.extra = fresh.extra;
+        node.seed = fresh.seed;
+        node.encryption = fresh.encryption;
+    } else {
+        if node.transport.eq_ignore_ascii_case("raw") {
+            node.transport = "tcp".to_string();
+        } else {
+            node.transport = node.transport.trim().to_lowercase();
+        }
+        node.tls_mode = node.tls_mode.trim().to_lowercase();
+        if node.tls_mode == "reality" {
+            node.vcn = false;
+        }
+        node.protocol = format_protocol_label(&node.transport, &node.tls_mode, node.vcn);
+    }
 }
 
 pub fn parse_any(raw: &str, mode: Option<&str>) -> Result<Vec<ServerNode>, String> {
@@ -523,11 +746,15 @@ pub fn parse_any(raw: &str, mode: Option<&str>) -> Result<Vec<ServerNode>, Strin
             if let Ok(node) = parse_vmess_uri(l) {
                 results.push(node);
             }
+        } else if lower.starts_with("trojan://") {
+            if let Ok(node) = parse_trojan_uri(l) {
+                results.push(node);
+            }
         }
     }
 
     if results.is_empty() {
-        Err("No valid vless://, vmess://, or Xray JSON profiles found".into())
+        Err("No valid vless://, vmess://, trojan://, or Xray JSON profiles found".into())
     } else {
         Ok(results)
     }
@@ -707,6 +934,7 @@ mod tests {
         assert_eq!(node.port, 443);
         assert_eq!(node.sni, "st1.zoom.us");
         assert!(node.vcn);
+        assert_eq!(node.protocol, "TCP+TLS+VCN");
         assert_eq!(node.vcn_host.as_deref(), Some("vpn.metrodens.site"));
         assert_eq!(node.flow.as_deref(), Some("xtls-rprx-vision"));
         assert_eq!(node.name, "SG-01 SLT");
@@ -721,9 +949,10 @@ mod tests {
         assert_eq!(node.sni, "st1.zoom.us");
         assert_eq!(node.transport, "tcp");
         assert_eq!(node.tls_mode, "tls");
+        assert_eq!(node.protocol, "TCP+TLS");
         assert_eq!(node.alpn.as_deref(), Some("h2,http/1.1"));
-        assert!(node.vcn);
-        assert_eq!(node.vcn_host.as_deref(), Some("vpn.metrodens.site"));
+        assert!(!node.vcn);
+        assert_eq!(node.vcn_host, None);
         assert_eq!(
             node.name,
             "SLT Fiber - Zoom Meet Max / Lite-SLT-FIBER-ZOOM-VIP-@METRODENZ-122"
@@ -735,6 +964,8 @@ mod tests {
         let uri = "vless://7c2e19a0-5b44-41d8-9a77-62f109e3ab11@sg02.metrovpn.io:443?security=reality&sni=m.zoom.us&pbk=abc123&sid=01ef&type=tcp#RealityNode";
         let node = parse_vless_uri(uri).expect("should parse reality");
         assert_eq!(node.tls_mode, "reality");
+        assert_eq!(node.protocol, "TCP+REALITY");
+        assert!(!node.vcn);
         assert_eq!(node.public_key.as_deref(), Some("abc123"));
         assert_eq!(node.short_id.as_deref(), Some("01ef"));
     }

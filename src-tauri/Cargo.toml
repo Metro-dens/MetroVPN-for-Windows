@@ -1,6 +1,6 @@
 [package]
 name = "metrovpn"
-version = "2.7.2"
+version = "2.7.3"
 description = "Metrovpn Desktop — High-contrast Crimson Void VPN client powered by Xray-core"
 authors = ["Metro Dens"]
 edition = "2021"

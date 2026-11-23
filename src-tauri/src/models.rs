@@ -36,6 +36,18 @@ pub struct ServerNode {
     #[serde(default)]
     pub service_name: Option<String>,
     #[serde(default)]
+    pub header_type: Option<String>,
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub authority: Option<String>,
+    #[serde(default)]
+    pub extra: Option<String>,
+    #[serde(default)]
+    pub seed: Option<String>,
+    #[serde(default)]
+    pub encryption: Option<String>,
+    #[serde(default)]
     pub allow_insecure: bool,
     pub ping: Option<u64>,
     #[serde(rename = "quotaUsedGB")]

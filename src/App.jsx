@@ -196,6 +196,14 @@ const GLASS_ACTIVE = {
   boxShadow: 'inset 0 1px 0 rgba(255, 184, 178, 0.14), 0 12px 28px -12px rgba(155, 10, 18, 0.28)',
 };
 
+const GLASS_CONNECTED = {
+  backgroundColor: 'rgba(19, 44, 35, 0.72)',
+  border: '1.5px solid rgba(109, 213, 176, 0.65)',
+  backdropFilter: 'blur(18px) saturate(155%)',
+  WebkitBackdropFilter: 'blur(18px) saturate(155%)',
+  boxShadow: 'inset 0 1px 0 rgba(160, 255, 220, 0.18), 0 12px 30px -10px rgba(109, 213, 176, 0.26)',
+};
+
 const GLASS_INSET = {
   backgroundColor: COLORS.obsidian,
   border: '1px solid rgba(255, 220, 218, 0.08)',
@@ -417,18 +425,23 @@ function parsePreviewNode(raw, mode = 'uri') {
   if (mode === 'json' || trimmed.startsWith('{')) {
     try {
       const obj = JSON.parse(trimmed);
+      const net = String(obj?.streamSettings?.network || 'tcp').toUpperCase();
+      const sec = String(obj?.streamSettings?.security || 'tls').toUpperCase();
+      const hasVcn = Boolean(obj?.streamSettings?.tlsSettings?.verifyPeerCertByName);
       return {
         name: obj.tag || 'Imported Xray JSON Node',
         isp: obj.isp || 'SLT Fiber',
         sni: obj.sni || obj?.streamSettings?.tlsSettings?.serverName || 'st1.zoom.us',
-        protocol: 'TCP • TLS+VCN',
+        protocol: hasVcn ? `${net}+TLS+VCN` : `${net}+${sec}`,
       };
     } catch {
       return null;
     }
   }
   const lower = trimmed.toLowerCase();
-  if (!lower.startsWith('vless://') && !lower.startsWith('vmess://')) return null;
+  if (!lower.startsWith('vless://') && !lower.startsWith('vmess://') && !lower.startsWith('trojan://')) {
+    return null;
+  }
   const hashIdx = trimmed.indexOf('#');
   let name = 'Imported Tunnel Node';
   if (hashIdx !== -1 && hashIdx < trimmed.length - 1) {
@@ -438,14 +451,43 @@ function parsePreviewNode(raw, mode = 'uri') {
       name = trimmed.slice(hashIdx + 1);
     }
   }
-  const sniMatch = trimmed.match(/sni=([^&#]+)/i);
-  const hostMatch = trimmed.match(/@([^:/?#]+)/i);
-  const host = hostMatch ? hostMatch[1] : '';
+  const sniMatch = trimmed.match(/[?&](?:sni|serverName|peer)=([^&#]+)/i);
+  const hostMatch = trimmed.match(/@(?:\[([^\]]+)\]|([^:/?#]+))/i);
+  const host = hostMatch ? hostMatch[1] || hostMatch[2] || '' : '';
   const sni = sniMatch ? decodeURIComponent(sniMatch[1]) : host || 'st1.zoom.us';
-  const inferredVcn =
-    lower.includes('vcn=') ||
-    lower.includes('reality') ||
-    (host && !/^\d+\.\d+\.\d+\.\d+$/.test(host) && host.toLowerCase() !== sni.toLowerCase());
+  const typeMatch = trimmed.match(/[?&](?:type|network)=([^&#]+)/i);
+  const secMatch = trimmed.match(/[?&]security=([^&#]+)/i);
+  const rawTr = (typeMatch ? typeMatch[1] : 'tcp').toLowerCase();
+  const trLabel =
+    rawTr === 'ws'
+      ? 'WS'
+      : rawTr === 'grpc'
+      ? 'gRPC'
+      : rawTr === 'httpupgrade'
+      ? 'HTTPUpgrade'
+      : rawTr === 'xhttp' || rawTr === 'splithttp'
+      ? 'XHTTP'
+      : rawTr === 'h2' || rawTr === 'http'
+      ? 'H2'
+      : rawTr === 'kcp'
+      ? 'mKCP'
+      : 'TCP';
+  const rawSec = (secMatch ? secMatch[1] : 'tls').toLowerCase();
+  const hasExplicitVcn = /[?&](?:vcn|verifyPeerCertByName)=/i.test(trimmed);
+  const baseProto =
+    rawSec === 'reality'
+      ? `${trLabel}+REALITY`
+      : rawSec === 'none'
+      ? trLabel
+      : hasExplicitVcn
+      ? `${trLabel}+TLS+VCN`
+      : `${trLabel}+TLS`;
+  const protocol = lower.startsWith('trojan://')
+    ? `Trojan • ${baseProto}`
+    : lower.startsWith('vmess://')
+    ? 'VMess'
+    : baseProto;
+
   return {
     name,
     isp: lower.includes('dialog')
@@ -458,7 +500,7 @@ function parsePreviewNode(raw, mode = 'uri') {
       ? 'Airtel'
       : 'SLT Fiber',
     sni,
-    protocol: inferredVcn ? 'TCP • TLS+VCN' : 'TCP • TLS 1.3',
+    protocol,
   };
 }
 
@@ -563,7 +605,8 @@ function MetroProvider({ children }) {
 
   const [logs, setLogs] = useState([]);
   const [logsStreaming, setLogsStreaming] = useState(true);
-  const [toasts, setToasts] = useState([]);
+  const [toasts] = useState([]);
+  const [connectionError, setConnectionError] = useState('');
 
   const logsStreamingRef = useRef(true);
   useEffect(() => {
@@ -575,29 +618,44 @@ function MetroProvider({ children }) {
     settingsRef.current = settingsState;
   }, [settingsState]);
 
-  const pushToast = useCallback((message, tone = 'neutral') => {
-    const clean = String(message || '').trim();
-    if (!clean) return;
-    const norm = clean.replace(/^Connection failed:\s*/i, '');
-    const id = `${Date.now()}-${Math.random()}`;
-    setToasts((prev) => {
-      const deduped = prev.filter((t) => {
-        const prevNorm = String(t.message || '').trim().replace(/^Connection failed:\s*/i, '');
-        return prevNorm !== norm;
-      });
-      return [...deduped.slice(-2), { id, message: clean, tone }];
-    });
-    setTimeout(() => {
-      setToasts((prev) => prev.filter((t) => t.id !== id));
-    }, 3600);
-  }, []);
-
   const appendLog = useCallback((tag, msg) => {
     const now = new Date();
     const time = [now.getHours(), now.getMinutes(), now.getSeconds()]
       .map((v) => String(v).padStart(2, '0'))
       .join(':');
     setLogs((prev) => [...prev.slice(-499), { id: `l-${Date.now()}-${Math.random()}`, time, tag, msg }]);
+  }, []);
+
+  // Floating toast popups are intentionally silenced (only native Windows toast fires on VPN connect).
+  const pushToast = useCallback(
+    (message, tone = 'neutral') => {
+      const clean = String(message || '').trim();
+      if (!clean) return;
+      if (tone === 'amber') {
+        appendLog('Warning', clean);
+      }
+    },
+    [appendLog]
+  );
+
+  const syncingAllRef = useRef(false);
+  const lastAllSyncMsRef = useRef(0);
+  const syncAllQuotas = useCallback(async (force = false) => {
+    if (!IN_TAURI || syncingAllRef.current) return;
+    const now = Date.now();
+    if (!force && now - lastAllSyncMsRef.current < 4000) return;
+    syncingAllRef.current = true;
+    lastAllSyncMsRef.current = now;
+    try {
+      const updatedList = await invokeCmd('sync_all_quotas');
+      if (Array.isArray(updatedList)) {
+        setNodes(updatedList);
+      }
+    } catch {
+      // ignore silent background quota sync failure
+    } finally {
+      syncingAllRef.current = false;
+    }
   }, []);
 
   const applySettingsObject = useCallback((s) => {
@@ -634,6 +692,9 @@ function MetroProvider({ children }) {
           setNodes(srvList);
           if (!settings?.activeNodeId && srvList[0]) {
             setActiveNodeId(srvList[0].id);
+          }
+          if (srvList.length > 0) {
+            syncAllQuotas(true);
           }
         }
         applySettingsObject(settings);
@@ -722,13 +783,16 @@ function MetroProvider({ children }) {
           }
           if (status.activeNodeId !== undefined) setActiveNodeId(status.activeNodeId || null);
           if (status.localLanIp) setLocalLanIp(status.localLanIp);
+          if (norm === 'connected') {
+            setConnectionError('');
+          }
           if (norm === 'disconnected') {
             setDownHistory(Array(14).fill(0));
             setUpHistory(Array(14).fill(0));
             setSettingsNeedsReconnect(false);
           }
           if (status.status === 'Error' && status.message) {
-            pushToast(status.message, 'amber');
+            setConnectionError(String(status.message));
           }
         })
       );
@@ -752,11 +816,16 @@ function MetroProvider({ children }) {
       );
     })();
 
+    const quotaTimer = setInterval(() => {
+      syncAllQuotas(false);
+    }, 60000);
+
     return () => {
       mounted = false;
+      clearInterval(quotaTimer);
       unsubs.forEach((u) => typeof u === 'function' && u());
     };
-  }, [applySettingsObject, appendLog, pushToast]);
+  }, [applySettingsObject, appendLog, syncAllQuotas]);
 
   const activeNode = useMemo(
     () => nodes.find((n) => n.id === activeNodeId) || nodes[0] || null,
@@ -797,8 +866,8 @@ function MetroProvider({ children }) {
     try {
       await invokeCmd('reconnect_active');
       setSettingsNeedsReconnect(false);
-      pushToast('Settings applied & tunnel reconnected', 'success');
     } catch (err) {
+      setConnectionError(String(err));
       pushToast(`Reconnect failed: ${String(err)}`, 'amber');
     }
   }, [pushToast]);
@@ -806,14 +875,12 @@ function MetroProvider({ children }) {
   const resetSettingsToDefault = useCallback(async () => {
     if (!IN_TAURI) {
       applySettingsObject(DEFAULT_SETTINGS_STATE);
-      pushToast('Settings reset to defaults', 'neutral');
       return;
     }
     try {
       const fresh = await invokeCmd('reset_settings');
       applySettingsObject(fresh);
       if (connectionStatus === 'connected') setSettingsNeedsReconnect(true);
-      pushToast('Restored MetroVPN default settings', 'success');
     } catch (err) {
       pushToast(`Reset failed: ${String(err)}`, 'amber');
     }
@@ -839,14 +906,6 @@ function MetroProvider({ children }) {
         const updated = await invokeCmd('sync_node_quota', { id: nodeId });
         if (updated) {
           setNodes((prev) => prev.map((n) => (n.id === updated.id ? { ...n, ...updated } : n)));
-          if (!silent) {
-            pushToast(
-              `Synced 3x-ui quota: ${formatUsageData(updated.quotaUsedGB || 0)}${
-                updated.quotaTotalGB > 0 ? ` / ${updated.quotaTotalGB.toFixed(1)} GB` : ' (Unlimited)'
-              }`,
-              'success'
-            );
-          }
         }
       } catch (err) {
         if (!silent) {
@@ -869,10 +928,10 @@ function MetroProvider({ children }) {
       if (!target) {
         setAddModalTab('uri');
         setAddModalOpen(true);
-        pushToast('Import a VLESS or VMess node first', 'amber');
         return;
       }
       const modeToUse = forcedMode || settingsRef.current.systemMode;
+      setConnectionError('');
       setActiveNodeId(nodeId);
       setConnectionStatus('connecting');
       setSettingsNeedsReconnect(false);
@@ -881,14 +940,12 @@ function MetroProvider({ children }) {
         setTimeout(() => {
           setConnectionStatus('connected');
           setSessionSeconds(1);
-          pushToast(`Connected to ${target.name}`, 'success');
         }, 500);
         return;
       }
 
       try {
         await invokeCmd('connect_server', { id: nodeId, mode: modeToUse });
-        pushToast(`Protected via ${target.name}`, 'success');
       } catch (err) {
         const msg = String(err);
         setConnectionStatus('disconnected');
@@ -896,6 +953,7 @@ function MetroProvider({ children }) {
           setPendingTunNodeId(nodeId);
           setAdminModalOpen(true);
         } else {
+          setConnectionError(msg);
           pushToast(`Connection failed: ${msg}`, 'amber');
         }
       }
@@ -912,16 +970,15 @@ function MetroProvider({ children }) {
           pushToast(`Disconnect error: ${String(err)}`, 'amber');
         }
       }
+      setConnectionError('');
       setConnectionStatus('disconnected');
       setSessionSeconds(0);
       setSettingsNeedsReconnect(false);
-      pushToast(`Disconnected from ${activeNode?.name || 'VPN'}`, 'neutral');
     } else if (activeNode) {
       await connectToNode(activeNode.id, settingsRef.current.systemMode);
     } else {
       setAddModalTab('uri');
       setAddModalOpen(true);
-      pushToast('No server added yet — Paste a VLESS link or scan QR to start', 'amber');
     }
   }, [connectionStatus, activeNode, connectToNode, pushToast]);
 
@@ -1020,17 +1077,17 @@ function MetroProvider({ children }) {
     try {
       if (!IN_TAURI) {
         const mockInfo = {
-          currentVersion: '2.7.2',
-          latestVersion: '2.7.2',
+          currentVersion: '2.7.3',
+          latestVersion: '2.7.3',
           updateAvailable: false,
           releaseUrl: 'https://github.com/Metro-dens/MetroVPN-for-Windows/releases',
           downloadUrl: 'https://github.com/Metro-dens/MetroVPN-for-Windows/releases/latest/download/Metrovpn-standalone-x64.exe',
           assetName: 'Metrovpn-standalone-x64.exe',
-          title: 'Metrovpn v2.7.2',
+          title: 'Metrovpn v2.7.3',
           message: 'You are running the latest version of Metrovpn for Windows.',
         };
         setUpdateInfo(mockInfo);
-        pushToast('You are on the latest version (v2.7.2)', 'success');
+        pushToast('You are on the latest version (v2.7.3)', 'success');
         return;
       }
       const info = await invokeCmd('check_github_update');
@@ -1187,7 +1244,10 @@ function MetroProvider({ children }) {
     testingAllPings,
     testAllPings,
     syncNodeQuota,
+    syncAllQuotas,
     syncingQuotaIds,
+    connectionError,
+    setConnectionError,
     downHistory,
     upHistory,
     totalSessionBytes,
@@ -1477,7 +1537,7 @@ function Titlebar() {
           }}
         >
           <span className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: COLORS.coral }} />
-          v2.7.2
+          v2.7.3
         </span>
       </div>
 
@@ -1688,6 +1748,8 @@ function HomeScreen() {
     openAddModal,
     setQrModalOpen,
     setOnboardingOpen,
+    connectionError,
+    setConnectionError,
     pushToast,
   } = useMetro();
 
@@ -1749,7 +1811,7 @@ function HomeScreen() {
           </span>
           <span>
             {isConnected
-              ? `Protected • ${activeNode?.vcn ? 'VCN' : 'TLS'}`
+              ? `Protected • ${activeNode?.protocol || 'Encrypted'}`
               : isConnecting
               ? 'Connecting...'
               : activeNode
@@ -1779,6 +1841,26 @@ function HomeScreen() {
             ? 'Click orb to connect'
             : 'No server yet • Paste link or scan QR to start'}
         </p>
+
+        {connectionError && (
+          <div
+            className="mt-2 w-full rounded-[12px] px-3 py-1.5 flex items-center justify-between gap-2 text-[11px]"
+            style={{ backgroundColor: 'rgba(84, 24, 29, 0.72)', border: '1px solid rgba(255, 84, 73, 0.45)', color: '#FFD4D0' }}
+          >
+            <div className="flex items-center gap-1.5 min-w-0">
+              <AlertCircle className="w-3.5 h-3.5 shrink-0" style={{ color: COLORS.coral }} />
+              <span className="truncate">{connectionError}</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setConnectionError('')}
+              className="w-5 h-5 rounded-full flex items-center justify-center shrink-0 cursor-pointer hover:bg-black/25"
+              style={{ color: COLORS.textMuted }}
+            >
+              <X className="w-3 h-3" />
+            </button>
+          </div>
+        )}
 
         {!activeNode && (
           <div className="mt-2.5 flex flex-wrap items-center justify-center gap-1.5">
@@ -2126,6 +2208,7 @@ function ServersScreen() {
     testingAllPings,
     testAllPings,
     syncNodeQuota,
+    syncAllQuotas,
     syncingQuotaIds,
     setShareNodeModal,
     setEditNodeModal,
@@ -2137,6 +2220,12 @@ function ServersScreen() {
   const [selectedFilter, setSelectedFilter] = useState('all');
   const [openMenuId, setOpenMenuId] = useState(null);
   const searchInputRef = useRef(null);
+
+  useEffect(() => {
+    if (nodes.length > 0) {
+      syncAllQuotas(false);
+    }
+  }, [syncAllQuotas, nodes.length]);
 
   useEffect(() => {
     const handler = (e) => {
@@ -2207,8 +2296,7 @@ function ServersScreen() {
     e.stopPropagation();
     if (!IN_TAURI) return;
     try {
-      const res = await invokeCmd('ping_server', { id: nodeId });
-      pushToast(res.pingMs != null ? `Latency: ${res.pingMs} ms` : 'Node ping timed out', res.online ? 'success' : 'amber');
+      await invokeCmd('ping_server', { id: nodeId });
     } catch (err) {
       pushToast(String(err), 'amber');
     }
@@ -2226,11 +2314,11 @@ function ServersScreen() {
       animate={{ opacity: 1, y: 0 }}
       exit={{ opacity: 0, y: -6 }}
       transition={SPRING_SOFT}
-      className="flex flex-col gap-3.5 pb-3"
+      className="flex flex-col gap-3.5 pb-12"
     >
       <div
         className="rounded-[24px] px-5 py-4 flex items-center justify-between gap-4"
-        style={GLASS_CARD}
+        style={connectionStatus === 'connected' ? GLASS_CONNECTED : GLASS_CARD}
       >
         <div className="flex items-center gap-3.5 min-w-0">
           <span className="relative flex h-3 w-3 shrink-0">
@@ -2250,10 +2338,20 @@ function ServersScreen() {
             />
           </span>
           <div className="min-w-0">
-            <div className="text-[10.5px] font-bold uppercase tracking-[0.13em]" style={{ color: COLORS.textMuted }}>
-              CURRENT SECURE EXIT
+            <div className="flex items-center gap-2">
+              <span className="text-[10.5px] font-bold uppercase tracking-[0.13em]" style={{ color: COLORS.textMuted }}>
+                {connectionStatus === 'connected' ? 'CONNECTED SERVER' : 'SELECTED SERVER'}
+              </span>
+              {connectionStatus === 'connected' && (
+                <span
+                  className="px-1.5 py-0.5 rounded-full text-[9px] font-bold tracking-wider uppercase"
+                  style={{ backgroundColor: 'rgba(26, 62, 48, 0.92)', border: '1px solid rgba(109, 213, 176, 0.5)', color: COLORS.mint }}
+                >
+                  ACTIVE
+                </span>
+              )}
             </div>
-            <div className="font-jakarta font-bold text-[16px] leading-snug truncate mt-0.5" style={{ color: COLORS.textPrimary }}>
+            <div className="font-jakarta font-bold text-[15.5px] leading-snug truncate mt-0.5" style={{ color: COLORS.textPrimary }}>
               {activeNode?.name || 'No Server'}
             </div>
           </div>
@@ -2263,7 +2361,7 @@ function ServersScreen() {
           <div className="font-mono tabular-nums text-[15px] font-bold leading-tight" style={{ color: COLORS.amber }}>
             {activeNode?.ping != null ? `${activeNode.ping} ms` : '— ms'}
           </div>
-          <div className="text-[11.5px] font-medium mt-0.5" style={{ color: COLORS.textMuted }}>
+          <div className="text-[11px] font-mono font-semibold mt-0.5" style={{ color: COLORS.textMuted }}>
             {activeNode?.protocol}
           </div>
         </div>
@@ -2373,7 +2471,7 @@ function ServersScreen() {
         </div>
       ) : (
         <div className="flex flex-col gap-2.5">
-          {filteredNodes.map((node) => {
+          {filteredNodes.map((node, idx) => {
             const isActiveNode = node.id === activeNodeId;
             const isConnectedCard = isActiveNode && connectionStatus === 'connected';
             const isConnectingCard = isActiveNode && connectionStatus === 'connecting';
@@ -2381,6 +2479,8 @@ function ServersScreen() {
             const hasQuotaSynced = (node.quotaUpdatedAtMs || 0) > 0;
             const remainingGB =
               node.quotaTotalGB > 0 ? Math.max(0, node.quotaTotalGB - (node.quotaUsedGB || 0)) : null;
+            const isMenuOpen = openMenuId === node.id;
+            const openMenuUpward = idx >= filteredNodes.length - 1 && filteredNodes.length > 1;
 
             return (
               <div
@@ -2392,34 +2492,42 @@ function ServersScreen() {
                   if (e.key === 'Enter' || e.key === ' ') connectToNode(node.id);
                 }}
                 className="rounded-[20px] p-3.5 cursor-pointer flex flex-col justify-between gap-2.5 relative transition-colors duration-150 hover:border-[#FF7369]"
-                style={isActiveNode ? GLASS_ACTIVE : GLASS_CARD}
+                style={{
+                  ...(isConnectedCard ? GLASS_CONNECTED : isActiveNode ? GLASS_ACTIVE : GLASS_CARD),
+                  zIndex: isMenuOpen ? 50 : 1,
+                }}
               >
                 <div className="flex items-start justify-between gap-2">
-                  <div className="flex items-center gap-2.5 min-w-0">
-                    <IspBadge node={node} size={36} isActive={isActiveNode} />
-                    <div className="min-w-0">
-                      <div className="flex items-center gap-1.5 flex-wrap">
-                        <h3 className="font-jakarta font-bold text-[13.5px] truncate" style={{ color: COLORS.textPrimary }}>
+                  <div className="flex items-center gap-2.5 min-w-0 flex-1">
+                    <IspBadge node={node} size={36} isActive={isConnectedCard || isActiveNode} />
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-1.5 min-w-0">
+                        <h3 className="font-jakarta font-bold text-[13.5px] truncate min-w-0 flex-1" style={{ color: COLORS.textPrimary }}>
                           {node.name}
                         </h3>
                         {isConnectedCard && (
                           <span
-                            className="px-1.5 py-0.5 rounded-full text-[9px] font-bold tracking-wider uppercase shrink-0"
-                            style={{ backgroundColor: COLORS.crimson, color: '#FFF1F1' }}
+                            className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[9px] font-bold tracking-wider uppercase shrink-0"
+                            style={{
+                              backgroundColor: 'rgba(22, 58, 44, 0.95)',
+                              border: '1px solid rgba(109, 213, 176, 0.65)',
+                              color: COLORS.mint,
+                            }}
                           >
+                            <span className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: COLORS.mint }} />
                             CONNECTED
                           </span>
                         )}
                         {isConnectingCard && (
                           <span
-                            className="px-1.5 py-0.5 rounded-full text-[9px] font-bold tracking-wider uppercase shrink-0"
+                            className="px-2 py-0.5 rounded-full text-[9px] font-bold tracking-wider uppercase shrink-0"
                             style={{ backgroundColor: COLORS.amberBg, color: COLORS.amber }}
                           >
                             CONNECTING
                           </span>
                         )}
                       </div>
-                      <p className="text-[11px] truncate mt-0.5" style={{ color: isActiveNode ? '#D2B7B6' : COLORS.textMuted }}>
+                      <p className="text-[11px] truncate mt-0.5" style={{ color: isConnectedCard ? '#BCE3D4' : isActiveNode ? '#D2B7B6' : COLORS.textMuted }}>
                         {node.isp} — <span className="font-mono text-[10.5px]">{node.sni}</span>
                       </p>
                     </div>
@@ -2451,7 +2559,7 @@ function ServersScreen() {
 
                     <button
                       type="button"
-                      onClick={() => setOpenMenuId(openMenuId === node.id ? null : node.id)}
+                      onClick={() => setOpenMenuId(isMenuOpen ? null : node.id)}
                       title="Node options"
                       className="w-7 h-7 rounded-full flex items-center justify-center cursor-pointer transition-colors hover:bg-black/20"
                       style={{ color: COLORS.textMuted }}
@@ -2460,13 +2568,13 @@ function ServersScreen() {
                     </button>
 
                     <AnimatePresence>
-                      {openMenuId === node.id && (
+                      {isMenuOpen && (
                         <motion.div
-                          initial={{ opacity: 0, scale: 0.96, y: -4 }}
+                          initial={{ opacity: 0, scale: 0.96, y: openMenuUpward ? 4 : -4 }}
                           animate={{ opacity: 1, scale: 1, y: 0 }}
-                          exit={{ opacity: 0, scale: 0.96, y: -4 }}
+                          exit={{ opacity: 0, scale: 0.96, y: openMenuUpward ? 4 : -4 }}
                           transition={{ duration: 0.12 }}
-                          className="absolute right-0 top-8 w-[156px] rounded-[14px] p-1 z-40 shadow-2xl"
+                          className={`absolute right-0 ${openMenuUpward ? 'bottom-8' : 'top-8'} w-[162px] rounded-[14px] p-1 z-50 shadow-2xl`}
                           style={GLASS_MODAL}
                         >
                           <button
@@ -2510,7 +2618,6 @@ function ServersScreen() {
                             onClick={async () => {
                               setOpenMenuId(null);
                               await copyClipboard(node.uri);
-                              pushToast(`Copied URI for ${node.name}`, 'success');
                             }}
                             className="w-full px-2.5 py-1.5 rounded-[9px] text-[11.5px] font-medium flex items-center gap-2 cursor-pointer hover:bg-[#312829]"
                             style={{ color: COLORS.textPrimary }}
@@ -2557,23 +2664,29 @@ function ServersScreen() {
                       : 'Ping'}
                   </button>
                   <span
-                    className="px-2 py-0.5 rounded-[7px] text-[10.5px] font-medium"
+                    className="px-2 py-0.5 rounded-[7px] font-mono text-[10.5px] font-semibold"
                     style={{
-                      backgroundColor: isActiveNode ? '#2A1C1C' : '#151213',
-                      border: `1px solid ${isActiveNode ? '#523837' : '#2A2324'}`,
-                      color: isActiveNode ? '#DFC7C6' : COLORS.textMuted,
+                      backgroundColor: node.vcn
+                        ? COLORS.amberBg
+                        : isConnectedCard
+                        ? 'rgba(20, 48, 37, 0.9)'
+                        : isActiveNode
+                        ? '#2A1C1C'
+                        : '#151213',
+                      border: `1px solid ${
+                        node.vcn
+                          ? 'rgba(230, 194, 128, 0.35)'
+                          : isConnectedCard
+                          ? 'rgba(109, 213, 176, 0.38)'
+                          : isActiveNode
+                          ? '#523837'
+                          : '#2A2324'
+                      }`,
+                      color: node.vcn ? COLORS.amber : isConnectedCard ? COLORS.mint : isActiveNode ? '#DFC7C6' : COLORS.textMuted,
                     }}
                   >
                     {node.protocol}
                   </span>
-                  {node.vcn && (
-                    <span
-                      className="px-2 py-0.5 rounded-[7px] font-mono text-[10px] font-bold"
-                      style={{ backgroundColor: COLORS.amberBg, color: COLORS.amber }}
-                    >
-                      VCN
-                    </span>
-                  )}
                   {node.quotaEmail && (
                     <span
                       className="px-2 py-0.5 rounded-[7px] font-mono text-[10px] truncate max-w-[130px]"
@@ -2586,27 +2699,25 @@ function ServersScreen() {
 
                 <div>
                   <div className="flex items-center justify-between text-[10px] font-mono tabular-nums mb-0.5">
-                    <span style={{ color: isActiveNode ? '#CCB1B0' : COLORS.textMuted }}>
+                    <span style={{ color: isConnectedCard ? '#BCE3D4' : isActiveNode ? '#CCB1B0' : COLORS.textMuted }}>
                       {isSyncingQuota
                         ? 'Syncing 3x-ui Quota...'
-                        : node.quotaTotalGB > 0
-                        ? `Used: ${formatUsageData(node.quotaUsedGB || 0)}`
-                        : hasQuotaSynced
-                        ? `Used: ${formatUsageData(node.quotaUsedGB || 0)}`
-                        : 'Data Quota'}
+                        : `Used: ${formatUsageData(node.quotaUsedGB || 0)}`}
                     </span>
                     <span style={{ color: COLORS.textPrimary }}>
                       {node.quotaTotalGB > 0
                         ? `Left: ${remainingGB.toFixed(1)} GB / ${node.quotaTotalGB.toFixed(1)} GB`
                         : hasQuotaSynced
                         ? 'Unlimited Plan'
-                        : `${formatUsageData(node.quotaUsedGB || 0)} • Tap ↻ to Sync`}
+                        : isSyncingQuota
+                        ? 'Updating...'
+                        : 'Auto-Sync'}
                     </span>
                   </div>
                   <WavyQuotaBar
                     usedGB={node.quotaUsedGB || 0}
                     totalGB={node.quotaTotalGB || 0}
-                    isConnectedCard={isActiveNode}
+                    isConnectedCard={isActiveNode || isConnectedCard}
                   />
                 </div>
               </div>
@@ -3674,7 +3785,7 @@ function SettingsScreen() {
               <div className="min-w-0">
                 <img src={metrovpnWordmark} alt="Metrovpn" className="h-[20px] w-auto object-contain mb-0.5" />
                 <div className="font-mono text-[11px] truncate" style={{ color: COLORS.textMuted }}>
-                  v2.7.2 • Xray v26.11.9 • Fixed :10808/:10809
+                  v2.7.3 • Xray v26.11.9 • Fixed :10808/:10809
                 </div>
               </div>
             </div>
@@ -3809,16 +3920,16 @@ function SettingsScreen() {
 }
 
 // ============================================================================
-// ADD CONFIG MODAL (VLESS / VMess URI Only — Clean Single Purpose)
+// ADD CONFIG MODAL (VLESS / VMess / Trojan URI — Add Manually)
 // ============================================================================
 function AddConfigModal() {
   const {
     addModalOpen,
     setAddModalOpen,
     setNodes,
-    connectToNode,
+    setActiveNodeId,
     setActiveRoute,
-    pushToast,
+    connectionStatus,
   } = useMetro();
 
   const [uriText, setUriText] = useState('');
@@ -3829,11 +3940,11 @@ function AddConfigModal() {
   const handleClipboardPaste = async () => {
     setErrorMsg('');
     const text = await readClipboard();
-    if (text && (text.toLowerCase().includes('vless://') || text.toLowerCase().includes('vmess://'))) {
+    const low = String(text || '').toLowerCase();
+    if (low.includes('vless://') || low.includes('vmess://') || low.includes('trojan://')) {
       setUriText(text.trim());
-      pushToast('Pasted link from clipboard', 'success');
     } else {
-      setErrorMsg('Clipboard does not contain a vless:// or vmess:// link.');
+      setErrorMsg('Clipboard does not contain a vless://, vmess://, or trojan:// link.');
     }
   };
 
@@ -3841,14 +3952,49 @@ function AddConfigModal() {
     setErrorMsg('');
     try {
       if (!uriText.trim()) {
-        setErrorMsg('Paste a valid vless:// or vmess:// link first.');
+        setErrorMsg('Paste a valid vless://, vmess://, or trojan:// link first.');
+        return;
+      }
+      if (!IN_TAURI) {
+        if (!parsedUri) {
+          setErrorMsg('Paste a valid vless://, vmess://, or trojan:// link first.');
+          return;
+        }
+        const localNode = {
+          id: `node-${Date.now()}`,
+          name: parsedUri.name,
+          region: 'SG',
+          isp: parsedUri.isp,
+          address: parsedUri.sni,
+          port: 443,
+          uuid: '',
+          sni: parsedUri.sni,
+          protocol: parsedUri.protocol,
+          transport: 'tcp',
+          tlsMode: 'tls',
+          vcn: parsedUri.protocol.includes('VCN'),
+          quotaUsedGB: 0,
+          quotaTotalGB: 0,
+          quotaUpdatedAtMs: 0,
+          starred: false,
+          online: false,
+          uri: uriText.trim(),
+        };
+        setNodes((prev) => [localNode, ...prev]);
+        if (connectionStatus !== 'connected') {
+          setActiveNodeId(localNode.id);
+        }
+        setUriText('');
+        setAddModalOpen(false);
+        setActiveRoute('servers');
         return;
       }
       const imported = await invokeCmd('import_uri', { input: uriText.trim(), mode: 'uri' });
       const all = await invokeCmd('list_servers');
       setNodes(all);
-      if (imported[0]) await connectToNode(imported[0].id);
-      pushToast(`Added ${imported.length} server(s)`, 'success');
+      if (imported[0] && connectionStatus !== 'connected') {
+        setActiveNodeId(imported[0].id);
+      }
       setUriText('');
       setAddModalOpen(false);
       setActiveRoute('servers');
@@ -3890,7 +4036,7 @@ function AddConfigModal() {
                     Add Server Config
                   </h3>
                   <p className="text-[11px]" style={{ color: COLORS.textMuted }}>
-                    Paste your vless:// or vmess:// config link
+                    Paste your vless://, vmess://, or trojan:// link
                   </p>
                 </div>
               </div>
@@ -3940,8 +4086,8 @@ function AddConfigModal() {
                       {parsedUri.isp} — {parsedUri.sni}
                     </div>
                   </div>
-                  <span className="px-2 py-0.5 rounded-full text-[10px] font-bold shrink-0" style={{ backgroundColor: '#1E332B', color: COLORS.mint }}>
-                    Ready
+                  <span className="px-2 py-0.5 rounded-full font-mono text-[10px] font-bold shrink-0" style={{ backgroundColor: '#1E332B', color: COLORS.mint }}>
+                    {parsedUri.protocol}
                   </span>
                 </div>
               )}
@@ -3966,10 +4112,10 @@ function AddConfigModal() {
               <button
                 type="button"
                 onClick={handleConfirm}
-                className="px-4 py-1.5 rounded-full text-[12px] font-semibold cursor-pointer transition-colors duration-150 hover:bg-[#B50D17]"
+                className="px-5 py-1.5 rounded-full text-[12px] font-semibold cursor-pointer transition-colors duration-150 hover:bg-[#B50D17]"
                 style={{ backgroundColor: COLORS.crimson, color: COLORS.textPrimary, border: '1px solid #BC1F27' }}
               >
-                Add &amp; Connect
+                Add
               </button>
             </div>
           </motion.div>
@@ -3987,9 +4133,9 @@ function QrScannerModal() {
     qrModalOpen,
     setQrModalOpen,
     setNodes,
-    connectToNode,
+    setActiveNodeId,
     setActiveRoute,
-    pushToast,
+    connectionStatus,
   } = useMetro();
 
   const [scanTab, setScanTab] = useState('screen'); // 'screen' | 'camera'
@@ -4023,14 +4169,14 @@ function QrScannerModal() {
       try {
         if (!IN_TAURI) {
           setDecodedUri(rawQrText);
-          pushToast('Decoded QR in preview mode', 'success');
           return;
         }
         const imported = await invokeCmd('import_uri', { input: rawQrText.trim(), mode: 'uri' });
         const all = await invokeCmd('list_servers');
         setNodes(all);
-        if (imported[0]) await connectToNode(imported[0].id);
-        pushToast(`Imported QR server: ${imported[0]?.name || 'Node'}`, 'success');
+        if (imported[0] && connectionStatus !== 'connected') {
+          setActiveNodeId(imported[0].id);
+        }
         stopCamera();
         setQrModalOpen(false);
         setActiveRoute('servers');
@@ -4038,7 +4184,7 @@ function QrScannerModal() {
         setErrorMsg(String(err));
       }
     },
-    [setNodes, connectToNode, pushToast, stopCamera, setQrModalOpen, setActiveRoute]
+    [setNodes, setActiveNodeId, connectionStatus, stopCamera, setQrModalOpen, setActiveRoute]
   );
 
   // Live Camera QR Loop using jsQR
@@ -5856,7 +6002,6 @@ function DesktopStage() {
         <AutoUpdateModal />
         <NodeUtilityModals />
         <XrayLogsDrawer />
-        <ToastOverlay />
       </div>
     );
   }
@@ -5977,8 +6122,6 @@ function DesktopStage() {
           </span>
         </motion.button>
       </div>
-
-      <ToastOverlay />
     </div>
   );
 }

@@ -18,9 +18,9 @@ use vpn_manager::{
     download_and_install_update, emit_status, finish_screen_snip, get_logs, get_settings,
     get_snip_preview, get_status, import_subscription, import_uri, is_admin, list_servers,
     quit_app, reconnect_active, refresh_local_ip, reset_settings, restart_as_admin,
-    scan_screen_qr, scan_windows_apps, start_screen_snip, sync_all_quotas, sync_node_quota,
-    sync_node_quota_internal, toggle_star, update_all_subscriptions, update_server,
-    update_settings, AppState,
+    scan_screen_qr, scan_windows_apps, start_screen_snip, sync_all_quotas,
+    sync_all_quotas_internal, sync_node_quota, toggle_star, update_all_subscriptions,
+    update_server, update_settings, AppState,
 };
 
 fn toggle_tray_flyout(app: &tauri::AppHandle) {
@@ -218,18 +218,16 @@ pub fn run() {
                         g.store.settings.system_mode.clone(),
                     )
                 };
-                if let Some(id) = node_id_opt {
-                    let app_h = app.handle().clone();
-                    let st_c = state.clone();
-                    if should_auto {
-                        tauri::async_runtime::spawn(async move {
-                            let _ = connect_internal(app_h, st_c, id, mode).await;
-                        });
-                    } else {
-                        tauri::async_runtime::spawn(async move {
-                            let _ = sync_node_quota_internal(&app_h, &st_c, &id).await;
-                        });
-                    }
+                let app_h = app.handle().clone();
+                let st_c = state.clone();
+                if let (true, Some(id)) = (should_auto, node_id_opt) {
+                    tauri::async_runtime::spawn(async move {
+                        let _ = connect_internal(app_h, st_c, id, mode).await;
+                    });
+                } else {
+                    tauri::async_runtime::spawn(async move {
+                        let _ = sync_all_quotas_internal(&app_h, &st_c).await;
+                    });
                 }
             }
 

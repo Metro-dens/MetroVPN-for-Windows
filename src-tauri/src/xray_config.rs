@@ -304,11 +304,31 @@ fn build_proxy_outbound(node: &ServerNode, settings: &AppSettings) -> Value {
         return raw;
     }
 
-    let is_vmess = node.uri.to_lowercase().starts_with("vmess://");
-    let security = if node.tls_mode.is_empty() {
-        "tls"
+    let uri_lower = node.uri.to_lowercase();
+    let is_vmess = uri_lower.starts_with("vmess://");
+    let is_trojan = uri_lower.starts_with("trojan://");
+
+    let security_owned = if node.tls_mode.trim().is_empty() {
+        "tls".to_string()
     } else {
-        node.tls_mode.as_str()
+        let s = node.tls_mode.trim().to_lowercase();
+        if s == "xtls" { "tls".to_string() } else { s }
+    };
+    let security = security_owned.as_str();
+
+    let transport_owned = {
+        let t = node.transport.trim().to_lowercase();
+        if t.is_empty() || t == "raw" {
+            "tcp".to_string()
+        } else {
+            t
+        }
+    };
+    let transport = transport_owned.as_str();
+    let stream_network = if transport == "splithttp" {
+        "xhttp"
+    } else {
+        transport
     };
 
     let fp = if !node.fingerprint.is_empty() {
@@ -326,7 +346,7 @@ fn build_proxy_outbound(node: &ServerNode, settings: &AppSettings) -> Value {
     };
 
     let mut stream_settings = json!({
-        "network": node.transport,
+        "network": stream_network,
         "security": security
     });
 
@@ -345,30 +365,36 @@ fn build_proxy_outbound(node: &ServerNode, settings: &AppSettings) -> Value {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect()
-        } else if node.transport == "ws" {
-            // Avoid HTTP/2 upgrade 400 trap on WebSocket+TLS inbounds
+        } else if transport == "ws" || transport == "httpupgrade" {
+            // Avoid HTTP/2 upgrade mismatch on WebSocket & HTTPUpgrade transports
             vec!["http/1.1".to_string()]
         } else {
             vec!["h2".to_string(), "http/1.1".to_string()]
         };
 
-        let inferred_vcn_host = node
+        let explicit_vcn_host = node
             .vcn_host
             .as_deref()
             .map(str::trim)
             .filter(|h| !h.is_empty())
-            .or_else(|| {
-                if !node.allow_insecure
-                    && node.address.parse::<std::net::IpAddr>().is_err()
-                    && !node.address.eq_ignore_ascii_case(effective_sni)
-                {
-                    Some(node.address.as_str())
-                } else {
-                    None
-                }
-            });
-        let has_vcn_host = inferred_vcn_host.is_some();
-        let allow_insecure = if has_vcn_host && settings.cert_pinning {
+            .map(str::to_string);
+
+        // If no explicit vcn= parameter was supplied on a domain+TLS link where server address != SNI,
+        // allow either the address domain cert (e.g. direct spoofed-SNI servers) OR the SNI domain cert
+        // (e.g. CDN / Cloudflare / reverse proxies) using Xray's comma-separated verifyPeerCertByName.
+        let verify_peer_names: Option<String> = explicit_vcn_host.or_else(|| {
+            if !node.allow_insecure
+                && node.address.parse::<std::net::IpAddr>().is_err()
+                && !node.address.eq_ignore_ascii_case(effective_sni)
+            {
+                Some(format!("{},{}", node.address, effective_sni))
+            } else {
+                None
+            }
+        });
+
+        let has_vcn_pin = node.vcn && verify_peer_names.is_some();
+        let allow_insecure = if has_vcn_pin && settings.cert_pinning {
             false
         } else {
             node.allow_insecure || settings.allow_insecure_fallback
@@ -381,47 +407,141 @@ fn build_proxy_outbound(node: &ServerNode, settings: &AppSettings) -> Value {
             "alpn": alpn_list
         });
 
-        // Always apply verifyPeerCertByName when node has explicit or inferred VCN host & cert_pinning is enabled
-        if let Some(vcn_host) = inferred_vcn_host {
+        if let Some(peer_names) = verify_peer_names {
             if settings.cert_pinning {
-                tls_obj["verifyPeerCertByName"] = json!(vcn_host);
+                tls_obj["verifyPeerCertByName"] = json!(peer_names);
             }
         }
         stream_settings["tlsSettings"] = tls_obj;
     }
 
-    match node.transport.as_str() {
-        "ws" => {
-            let ws_path = node
-                .path
-                .clone()
-                .filter(|p| !p.trim().is_empty())
-                .unwrap_or_else(|| "/".into());
-            // Match Android XrayConfigBuilder: wsHost.ifBlank { vcn.ifBlank { sni } }
-            let host_header = node
-                .host
+    let host_header = node
+        .host
+        .as_deref()
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .or_else(|| {
+            node.vcn_host
                 .as_deref()
-                .filter(|h| !h.trim().is_empty())
-                .or_else(|| node.vcn_host.as_deref().filter(|v| !v.trim().is_empty()))
-                .unwrap_or(effective_sni);
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+        })
+        .unwrap_or(effective_sni);
+
+    let path_str = node
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .unwrap_or("/");
+
+    match stream_network {
+        "ws" => {
             let mut ws = json!({
-                "path": ws_path
+                "path": path_str
             });
             if !host_header.is_empty() {
                 ws["host"] = json!(host_header);
-                ws["headers"] = json!({ "Host": host_header });
             }
             stream_settings["wsSettings"] = ws;
         }
-        "tcp" => {
-            stream_settings["tcpSettings"] = json!({
-                "header": { "type": "none" }
+        "httpupgrade" => {
+            let mut hu = json!({
+                "path": path_str
+            });
+            if !host_header.is_empty() {
+                hu["host"] = json!(host_header);
+            }
+            stream_settings["httpupgradeSettings"] = hu;
+        }
+        "xhttp" => {
+            let mut xh = json!({
+                "path": path_str,
+                "mode": node.mode.as_deref().filter(|m| !m.trim().is_empty()).unwrap_or("auto")
+            });
+            if !host_header.is_empty() {
+                xh["host"] = json!(host_header);
+            }
+            if let Some(extra_raw) = &node.extra {
+                if let Ok(extra_val) = serde_json::from_str::<Value>(extra_raw.trim()) {
+                    xh["extra"] = extra_val;
+                }
+            }
+            stream_settings["xhttpSettings"] = xh;
+        }
+        "h2" | "http" => {
+            stream_settings["network"] = json!("http");
+            let hosts = if host_header.is_empty() {
+                Vec::<String>::new()
+            } else {
+                vec![host_header.to_string()]
+            };
+            stream_settings["httpSettings"] = json!({
+                "path": path_str,
+                "host": hosts
             });
         }
+        "tcp" => {
+            let header_t = node
+                .header_type
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("none")
+                .to_lowercase();
+            if header_t == "http" {
+                let req_host = if host_header.is_empty() {
+                    node.address.as_str()
+                } else {
+                    host_header
+                };
+                stream_settings["tcpSettings"] = json!({
+                    "header": {
+                        "type": "http",
+                        "request": {
+                            "version": "1.1",
+                            "method": "GET",
+                            "path": [path_str],
+                            "headers": {
+                                "Host": [req_host]
+                            }
+                        }
+                    }
+                });
+            } else {
+                stream_settings["tcpSettings"] = json!({
+                    "header": { "type": "none" }
+                });
+            }
+        }
         "grpc" => {
-            stream_settings["grpcSettings"] = json!({
-                "serviceName": node.service_name.clone().unwrap_or_else(|| "grpc".into())
+            let multi_mode = node
+                .mode
+                .as_deref()
+                .map(|m| m.eq_ignore_ascii_case("multi"))
+                .unwrap_or(false);
+            let mut grpc = json!({
+                "serviceName": node.service_name.clone().unwrap_or_else(|| "grpc".into()),
+                "multiMode": multi_mode
             });
+            if let Some(auth) = &node.authority {
+                if !auth.trim().is_empty() {
+                    grpc["authority"] = json!(auth.trim());
+                }
+            }
+            stream_settings["grpcSettings"] = grpc;
+        }
+        "kcp" => {
+            let mut kcp = json!({
+                "header": {
+                    "type": node.header_type.clone().unwrap_or_else(|| "none".into())
+                }
+            });
+            if let Some(seed) = &node.seed {
+                if !seed.trim().is_empty() {
+                    kcp["seed"] = json!(seed.trim());
+                }
+            }
+            stream_settings["kcpSettings"] = kcp;
         }
         _ => {}
     }
@@ -449,9 +569,23 @@ fn build_proxy_outbound(node: &ServerNode, settings: &AppSettings) -> Value {
                     "users": [{
                         "id": node.uuid,
                         "alterId": 0,
-                        "security": "auto",
+                        "security": node.encryption.clone().unwrap_or_else(|| "auto".into()),
                         "level": 8
                     }]
+                }]
+            },
+            "streamSettings": stream_settings
+        })
+    } else if is_trojan {
+        json!({
+            "tag": "proxy",
+            "protocol": "trojan",
+            "settings": {
+                "servers": [{
+                    "address": node.address,
+                    "port": node.port,
+                    "password": node.uuid,
+                    "level": 8
                 }]
             },
             "streamSettings": stream_settings
@@ -459,11 +593,11 @@ fn build_proxy_outbound(node: &ServerNode, settings: &AppSettings) -> Value {
     } else {
         let mut user = json!({
             "id": node.uuid,
-            "encryption": "none",
+            "encryption": node.encryption.clone().unwrap_or_else(|| "none".into()),
             "level": 8
         });
         if let Some(flow) = &node.flow {
-            if !flow.is_empty() && node.transport == "tcp" {
+            if !flow.is_empty() && transport == "tcp" {
                 user["flow"] = json!(flow);
             }
         }
@@ -542,7 +676,7 @@ mod tests {
         let proxy = &cfg["outbounds"][0];
         let tls = &proxy["streamSettings"]["tlsSettings"];
         assert_eq!(tls["serverName"], "st1.zoom.us");
-        assert_eq!(tls["verifyPeerCertByName"], "vpn.metrodens.site");
+        assert_eq!(tls["verifyPeerCertByName"], "vpn.metrodens.site,st1.zoom.us");
         assert_eq!(tls["allowInsecure"], false);
         assert_eq!(tls["fingerprint"], "chrome");
         assert_eq!(tls["alpn"], json!(["h2", "http/1.1"]));

@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: "Release tag to create (e.g. v2.7.2)"
+        description: "Release tag to create (e.g. v2.7.3)"
         required: true
-        default: "v2.7.2"
+        default: "v2.7.3"
         type: string
       draft:
         description: "Create as a draft release (hidden until published)"
@@ -76,12 +76,12 @@ jobs:
             - **`Metrovpn-windows-x64-portable.zip`** — Portable folder archive with all binaries side-by-side.
             - **`SHA256SUMS.txt`** — SHA-256 verification checksums (`Get-FileHash <file> -Algorithm SHA256`).
 
-            ### What's New in v2.7.2
-            - **Always Starts as Administrator & TUN Default:** Embedded UAC `requireAdministrator` manifest so Windows launches Metrovpn elevated every time, and set **TUN Mode** as the out-of-the-box default.
-            - **Snipping-Tool Mouse-Drag QR Scanner:** Drag your mouse over any QR code anywhere on your desktop/browser (with zoomed dim backdrop and `Esc` cancel) to crop and import instantly.
-            - **Fixed Spoofed-SNI TCP+TLS Links (e.g. `type=tcp&security=tls&sni=st1.zoom.us`):** Automatically infers `verifyPeerCertByName` from domain addresses when `sni` differs from host without an explicit `vcn=` parameter.
-            - **Android Frosted Glass UI + Smooth Neon Telemetry:** Added layered glassmorphic cards with ambient radial lighting, silky-smooth `requestAnimationFrame` speedometer & sparkline interpolation, and neon-blooming Download/Upload lines with glowing endpoint dots.
-            - **Cleaner Add Config Dialog:** Removed the Sample button so pasting/importing configs stays focused.
+            ### What's New in v2.7.3
+            - **Native Windows Notification Only on Connect:** Removed all annoying floating in-app toast popups; displays a single clean Windows notification when the VPN tunnel connects.
+            - **Manual Connect After Adding Configs:** Replaced **Add & Connect** with **Add** in both URI import and QR scan so you connect manually whenever ready.
+            - **Servers Tab Overlap & Active Indicator Fix:** Fixed dropdown menu z-index stacking behind sibling glass cards, clearly highlights the **CONNECTED** server in emerald, and displays exact protocol types (`TCP+TLS`, `TCP+TLS+VCN`, `WS+TLS`, `gRPC+TLS`, `XHTTP+TLS`, `HTTPUpgrade+TLS`, `TCP+REALITY`, Trojan, VMess).
+            - **Full Non-VCN Support + Multi-IP TUN Fix:** Fixed TLS certificate verification (`verifyPeerCertByName` comma-list support for domain + SNI/CDN certs), added XHTTP/HTTPUpgrade/H2/mKCP/TCP-HTTP/gRPC-multi/Trojan support, and synchronized TUN DNS hosts with Windows gateway routes.
+            - **Automatic Quota Sync Across Every VLESS Node:** Concurrently auto-syncs 3x-ui data quota for all servers on launch, connect, Servers tab open, and periodically in the background.
 
             > **SmartScreen Note:** If Windows Defender SmartScreen prompts on an unsigned build, verify the SHA-256 checksum against `SHA256SUMS.txt` and click **More info → Run anyway**.
           releaseDraft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft || false }}

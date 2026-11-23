@@ -1,8 +1,8 @@
 {
-  "versionCode": 272,
-  "versionName": "2.7.2",
-  "title": "Metrovpn v2.7.2 Update Available",
-  "message": "Always launches elevated as Administrator with TUN Mode set as default, fixes TCP+TLS spoofed-SNI links without explicit VCN params, upgrades Screen QR capture to a mouse-drag Snipping Tool overlay, removes the Sample button, adds smooth neon telemetry lines with endpoint dots + smoother speedometer, and brings Android frosted glassmorphism.",
-  "downloadUrl": "https://github.com/Metro-dens/MetroVPN-for-Windows/releases/latest/download/Metrovpn_2.7.2_x64-setup.exe",
+  "versionCode": 273,
+  "versionName": "2.7.3",
+  "title": "Metrovpn v2.7.3 Update Available",
+  "message": "Removes floating in-app toast notifications in favor of a single native Windows notification on connect, replaces 'Add & Connect' with manual 'Add', fixes Servers tab dropdown overlapping & clearly highlights the connected server, adds full support & exact labels (TCP+TLS, TCP+TLS+VCN, WS+TLS, gRPC, XHTTP, HTTPUpgrade, Reality, Trojan, VMess), and auto-updates data quota across every VLESS node.",
+  "downloadUrl": "https://github.com/Metro-dens/MetroVPN-for-Windows/releases/latest/download/Metrovpn_2.7.3_x64-setup.exe",
   "mandatory": false
 }

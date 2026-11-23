@@ -265,6 +265,8 @@ mod win_impl {
     pub fn configure_tun_interface(
         interface_name: &str,
         server_host: &str,
+        server_port: u16,
+        pre_resolved_ips: &[String],
         dns_server: &str,
         mtu: u16,
     ) -> Result<Vec<String>, String> {
@@ -362,19 +364,31 @@ mod win_impl {
             .creation_flags(CREATE_NO_WINDOW)
             .output();
 
-        // Pin direct host routes for ALL resolved server IPv4s so TUN traffic never loops
+        // Pin direct host routes for ALL pre-resolved server IPv4s so TUN traffic never loops
         let mut pinned_ips = Vec::new();
         if !orig_gw.is_empty() {
-            if let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&(server_host, 443)) {
-                for addr in addrs {
-                    if let std::net::SocketAddr::V4(v4) = addr {
-                        let ip = v4.ip().to_string();
-                        if !pinned_ips.contains(&ip) {
-                            let _ = Command::new("route")
-                                .args(["add", &ip, "mask", "255.255.255.255", &orig_gw, "metric", "1"])
-                                .creation_flags(CREATE_NO_WINDOW)
-                                .output();
-                            pinned_ips.push(ip);
+            for ip in pre_resolved_ips {
+                let clean = ip.trim();
+                if !clean.is_empty() && !pinned_ips.iter().any(|x| x == clean) {
+                    let _ = Command::new("route")
+                        .args(["add", clean, "mask", "255.255.255.255", &orig_gw, "metric", "1"])
+                        .creation_flags(CREATE_NO_WINDOW)
+                        .output();
+                    pinned_ips.push(clean.to_string());
+                }
+            }
+            if pinned_ips.is_empty() {
+                if let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&(server_host, server_port)) {
+                    for addr in addrs {
+                        if let std::net::SocketAddr::V4(v4) = addr {
+                            let ip = v4.ip().to_string();
+                            if !pinned_ips.contains(&ip) {
+                                let _ = Command::new("route")
+                                    .args(["add", &ip, "mask", "255.255.255.255", &orig_gw, "metric", "1"])
+                                    .creation_flags(CREATE_NO_WINDOW)
+                                    .output();
+                                pinned_ips.push(ip);
+                            }
                         }
                     }
                 }
@@ -766,6 +780,49 @@ mod win_impl {
         let (_vx, _vy, vw, vh, buf) = capture_virtual_screen_with_bounds()?;
         Ok((vw, vh, buf))
     }
+
+    fn escape_xml_text(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        for ch in s.chars() {
+            match ch {
+                '&' => out.push_str("&amp;"),
+                '<' => out.push_str("&lt;"),
+                '>' => out.push_str("&gt;"),
+                '"' => out.push_str("&quot;"),
+                '\'' => out.push_str("&apos;"),
+                '\r' | '\n' | '\t' => out.push(' '),
+                c => out.push(c),
+            }
+        }
+        out
+    }
+
+    pub fn send_windows_connected_notification(server_name: &str, mode: &str) {
+        use base64::Engine as _;
+        let title_xml = escape_xml_text("Metrovpn Connected");
+        let body_xml = escape_xml_text(&format!("Protected via {server_name} ({mode})"));
+        let ps_script = format!(
+            "$ErrorActionPreference='SilentlyContinue'\n\
+            [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null\n\
+            [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null\n\
+            $xml = New-Object Windows.Data.Xml.Dom.XmlDocument\n\
+            $xml.LoadXml('<toast><visual><binding template=\"ToastGeneric\"><text>{title_xml}</text><text>{body_xml}</text></binding></visual></toast>')\n\
+            $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)\n\
+            try {{ [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('site.metrodens.metrovpn').Show($toast) }} catch {{ try {{ [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}}\\WindowsPowerShell\\v1.0\\powershell.exe').Show($toast) }} catch {{}} }}"
+        );
+        let mut utf16le = Vec::with_capacity(ps_script.len() * 2);
+        for unit in ps_script.encode_utf16() {
+            utf16le.extend_from_slice(&unit.to_le_bytes());
+        }
+        let encoded = base64::engine::general_purpose::STANDARD.encode(utf16le);
+
+        std::thread::spawn(move || {
+            let _ = Command::new("powershell")
+                .args(["-NoProfile", "-NonInteractive", "-EncodedCommand", &encoded])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output();
+        });
+    }
 }
 
 #[cfg(not(windows))]
@@ -812,6 +869,8 @@ mod win_impl {
     pub fn configure_tun_interface(
         _interface_name: &str,
         _server_host: &str,
+        _server_port: u16,
+        _pre_resolved_ips: &[String],
         _dns_server: &str,
         _mtu: u16,
     ) -> Result<Vec<String>, String> {
@@ -831,13 +890,16 @@ mod win_impl {
     pub fn capture_virtual_screen_rgba() -> Result<(u32, u32, Vec<u8>), String> {
         Err("Screen capture QR is only supported on Windows".into())
     }
+
+    pub fn send_windows_connected_notification(_server_name: &str, _mode: &str) {}
 }
 
 pub use win_impl::{
     acquire_single_instance_or_focus, capture_virtual_screen_rgba,
     capture_virtual_screen_with_bounds, configure_tun_interface, enable_system_proxy,
     is_elevated, kill_stale_core_processes, relaunch_as_admin, restore_system_proxy,
-    scan_installed_windows_apps, teardown_tun_routes, CREATE_NO_WINDOW,
+    scan_installed_windows_apps, send_windows_connected_notification, teardown_tun_routes,
+    CREATE_NO_WINDOW,
 };
 
 pub fn backup_file_path(app_data_dir: &Path) -> std::path::PathBuf {

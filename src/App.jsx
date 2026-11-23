@@ -1074,17 +1074,17 @@ function MetroProvider({ children }) {
     try {
       if (!IN_TAURI) {
         const mockInfo = {
-          currentVersion: '2.7.5',
-          latestVersion: '2.7.5',
+          currentVersion: '2.7.6',
+          latestVersion: '2.7.6',
           updateAvailable: false,
           releaseUrl: 'https://github.com/Metro-dens/MetroVPN-for-Windows/releases',
           downloadUrl: 'https://github.com/Metro-dens/MetroVPN-for-Windows/releases/latest/download/Metrovpn-standalone-x64.exe',
           assetName: 'Metrovpn-standalone-x64.exe',
-          title: 'Metrovpn v2.7.5',
+          title: 'Metrovpn v2.7.6',
           message: 'You are running the latest version of Metrovpn for Windows.',
         };
         setUpdateInfo(mockInfo);
-        pushToast('You are on the latest version (v2.7.5)', 'success');
+        pushToast('You are on the latest version (v2.7.6)', 'success');
         return;
       }
       const info = await invokeCmd('check_github_update');
@@ -1537,7 +1537,7 @@ function Titlebar() {
           }}
         >
           <span className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: COLORS.coral }} />
-          v2.7.5
+          v2.7.6
         </span>
       </div>
 
@@ -2820,13 +2820,35 @@ function SpeedScreen() {
 
   const [bars, setBars] = useState(() => Array(22).fill(12));
 
+  const speedToGaugeFraction = useCallback((mbps) => {
+    const v = Math.max(0, Number(mbps) || 0);
+    if (v <= 0.01) return 0.06;
+    // Smooth Ookla-style nonlinear curve spanning 0 -> 1000+ Mbps
+    const stops = [
+      [0, 0.06],
+      [10, 0.22],
+      [50, 0.44],
+      [100, 0.58],
+      [250, 0.76],
+      [500, 0.90],
+      [1000, 0.98],
+    ];
+    for (let i = 1; i < stops.length; i++) {
+      const [x0, y0] = stops[i - 1];
+      const [x1, y1] = stops[i];
+      if (v <= x1) {
+        return y0 + ((v - x0) / (x1 - x0)) * (y1 - y0);
+      }
+    }
+    return 0.98;
+  }, []);
+
   useEffect(() => {
     if (!speedTestProgress) return;
     setPhase(speedTestProgress.phase);
     if (speedTestProgress.mbps != null) {
       setGaugeSpeed(speedTestProgress.mbps);
-      const maxScale = speedTestProgress.phase === 'upload' ? 50 : 100;
-      setGaugeFraction(Math.min(0.98, Math.max(0.06, speedTestProgress.mbps / maxScale)));
+      setGaugeFraction(speedToGaugeFraction(speedTestProgress.mbps));
     }
     setMetrics((prev) => ({
       ping: speedTestProgress.pingMs ?? prev.ping,
@@ -2834,7 +2856,7 @@ function SpeedScreen() {
       download: speedTestProgress.downloadMbps ?? prev.download,
       upload: speedTestProgress.uploadMbps ?? prev.upload,
     }));
-  }, [speedTestProgress]);
+  }, [speedTestProgress, speedToGaugeFraction]);
 
   const latestDownMbps = downHistory[downHistory.length - 1] || 0;
   const latestUpMbps = upHistory[upHistory.length - 1] || 0;
@@ -2853,8 +2875,8 @@ function SpeedScreen() {
       let nextHeight = 10;
       if (active) {
         if (mbps > 0.002) {
-          // Logarithmic scaling so KB/s browsing AND 100+ Mbps speed tests both read clearly
-          const norm = Math.log10(1 + mbps * 25) / Math.log10(1 + 100 * 25);
+          // Logarithmic scaling so KB/s browsing AND 500+ Mbps speed tests both read clearly
+          const norm = Math.log10(1 + mbps * 12) / Math.log10(1 + 600 * 12);
           nextHeight = Math.max(20, Math.min(96, Math.round(18 + norm * 78)));
         } else {
           nextHeight = 16;
@@ -2888,7 +2910,7 @@ function SpeedScreen() {
       const entry = await invokeCmd('run_speed_test', { serverId: testNode.id });
       setPhase('complete');
       setGaugeSpeed(entry.download);
-      setGaugeFraction(Math.min(0.96, entry.download / 100));
+      setGaugeFraction(speedToGaugeFraction(entry.download));
       setMetrics({
         ping: entry.ping,
         jitter: entry.jitter,
@@ -3818,7 +3840,7 @@ function SettingsScreen() {
               <div className="min-w-0">
                 <img src={metrovpnWordmark} alt="Metrovpn" className="h-[20px] w-auto object-contain mb-0.5" />
                 <div className="font-mono text-[11px] truncate" style={{ color: COLORS.textMuted }}>
-                  v2.7.5 • Xray v26.11.9 • Fixed :10808/:10809
+                  v2.7.6 • Xray v26.11.9 • Fixed :10808/:10809
                 </div>
               </div>
             </div>

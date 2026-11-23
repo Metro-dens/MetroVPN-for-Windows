@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: "Release tag to create (e.g. v2.7.5)"
+        description: "Release tag to create (e.g. v2.7.6)"
         required: true
-        default: "v2.7.5"
+        default: "v2.7.6"
         type: string
       draft:
         description: "Create as a draft release (hidden until published)"
@@ -76,10 +76,10 @@ jobs:
             - **`Metrovpn-windows-x64-portable.zip`** — Portable folder archive with all binaries side-by-side.
             - **`SHA256SUMS.txt`** — SHA-256 verification checksums (`Get-FileHash <file> -Algorithm SHA256`).
 
-            ### What's New in v2.7.5
-            - **Fixed Connected Server Indicator on Servers Tab:** Fixed a React context key-spread bug where stale `settingsState.activeNodeId` overwrote the live `activeNodeId`, preventing the connected server card from lighting up. The connected server now clearly displays a glowing emerald green card border and pulsing **CONNECTED** pill (and a **SELECTED** badge when disconnected).
-            - **Fixed Post-Connect TLS Warning Banner:** Preserves diagnostic messages emitted on `vpn://status` so any TLS/x509 warning shows immediately on the Home screen with a 1-click **Logs** button.
-            - Includes all **v2.7.4** Xray-core `v26.11.9` TLS (`pinnedPeerCertSha256`) and Windows TUN DNS routing fixes.
+            ### What's New in v2.7.6
+            - **Multi-Connection Ookla/Fast.com-Grade Speed Test Engine:** Replaced the old single-stream 25 MB / 10 MB test (which capped high-speed fiber links at half speed due to TCP slow-start and HTTP/2 single-socket multiplexing) with **8 parallel independent HTTP/1.1 TCP download streams (7s)** and **6 parallel independent upload streams (6s)**, discarding the initial 1.5s warm-up ramp and computing Ookla-style trimmed steady-state Mbps.
+            - **Warmed Keep-Alive Ping & Jitter:** Discards 2 cold TLS/SOCKS5 warm-up probes before timing 10 keep-alive RTT probes, reporting accurate low-percentile Ping and spike-filtered Jitter.
+            - **0–1000+ Mbps Nonlinear Speedometer Arc:** Upgraded the Speed tab gauge and telemetry bars to smoothly scale from 0 to 1,000+ Mbps instead of pinning at 100 Mbps.
 
             > **SmartScreen Note:** If Windows Defender SmartScreen prompts on an unsigned build, verify the SHA-256 checksum against `SHA256SUMS.txt` and click **More info → Run anyway**.
           releaseDraft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft || false }}

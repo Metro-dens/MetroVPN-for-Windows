@@ -1,8 +1,8 @@
 {
-  "versionCode": 275,
-  "versionName": "2.7.5",
-  "title": "Metrovpn v2.7.5 Update Available",
-  "message": "Fixes the Servers tab active/connected card highlight so the currently connected server is clearly marked with a pulsing emerald CONNECTED badge and glowing green border (plus a SELECTED badge when disconnected), and keeps live TLS diagnostics visible on the Home screen.",
-  "downloadUrl": "https://github.com/Metro-dens/MetroVPN-for-Windows/releases/latest/download/Metrovpn_2.7.5_x64-setup.exe",
+  "versionCode": 276,
+  "versionName": "2.7.6",
+  "title": "Metrovpn v2.7.6 Speed Test Upgrade",
+  "message": "Upgrades the built-in Speed Test to a multi-connection steady-state engine (8 parallel TCP/HTTP1.1 download streams + 6 parallel upload streams with warm-up exclusion and Ookla-style trimmed sampling, warmed keep-alive ping & jitter, and a 0-1000+ Mbps nonlinear speedometer arc) so high-speed fiber connections match Ookla Speedtest & Fast.com.",
+  "downloadUrl": "https://github.com/Metro-dens/MetroVPN-for-Windows/releases/latest/download/Metrovpn_2.7.6_x64-setup.exe",
   "mandatory": false
 }

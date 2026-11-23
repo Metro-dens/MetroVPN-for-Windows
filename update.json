@@ -1,8 +1,8 @@
 {
-  "versionCode": 274,
-  "versionName": "2.7.4",
-  "title": "Metrovpn v2.7.4 Critical TLS & TUN Fix",
-  "message": "Fixes critical Xray-core v26.11.9 TLS crashes (migrates allowInsecure=1 and IP/self-signed TLS nodes to automatic pinnedPeerCertSha256 leaf-cert pinning, expands VCN/host verification, forces WS/HTTPUpgrade ALPN to http/1.1, migrates legacy H2 to XHTTP stream-one), eliminates Windows TUN DNS routing deadlocks (direct IPv4 TUN dial + AsIs routing + Win32 GetBestRoute gateway pinning + TUN metric=1), fixes standalone .exe core upgrades, and adds post-connect live TLS tunnel verification.",
-  "downloadUrl": "https://github.com/Metro-dens/MetroVPN-for-Windows/releases/latest/download/Metrovpn_2.7.4_x64-setup.exe",
+  "versionCode": 275,
+  "versionName": "2.7.5",
+  "title": "Metrovpn v2.7.5 Update Available",
+  "message": "Fixes the Servers tab active/connected card highlight so the currently connected server is clearly marked with a pulsing emerald CONNECTED badge and glowing green border (plus a SELECTED badge when disconnected), and keeps live TLS diagnostics visible on the Home screen.",
+  "downloadUrl": "https://github.com/Metro-dens/MetroVPN-for-Windows/releases/latest/download/Metrovpn_2.7.5_x64-setup.exe",
   "mandatory": false
 }

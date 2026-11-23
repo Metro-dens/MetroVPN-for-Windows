@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: "Release tag to create (e.g. v2.7.4)"
+        description: "Release tag to create (e.g. v2.7.5)"
         required: true
-        default: "v2.7.4"
+        default: "v2.7.5"
         type: string
       draft:
         description: "Create as a draft release (hidden until published)"
@@ -76,12 +76,10 @@ jobs:
             - **`Metrovpn-windows-x64-portable.zip`** — Portable folder archive with all binaries side-by-side.
             - **`SHA256SUMS.txt`** — SHA-256 verification checksums (`Get-FileHash <file> -Algorithm SHA256`).
 
-            ### What's New in v2.7.4 (Critical TLS & Windows TUN Fix)
-            - **Fixed Xray-core v26.11.9 TLS Crash (`allowInsecure` Removal):** Upstream Xray-core v26.x removed `"allowInsecure": true` (causing instant exit code 23 crashes). Metrovpn now omits `allowInsecure`, parses `pcs=`/`pinsha256=`, and automatically probes the server's leaf X.509 SHA-256 over TLS (`pinnedPeerCertSha256`) for `allowInsecure=1`, Allow Insecure Fallback, and IP-only TLS links across Connect, Ping, and Speed Test.
-            - **Fixed Windows TUN Mode DNS & Routing Deadlocks:** Pre-resolves domain servers to direct IPv4s in TUN mode (preserving SNI/VCN/Host), switches Xray routing `domainStrategy` to `AsIs` (preventing local UDP:53 loops on Windows TUN and Sri Lanka ISP zero-rating packages), binds `socks-in` UDP IP explicitly for `tun2socks` DNS, uses Win32 `GetBestRoute` + interface-index pinning (Wi-Fi/Ethernet/PPPoE/USB tethering/WSL safe), sets `Metrovpn-TUN` `metric=1`, and checks route command exit statuses.
-            - **Fixed Protocol & Transport Edge Cases:** Forces `alpn: ["http/1.1"]` on WebSocket & HTTPUpgrade (preventing HTTP/2 400 rejections), migrates removed legacy `h2`/`http` transport to `xhttp` (`stream-one`), includes `host` in `verifyPeerCertByName` candidates, and guards `flow` / `TLS Frag` / `mux`.
-            - **Live Post-Connect TLS Tunnel Verification & Diagnostics:** Automatically verifies HTTP 204 over the active tunnel and surfaces exact `x509`/TLS/Xray errors with a 1-click **Logs** button on the Home screen.
-            - **Fixed Standalone `.exe` Core Upgrades + Full Lint/Audit Pass:** Version-stamps `%AppData%\...\core\.core-version` so upgrading `Metrovpn-standalone-x64.exe` always updates bundled core binaries; 0 Rust Clippy warnings (`-D warnings`) and 0 ESLint errors.
+            ### What's New in v2.7.5
+            - **Fixed Connected Server Indicator on Servers Tab:** Fixed a React context key-spread bug where stale `settingsState.activeNodeId` overwrote the live `activeNodeId`, preventing the connected server card from lighting up. The connected server now clearly displays a glowing emerald green card border and pulsing **CONNECTED** pill (and a **SELECTED** badge when disconnected).
+            - **Fixed Post-Connect TLS Warning Banner:** Preserves diagnostic messages emitted on `vpn://status` so any TLS/x509 warning shows immediately on the Home screen with a 1-click **Logs** button.
+            - Includes all **v2.7.4** Xray-core `v26.11.9` TLS (`pinnedPeerCertSha256`) and Windows TUN DNS routing fixes.
 
             > **SmartScreen Note:** If Windows Defender SmartScreen prompts on an unsigned build, verify the SHA-256 checksum against `SHA256SUMS.txt` and click **More info → Run anyway**.
           releaseDraft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft || false }}

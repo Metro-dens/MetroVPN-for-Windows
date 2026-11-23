@@ -676,16 +676,17 @@ function MetroProvider({ children }) {
           invokeCmd('get_speed_history'),
         ]);
         if (!mounted) return;
+        applySettingsObject(settings);
         if (Array.isArray(srvList)) {
           setNodes(srvList);
           if (!settings?.activeNodeId && srvList[0]) {
             setActiveNodeId(srvList[0].id);
+            setSettingsState((prev) => ({ ...prev, activeNodeId: srvList[0].id }));
           }
           if (srvList.length > 0) {
             syncAllQuotas(true);
           }
         }
-        applySettingsObject(settings);
         if (settings && !settings.onboardingCompleted) {
           setOnboardingOpen(true);
         }
@@ -693,7 +694,10 @@ function MetroProvider({ children }) {
           setConnectionStatus(status.status.toLowerCase());
           setSessionSeconds(status.elapsedSecs || 0);
           setLocalLanIp(status.localLanIp || '127.0.0.1');
-          if (status.activeNodeId) setActiveNodeId(status.activeNodeId);
+          if (status.activeNodeId) {
+            setActiveNodeId(status.activeNodeId);
+            setSettingsState((prev) => ({ ...prev, activeNodeId: status.activeNodeId }));
+          }
         }
         if (Array.isArray(initLogs)) setLogs(initLogs);
         if (Array.isArray(history)) setSpeedHistory(history);
@@ -769,10 +773,14 @@ function MetroProvider({ children }) {
           if (status.systemMode) {
             setSettingsState((prev) => ({ ...prev, systemMode: status.systemMode }));
           }
-          if (status.activeNodeId !== undefined) setActiveNodeId(status.activeNodeId || null);
+          if (status.activeNodeId !== undefined) {
+            const nextId = status.activeNodeId || null;
+            setActiveNodeId(nextId);
+            setSettingsState((prev) => ({ ...prev, activeNodeId: nextId }));
+          }
           if (status.localLanIp) setLocalLanIp(status.localLanIp);
           if (norm === 'connected') {
-            setConnectionError('');
+            setConnectionError(status.message ? String(status.message) : '');
           }
           if (norm === 'disconnected') {
             setDownHistory(Array(14).fill(0));
@@ -921,6 +929,7 @@ function MetroProvider({ children }) {
       const modeToUse = forcedMode || settingsRef.current.systemMode;
       setConnectionError('');
       setActiveNodeId(nodeId);
+      setSettingsState((prev) => ({ ...prev, activeNodeId: nodeId }));
       setConnectionStatus('connecting');
       setSettingsNeedsReconnect(false);
 
@@ -1065,17 +1074,17 @@ function MetroProvider({ children }) {
     try {
       if (!IN_TAURI) {
         const mockInfo = {
-          currentVersion: '2.7.4',
-          latestVersion: '2.7.4',
+          currentVersion: '2.7.5',
+          latestVersion: '2.7.5',
           updateAvailable: false,
           releaseUrl: 'https://github.com/Metro-dens/MetroVPN-for-Windows/releases',
           downloadUrl: 'https://github.com/Metro-dens/MetroVPN-for-Windows/releases/latest/download/Metrovpn-standalone-x64.exe',
           assetName: 'Metrovpn-standalone-x64.exe',
-          title: 'Metrovpn v2.7.4',
+          title: 'Metrovpn v2.7.5',
           message: 'You are running the latest version of Metrovpn for Windows.',
         };
         setUpdateInfo(mockInfo);
-        pushToast('You are on the latest version (v2.7.4)', 'success');
+        pushToast('You are on the latest version (v2.7.5)', 'success');
         return;
       }
       const info = await invokeCmd('check_github_update');
@@ -1206,7 +1215,13 @@ function MetroProvider({ children }) {
     [persistSettingsPatch, connectionStatus]
   );
 
+  const resolvedActiveNodeId = activeNode?.id || activeNodeId || null;
+
   const value = {
+    // Spread persisted settings first so live state values (especially activeNodeId) always win
+    ...settingsState,
+    settings: settingsState,
+
     activeRoute,
     setActiveRoute,
     railExpanded,
@@ -1223,7 +1238,7 @@ function MetroProvider({ children }) {
     nodes,
     setNodes,
     activeNode,
-    activeNodeId,
+    activeNodeId: resolvedActiveNodeId,
     setActiveNodeId,
     connectToNode,
     toggleStarNode,
@@ -1262,9 +1277,6 @@ function MetroProvider({ children }) {
     persistSettingsPatch,
     applySettingsObject,
 
-    // All Settings fields exposed ergonomically + settings object alias
-    settings: settingsState,
-    ...settingsState,
     socksPort: 10808,
     httpPort: 10809,
     systemMode: settingsState.systemMode,
@@ -1525,7 +1537,7 @@ function Titlebar() {
           }}
         >
           <span className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: COLORS.coral }} />
-          v2.7.4
+          v2.7.5
         </span>
       </div>
 
@@ -2471,7 +2483,8 @@ function ServersScreen() {
       ) : (
         <div className="flex flex-col gap-2.5">
           {filteredNodes.map((node, idx) => {
-            const isActiveNode = node.id === activeNodeId;
+            const effectiveActiveId = activeNode?.id || activeNodeId;
+            const isActiveNode = Boolean(effectiveActiveId && node.id === effectiveActiveId);
             const isConnectedCard = isActiveNode && connectionStatus === 'connected';
             const isConnectingCard = isActiveNode && connectionStatus === 'connecting';
             const isSyncingQuota = Boolean(syncingQuotaIds?.[node.id]);
@@ -2486,6 +2499,8 @@ function ServersScreen() {
                 key={node.id}
                 role="button"
                 tabIndex={0}
+                data-connected={isConnectedCard ? 'true' : 'false'}
+                data-active={isActiveNode ? 'true' : 'false'}
                 onClick={() => connectToNode(node.id)}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter' || e.key === ' ') connectToNode(node.id);
@@ -2506,23 +2521,36 @@ function ServersScreen() {
                         </h3>
                         {isConnectedCard && (
                           <span
-                            className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[9px] font-bold tracking-wider uppercase shrink-0"
+                            className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[9.5px] font-bold tracking-wider uppercase shrink-0"
                             style={{
-                              backgroundColor: 'rgba(22, 58, 44, 0.95)',
-                              border: '1px solid rgba(109, 213, 176, 0.65)',
+                              backgroundColor: 'rgba(18, 66, 48, 0.96)',
+                              border: '1px solid rgba(109, 213, 176, 0.85)',
                               color: COLORS.mint,
+                              boxShadow: '0 0 12px rgba(109, 213, 176, 0.35)',
                             }}
                           >
-                            <span className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: COLORS.mint }} />
+                            <span className="w-1.5 h-1.5 rounded-full animate-pulse" style={{ backgroundColor: COLORS.mint }} />
                             CONNECTED
                           </span>
                         )}
                         {isConnectingCard && (
                           <span
-                            className="px-2 py-0.5 rounded-full text-[9px] font-bold tracking-wider uppercase shrink-0"
+                            className="px-2 py-0.5 rounded-full text-[9.5px] font-bold tracking-wider uppercase shrink-0"
                             style={{ backgroundColor: COLORS.amberBg, color: COLORS.amber }}
                           >
                             CONNECTING
+                          </span>
+                        )}
+                        {isActiveNode && !isConnectedCard && !isConnectingCard && (
+                          <span
+                            className="px-2 py-0.5 rounded-full text-[9px] font-bold tracking-wider uppercase shrink-0"
+                            style={{
+                              backgroundColor: 'rgba(92, 34, 38, 0.85)',
+                              border: '1px solid rgba(255, 130, 120, 0.45)',
+                              color: '#FFD4D0',
+                            }}
+                          >
+                            SELECTED
                           </span>
                         )}
                       </div>
@@ -3790,7 +3818,7 @@ function SettingsScreen() {
               <div className="min-w-0">
                 <img src={metrovpnWordmark} alt="Metrovpn" className="h-[20px] w-auto object-contain mb-0.5" />
                 <div className="font-mono text-[11px] truncate" style={{ color: COLORS.textMuted }}>
-                  v2.7.4 • Xray v26.11.9 • Fixed :10808/:10809
+                  v2.7.5 • Xray v26.11.9 • Fixed :10808/:10809
                 </div>
               </div>
             </div>

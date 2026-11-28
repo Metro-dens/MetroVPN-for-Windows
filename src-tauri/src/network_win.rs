@@ -41,7 +41,7 @@ mod win_impl {
     use std::os::windows::process::CommandExt;
     use std::path::Path;
     use std::process::Command;
-    use std::sync::OnceLock;
+    use std::sync::Mutex;
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
     use windows_sys::Win32::Graphics::Gdi::{
         BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC,
@@ -61,9 +61,10 @@ mod win_impl {
     use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE};
     use winreg::RegKey;
 
-    static SINGLE_INSTANCE_HANDLE: OnceLock<isize> = OnceLock::new();
+    static SINGLE_INSTANCE_HANDLE: Mutex<Option<isize>> = Mutex::new(None);
 
     pub const CREATE_NO_WINDOW: u32 = 0x08000000;
+    const DETACHED_PROCESS: u32 = 0x00000008;
     const INTERNET_SETTINGS_PATH: &str =
         "Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
 
@@ -201,13 +202,15 @@ mod win_impl {
     pub fn acquire_single_instance_or_focus() -> bool {
         let is_relaunch = std::env::args().any(|a| a == "--relaunch");
         let name = to_wide("Local\\MetrovpnSingleInstanceMutex");
-        let attempts = if is_relaunch { 30 } else { 1 };
+        let attempts = if is_relaunch { 40 } else { 1 };
         for _ in 0..attempts {
             let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
             if !handle.is_null() {
                 let err = unsafe { GetLastError() };
                 if err != ERROR_ALREADY_EXISTS {
-                    let _ = SINGLE_INSTANCE_HANDLE.set(handle as isize);
+                    if let Ok(mut guard) = SINGLE_INSTANCE_HANDLE.lock() {
+                        *guard = Some(handle as isize);
+                    }
                     return true;
                 }
                 unsafe {
@@ -215,7 +218,7 @@ mod win_impl {
                 }
             }
             if is_relaunch {
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                std::thread::sleep(std::time::Duration::from_millis(120));
             }
         }
 
@@ -230,7 +233,151 @@ mod win_impl {
         false
     }
 
+    pub fn release_single_instance_mutex() {
+        if let Ok(mut guard) = SINGLE_INSTANCE_HANDLE.lock() {
+            if let Some(raw) = guard.take() {
+                unsafe {
+                    CloseHandle(raw as *mut std::ffi::c_void);
+                }
+            }
+        }
+    }
+
+    fn escape_ps_single(s: &str) -> String {
+        s.replace('\'', "''")
+    }
+
+    fn encode_ps_utf16_b64(script: &str) -> String {
+        use base64::Engine as _;
+        let mut utf16le = Vec::with_capacity(script.len() * 2);
+        for unit in script.encode_utf16() {
+            utf16le.extend_from_slice(&unit.to_le_bytes());
+        }
+        base64::engine::general_purpose::STANDARD.encode(utf16le)
+    }
+
+    fn shell_execute_open(file_path: &str, params: Option<&str>) -> Result<(), String> {
+        let verb = to_wide("open");
+        let file = to_wide(file_path);
+        let params_wide = params.map(to_wide);
+        let params_ptr = params_wide
+            .as_ref()
+            .map(|w| w.as_ptr())
+            .unwrap_or(std::ptr::null());
+        let res = unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                verb.as_ptr(),
+                file.as_ptr(),
+                params_ptr,
+                std::ptr::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        if (res as isize) <= 32 {
+            return Err(format!(
+                "Windows ShellExecute failed to launch updater (code {})",
+                res as isize
+            ));
+        }
+        Ok(())
+    }
+
+    /// Launches a detached Windows updater helper that waits for the current
+    /// `Metrovpn.exe` process to exit completely (freeing file locks & single-instance
+    /// mutex), then either replaces the standalone `.exe` in-place and relaunches with
+    /// `--relaunch`, or launches the NSIS `.exe` / WiX `.msi` installer via ShellExecute.
+    pub fn launch_windows_update_handoff(
+        installer_path: &Path,
+        is_standalone_replace: bool,
+    ) -> Result<(), String> {
+        let src_str = installer_path.to_string_lossy().to_string();
+        let src_ps = escape_ps_single(&src_str);
+        let pid = std::process::id();
+        let lower_src = src_str.to_lowercase();
+
+        let ps_script = if is_standalone_replace {
+            let cur_exe = std::env::current_exe()
+                .map_err(|e| format!("Failed to resolve current executable: {e}"))?;
+            let dst_ps = escape_ps_single(&cur_exe.to_string_lossy());
+            format!(
+                "$ErrorActionPreference='SilentlyContinue'\n\
+                try {{ Wait-Process -Id {pid} -Timeout 12 -ErrorAction SilentlyContinue }} catch {{}}\n\
+                Start-Sleep -Milliseconds 400\n\
+                $src = '{src_ps}'\n\
+                $dst = '{dst_ps}'\n\
+                $bak = \"$dst.old\"\n\
+                $replaced = $false\n\
+                if ($src -ne $dst) {{\n\
+                  for ($i = 0; $i -lt 15; $i++) {{\n\
+                    try {{\n\
+                      if (Test-Path -LiteralPath $bak) {{ Remove-Item -LiteralPath $bak -Force -ErrorAction SilentlyContinue }}\n\
+                      if (Test-Path -LiteralPath $dst) {{ Move-Item -LiteralPath $dst -Destination $bak -Force -ErrorAction Stop }}\n\
+                      Copy-Item -LiteralPath $src -Destination $dst -Force -ErrorAction Stop\n\
+                      Remove-Item -LiteralPath $bak -Force -ErrorAction SilentlyContinue\n\
+                      Remove-Item -LiteralPath $src -Force -ErrorAction SilentlyContinue\n\
+                      $replaced = $true\n\
+                      break\n\
+                    }} catch {{\n\
+                      if (-not (Test-Path -LiteralPath $dst) -and (Test-Path -LiteralPath $bak)) {{\n\
+                        Move-Item -LiteralPath $bak -Destination $dst -Force -ErrorAction SilentlyContinue\n\
+                      }}\n\
+                      Start-Sleep -Milliseconds 500\n\
+                    }}\n\
+                  }}\n\
+                }} else {{ $replaced = $true }}\n\
+                if ($replaced) {{\n\
+                  Start-Process -FilePath $dst -ArgumentList '--relaunch'\n\
+                }} else {{\n\
+                  Start-Process -FilePath $src -ArgumentList '--relaunch'\n\
+                }}"
+            )
+        } else if lower_src.ends_with(".msi") {
+            format!(
+                "$ErrorActionPreference='SilentlyContinue'\n\
+                try {{ Wait-Process -Id {pid} -Timeout 12 -ErrorAction SilentlyContinue }} catch {{}}\n\
+                Start-Sleep -Milliseconds 400\n\
+                Start-Process -FilePath 'msiexec.exe' -ArgumentList @('/i', '{src_ps}')"
+            )
+        } else {
+            format!(
+                "$ErrorActionPreference='SilentlyContinue'\n\
+                try {{ Wait-Process -Id {pid} -Timeout 12 -ErrorAction SilentlyContinue }} catch {{}}\n\
+                Start-Sleep -Milliseconds 400\n\
+                Start-Process -FilePath '{src_ps}'"
+            )
+        };
+
+        let encoded = encode_ps_utf16_b64(&ps_script);
+        match Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-WindowStyle",
+                "Hidden",
+                "-EncodedCommand",
+                &encoded,
+            ])
+            .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+            .spawn()
+        {
+            Ok(_) => Ok(()),
+            Err(_) => {
+                // Fallback to direct ShellExecuteW if powershell is unavailable
+                if lower_src.ends_with(".msi") {
+                    let arg = format!("/i \"{src_str}\"");
+                    shell_execute_open("msiexec.exe", Some(&arg))
+                } else if is_standalone_replace {
+                    shell_execute_open(&src_str, Some("--relaunch"))
+                } else {
+                    shell_execute_open(&src_str, None)
+                }
+            }
+        }
+    }
+
     pub fn relaunch_as_admin() -> Result<(), String> {
+        release_single_instance_mutex();
         let exe = std::env::current_exe()
             .map_err(|e| format!("Failed to resolve current executable: {e}"))?;
         let verb = to_wide("runas");
@@ -952,6 +1099,15 @@ mod win_impl {
         true
     }
 
+    pub fn release_single_instance_mutex() {}
+
+    pub fn launch_windows_update_handoff(
+        _installer_path: &Path,
+        _is_standalone_replace: bool,
+    ) -> Result<(), String> {
+        Err("Windows installer handoff is only supported on Windows 10/11".into())
+    }
+
     pub fn enable_system_proxy(
         backup_path: &Path,
         _http_port: u16,
@@ -1014,9 +1170,9 @@ mod win_impl {
 pub use win_impl::{
     acquire_single_instance_or_focus, capture_virtual_screen_rgba,
     capture_virtual_screen_with_bounds, configure_tun_interface, enable_system_proxy,
-    is_elevated, kill_stale_core_processes, relaunch_as_admin, restore_system_proxy,
-    scan_installed_windows_apps, send_windows_connected_notification, teardown_tun_routes,
-    CREATE_NO_WINDOW,
+    is_elevated, kill_stale_core_processes, launch_windows_update_handoff, relaunch_as_admin,
+    release_single_instance_mutex, restore_system_proxy, scan_installed_windows_apps,
+    send_windows_connected_notification, teardown_tun_routes, CREATE_NO_WINDOW,
 };
 
 pub fn backup_file_path(app_data_dir: &Path) -> std::path::PathBuf {

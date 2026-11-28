@@ -800,22 +800,160 @@ pub fn parse_any(raw: &str, mode: Option<&str>) -> Result<Vec<ServerNode>, Strin
     }
 }
 
-pub async fn fetch_subscription(url: &str) -> Result<(Vec<ServerNode>, Option<(f64, f64)>), String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
-
-    let resp = client
-        .get(url.trim())
-        .header("User-Agent", "Metrovpn/2.4 (Windows NT 10.0; Win64; x64)")
-        .send()
-        .await
-        .map_err(|e| format!("Subscription request failed: {e}"))?;
-
-    if !resp.status().is_success() {
-        return Err(format!("Subscription server returned HTTP {}", resp.status()));
+fn percent_encode_fragment(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() * 2);
+    for b in input.bytes() {
+        let is_unreserved = b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~');
+        if is_unreserved {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
     }
+    out
+}
+
+/// Keeps `node.uri` synchronized when a user edits display name or SNI so
+/// Share QR and Copy URI always export the updated configuration.
+pub fn update_node_uri_fields(node: &mut ServerNode) {
+    let trimmed = node.uri.trim().to_string();
+    let lower = trimmed.to_lowercase();
+
+    if lower.starts_with("vless://") || lower.starts_with("trojan://") {
+        if let Ok(mut parsed) = Url::parse(&trimmed) {
+            let clean_sni = node.sni.trim();
+            let mut pairs: Vec<(String, String)> = parsed
+                .query_pairs()
+                .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                .collect();
+            if !clean_sni.is_empty() {
+                let mut replaced = false;
+                for (k, v) in &mut pairs {
+                    if k.eq_ignore_ascii_case("sni") || k.eq_ignore_ascii_case("servername") {
+                        *v = clean_sni.to_string();
+                        replaced = true;
+                    }
+                }
+                if !replaced {
+                    pairs.push(("sni".to_string(), clean_sni.to_string()));
+                }
+            }
+            {
+                let mut qp = parsed.query_pairs_mut();
+                qp.clear();
+                for (k, v) in &pairs {
+                    qp.append_pair(k, v);
+                }
+            }
+            let encoded_name = percent_encode_fragment(node.name.trim());
+            parsed.set_fragment(if encoded_name.is_empty() {
+                None
+            } else {
+                Some(&encoded_name)
+            });
+            node.uri = parsed.to_string();
+            return;
+        }
+    } else if lower.starts_with("vmess://") {
+        if let Some(b64) = trimmed
+            .strip_prefix("vmess://")
+            .or_else(|| trimmed.strip_prefix("VMESS://"))
+            .or_else(|| trimmed.get(8..))
+        {
+            if let Ok(raw_bytes) = decode_b64_flexible(b64) {
+                if let Ok(mut json) = serde_json::from_slice::<Value>(&raw_bytes) {
+                    if let Some(obj) = json.as_object_mut() {
+                        obj.insert("ps".to_string(), Value::String(node.name.trim().to_string()));
+                        if !node.sni.trim().is_empty() {
+                            obj.insert(
+                                "sni".to_string(),
+                                Value::String(node.sni.trim().to_string()),
+                            );
+                        }
+                    }
+                    if let Ok(serialized) = serde_json::to_string(&json) {
+                        node.uri = format!("vmess://{}", STANDARD.encode(serialized.as_bytes()));
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: build canonical vless:// URI if node.uri was blank
+    if trimmed.is_empty() && !node.address.trim().is_empty() {
+        let host_part = if node.address.contains(':') && !node.address.starts_with('[') {
+            format!("[{}]", node.address.trim())
+        } else {
+            node.address.trim().to_string()
+        };
+        let encoded_name = percent_encode_fragment(node.name.trim());
+        node.uri = format!(
+            "vless://{}@{}:{}?security={}&sni={}&type={}#{}",
+            node.uuid.trim(),
+            host_part,
+            node.port,
+            node.tls_mode.trim(),
+            urlencoding_encode(node.sni.trim()),
+            node.transport.trim(),
+            encoded_name
+        );
+    }
+}
+
+pub async fn fetch_subscription(
+    url: &str,
+    proxy_http_port: Option<u16>,
+) -> Result<(Vec<ServerNode>, Option<(f64, f64)>), String> {
+    let clean_url = url.trim();
+    let user_agent = format!(
+        "Metrovpn/{} (Windows NT 10.0; Win64; x64)",
+        env!("CARGO_PKG_VERSION")
+    );
+    let attempts: Vec<Option<u16>> = match proxy_http_port {
+        Some(p) => vec![Some(p), None],
+        None => vec![None],
+    };
+
+    let mut last_err = String::from("Subscription request failed");
+    let mut response_opt = None;
+
+    for port_opt in attempts {
+        let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(15));
+        if let Some(p) = port_opt {
+            if let Ok(px) = reqwest::Proxy::all(format!("http://127.0.0.1:{p}")) {
+                builder = builder.proxy(px);
+            }
+        } else {
+            builder = builder.no_proxy();
+        }
+        let client = match builder.build() {
+            Ok(c) => c,
+            Err(e) => {
+                last_err = format!("Failed to build HTTP client: {e}");
+                continue;
+            }
+        };
+        match client
+            .get(clean_url)
+            .header("User-Agent", &user_agent)
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                response_opt = Some(resp);
+                break;
+            }
+            Ok(resp) => {
+                last_err = format!("Subscription server returned HTTP {}", resp.status());
+            }
+            Err(e) => {
+                last_err = format!("Subscription request failed: {e}");
+            }
+        }
+    }
+
+    let resp = response_opt.ok_or(last_err)?;
 
     let quota = resp
         .headers()
@@ -1048,5 +1186,36 @@ mod tests {
         assert_eq!(node.isp, "Dialog");
         assert!(node.vcn);
     }
-}
 
+    #[test]
+    fn test_update_node_uri_fields_vless_and_vmess() {
+        let uri = "vless://a94b7c12-e3f1-48a2-b910-81c450d912fa@vpn.metrodens.site:443?encryption=none&security=tls&sni=st1.zoom.us&vcn=vpn.metrodens.site&type=tcp#Old%20Name";
+        let mut node = parse_vless_uri(uri).expect("should parse vless");
+        node.name = "New SLT Fiber".into();
+        node.sni = "m.zoom.us".into();
+        update_node_uri_fields(&mut node);
+
+        let reparsed = parse_vless_uri(&node.uri).expect("updated vless should re-parse");
+        assert_eq!(reparsed.name, "New SLT Fiber");
+        assert_eq!(reparsed.sni, "m.zoom.us");
+        assert_eq!(reparsed.vcn_host.as_deref(), Some("vpn.metrodens.site"));
+
+        let payload = serde_json::json!({
+            "v": "2", "ps": "Old VMess", "add": "jp.metrovpn.io", "port": 443,
+            "id": "3b1f09a4-12c8-4e7b-b3d1-90a27c8e51fd", "net": "ws",
+            "host": "cdn.example.com", "path": "/ws", "tls": "tls", "sni": "old.zoom.us"
+        });
+        let mut vnode = parse_vmess_uri(&format!(
+            "vmess://{}",
+            STANDARD.encode(payload.to_string().as_bytes())
+        ))
+        .expect("should parse vmess");
+        vnode.name = "Edited VMess".into();
+        vnode.sni = "new.zoom.us".into();
+        update_node_uri_fields(&mut vnode);
+
+        let vreparsed = parse_vmess_uri(&vnode.uri).expect("updated vmess should re-parse");
+        assert_eq!(vreparsed.name, "Edited VMess");
+        assert_eq!(vreparsed.sni, "new.zoom.us");
+    }
+}

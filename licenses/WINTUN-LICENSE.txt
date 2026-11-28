@@ -1,0 +1,16 @@
+Wintun (wintun.dll) — Third-Party License & Redistribution Notice
+=================================================================
+
+Copyright (C) 2018-2021 WireGuard LLC. All Rights Reserved.
+
+Metrovpn for Windows redistributes the unmodified, Microsoft-signed prebuilt
+`wintun.dll` driver binary from WireGuard LLC alongside `tun2socks.exe`.
+
+Homepage:    https://www.wintun.net/
+Source Code: https://git.zx2c4.com/wintun
+
+The Wintun source code is licensed under the GNU General Public License,
+Version 2 (GPL-2.0). A full copy of the GPL-2.0 license is included in
+`GPL-2.0.txt` in this directory. Prebuilt signed `wintun.dll` binaries are
+redistributed in unmodified form in accordance with WireGuard LLC's Wintun
+prebuilt binary license terms.

@@ -1,8 +1,10 @@
 {
-  "versionCode": 276,
-  "versionName": "2.7.6",
-  "title": "Metrovpn v2.7.6 Speed Test Upgrade",
-  "message": "Upgrades the built-in Speed Test to a multi-connection steady-state engine (8 parallel TCP/HTTP1.1 download streams + 6 parallel upload streams with warm-up exclusion and Ookla-style trimmed sampling, warmed keep-alive ping & jitter, and a 0-1000+ Mbps nonlinear speedometer arc) so high-speed fiber connections match Ookla Speedtest & Fast.com.",
-  "downloadUrl": "https://github.com/Metro-dens/MetroVPN-for-Windows/releases/latest/download/Metrovpn_2.7.6_x64-setup.exe",
+  "versionCode": 277,
+  "versionName": "2.7.7",
+  "title": "Metrovpn v2.7.7 Auto-Updater, QR Share & License Compliance",
+  "message": "Fixes the Windows auto-updater for NSIS, MSI, and Standalone EXE builds (releases the single-instance mutex, waits for clean process exit, verifies PE/MSI magic headers and SHA-256 checksums, and supports UAC/ShellExecute handoff), replaces the broken Share Node QR placeholder with a real scannable ISO/IEC 18004 QR generator with PNG export, fixes active-node deletion, node edit URI sync, subscription proxy routing, and Xray config edge cases, and bundles full MIT / MPL-2.0 / GPL-3.0 / Wintun open-source licenses and notices.",
+  "downloadUrl": "https://github.com/Metro-dens/MetroVPN-for-Windows/releases/download/v2.7.7/Metrovpn_2.7.7_x64-setup.exe",
+  "standaloneDownloadUrl": "https://github.com/Metro-dens/MetroVPN-for-Windows/releases/download/v2.7.7/Metrovpn-standalone-x64.exe",
+  "msiDownloadUrl": "https://github.com/Metro-dens/MetroVPN-for-Windows/releases/download/v2.7.7/Metrovpn_2.7.7_x64_en-US.msi",
   "mandatory": false
 }

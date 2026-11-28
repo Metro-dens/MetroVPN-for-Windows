@@ -1,5 +1,26 @@
 # Changelog
 
+## [v2.7.7] - 2026-11-27
+
+### Fixed & Added
+- **Windows Auto-Updater Overhaul (`vpn_manager.rs`, `network_win.rs`, `App.jsx`):**
+  - Fixed standalone EXE auto-updates failing due to single-instance mutex collision (`MetrovpnSingleInstanceMutex`) and launching from `%AppData%\updates` instead of updating in-place; added `release_single_instance_mutex()` and a detached PID-waiting handoff script that atomically replaces the standalone binary and relaunches with `--relaunch`.
+  - Fixed NSIS `.exe` and WiX `.msi` installer handoff by waiting for clean process exit and launching via Windows ShellExecute (`Start-Process` / `ShellExecuteW` fallback), preventing locked-binary errors and `ERROR_ELEVATION_REQUIRED` (740) failures.
+  - Added HTTPS trusted-host allowlist, parallel GitHub API + `update.json` manifest checks (supporting `downloadUrl`, `standaloneDownloadUrl`, and `msiDownloadUrl`), explicit `.no_proxy()` on direct fallback, HTML rejection, PE (`MZ`) / MSI OLE magic-byte verification, and `SHA256SUMS.txt` verification.
+  - Upgraded `AutoUpdateModal` with accurate launching progress, error display, **Retry**, and **GitHub** manual download fallback.
+- **Real Scannable Config QR Code Generator (`App.jsx`):**
+  - Replaced the decorative fake SVG grid in **Share Node QR** with a real ISO/IEC 18004 QR code generator (`qrcode`) encoding the node's actual `vless://` / `vmess://` / `trojan://` URI on a crisp pure-white quiet zone, plus one-click **Save PNG** and **Copy URI**.
+- **Core Bug Fixes:**
+  - Automatically disconnect the active VPN tunnel if its server node is deleted (`delete_server`).
+  - Keep `node.uri` synchronized when editing node Display Name or SNI (`update_server` / `update_node_uri_fields`) so Share QR and Copy URI always export updated settings.
+  - Honor `sub_use_proxy` when importing or syncing subscriptions (`fetch_subscription`).
+  - Restrict Xray `tlshello` fragmentation to TCP TLS/Reality transports (skipping UDP `quic`/`kcp`), sanitize comma/wildcard VCN before HTTP `Host` headers, and keep RFC1918 LAN bypass active when LAN Proxy Sharing is enabled.
+  - Persist System Tray mode toggles and guard TUN switches with an Administrator elevation check (`lib.rs`).
+- **Open-Source License Compliance (`LICENSE`, `THIRD-PARTY-LICENSES.md`, `licenses/`, `tauri.conf.json`, `App.jsx`):**
+  - Fixed MIT License text wording and added `"license": "MIT"` metadata to `package.json`, `Cargo.toml`, and `tauri.conf.json`.
+  - Added `THIRD-PARTY-LICENSES.md` and verbatim license texts (`GPL-3.0.txt`, `MPL-2.0.txt`, `GPL-2.0.txt`, `APACHE-2.0.txt`) covering Xray-core (`MPL-2.0`), tun2socks (`GPL-3.0` + corresponding source offer), Wintun (`WireGuard Prebuilt / GPL-2.0`), v2fly GeoIP/GeoSite (`CC-BY-SA-4.0 / MaxMind / MIT`), Tauri v2, Rust crates, and JS packages.
+  - Bundled license files into NSIS/MSI installers (`bundle.licenseFile` + `bundle.resources`) and Portable ZIP, and added an **Open Source Licenses** card and full viewer modal in **Settings → About**.
+
 ## [v2.6.0] - 2026-11-21
 
 ### Fixed & Redesigned

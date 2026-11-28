@@ -173,6 +173,16 @@ pub fn run() {
                                     } else {
                                         "TUN".to_string()
                                     };
+                                    if next == "TUN" && !network_win::is_elevated() {
+                                        drop(g);
+                                        st_c.push_log(
+                                            Some(&app_h),
+                                            "Warning",
+                                            "TUN Mode requires Administrator privileges — open Metrovpn to elevate",
+                                        );
+                                        show_main_window(&app_h);
+                                        return;
+                                    }
                                     g.store.settings.system_mode = next.clone();
                                     let was_c = g.status == "Connected";
                                     let id = g
@@ -183,6 +193,7 @@ pub fn run() {
                                         .or_else(|| g.store.servers.first().map(|s| s.id.clone()));
                                     (was_c, id, next)
                                 };
+                                st_c.persist();
                                 emit_status(&app_h, &st_c);
                                 if was_conn {
                                     if let Some(id) = node_id {

@@ -9,6 +9,7 @@ import React, {
 } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import jsQR from 'jsqr';
+import QRCode from 'qrcode';
 import {
   Home,
   Globe,
@@ -61,6 +62,7 @@ import {
   ScanLine,
   Info,
   Lock,
+  Scale,
 } from 'lucide-react';
 import {
   IN_TAURI,
@@ -83,6 +85,59 @@ import ispAirtelImg from './assets/isp_airtel.jpg';
 import ispMobitelImg from './assets/isp_mobitel.jpg';
 import metrovpnWordmark from './assets/metrovpn_wordmark.png';
 import metrovpnApkIcon from './assets/metrovpn_apk_icon.png';
+
+const APP_VERSION = '2.7.7';
+
+const OPEN_SOURCE_LICENSES = [
+  {
+    name: 'Metrovpn for Windows',
+    version: `v${APP_VERSION}`,
+    license: 'MIT License',
+    copyright: 'Copyright (c) 2026 Metro Dens',
+    url: 'https://github.com/Metro-dens/MetroVPN-for-Windows',
+    note: 'Desktop client source code and UI shell.',
+  },
+  {
+    name: 'Xray-core (xray.exe)',
+    version: 'v26.11.9',
+    license: 'MPL-2.0',
+    copyright: 'Project X / XTLS Contributors',
+    url: 'https://github.com/XTLS/Xray-core',
+    note: 'Distributed unmodified as a standalone external process. Full MPL-2.0 text bundled in licenses/MPL-2.0.txt.',
+  },
+  {
+    name: 'tun2socks (tun2socks.exe)',
+    version: 'v2.7.0',
+    license: 'GPL-3.0',
+    copyright: 'Copyright (c) xjasonlyu & contributors',
+    url: 'https://github.com/xjasonlyu/tun2socks/releases/tag/v2.7.0',
+    note: 'Distributed unmodified as a separate standalone CLI executable (GPL-3.0 §5 aggregate). Corresponding source available at the upstream link; full GPL-3.0 text in licenses/GPL-3.0.txt.',
+  },
+  {
+    name: 'Wintun (wintun.dll)',
+    version: 'Signed Prebuilt Driver',
+    license: 'Wintun Prebuilt / GPL-2.0',
+    copyright: 'Copyright (C) 2018-2021 WireGuard LLC. All Rights Reserved.',
+    url: 'https://www.wintun.net/',
+    note: 'Unmodified Microsoft-signed WireGuard Wintun driver redistributed alongside tun2socks.exe. Source at https://git.zx2c4.com/wintun.',
+  },
+  {
+    name: 'v2fly GeoIP & GeoSite',
+    version: 'geoip.dat / geosite.dat',
+    license: 'CC-BY-SA-4.0 & MIT',
+    copyright: 'v2fly Contributors / MaxMind GeoLite2',
+    url: 'https://github.com/v2fly/geoip',
+    note: 'Includes GeoLite2 data created by MaxMind (https://www.maxmind.com).',
+  },
+  {
+    name: 'Tauri v2, Rust Crates & React UI',
+    version: 'Tauri 2 • React 19 • qrcode • jsQR',
+    license: 'MIT / Apache-2.0 / ISC',
+    copyright: 'Tauri Programme, Tokio, Rustls, React, Framer Motion, node-qrcode, jsQR & Lucide contributors',
+    url: 'https://github.com/Metro-dens/MetroVPN-for-Windows/blob/main/THIRD-PARTY-LICENSES.md',
+    note: 'Full third-party license table and Apache-2.0 text bundled in licenses/THIRD-PARTY-LICENSES.md.',
+  },
+];
 
 const ISP_BRANDS = {
   SLT: { id: 'SLT', label: 'SLT', displayName: 'SLT Fiber', img: ispSltImg, bg: '#FFFFFF' },
@@ -590,6 +645,7 @@ function MetroProvider({ children }) {
   const [updateModalOpen, setUpdateModalOpen] = useState(false);
   const [downloadingUpdate, setDownloadingUpdate] = useState(false);
   const [updateDownloadProgress, setUpdateDownloadProgress] = useState(null);
+  const [licensesModalOpen, setLicensesModalOpen] = useState(false);
 
   const [logs, setLogs] = useState([]);
   const [logsStreaming, setLogsStreaming] = useState(true);
@@ -712,7 +768,9 @@ function MetroProvider({ children }) {
                 setUpdateModalOpen(true);
               }
             })
-            .catch(() => {});
+            .catch((err) => {
+              if (mounted) appendLog('Info', `Auto-update check skipped: ${String(err)}`);
+            });
         }
       } catch (err) {
         appendLog('Warning', `Initial backend hydration error: ${String(err)}`);
@@ -996,12 +1054,20 @@ function MetroProvider({ children }) {
   const deleteNode = useCallback(
     async (nodeId) => {
       const target = nodes.find((n) => n.id === nodeId);
+      const deletingActive = activeNodeId === nodeId;
       if (IN_TAURI) {
         try {
           const updated = await invokeCmd('delete_server', { id: nodeId });
           setNodes(updated);
-          if (activeNodeId === nodeId) {
-            setActiveNodeId(updated[0]?.id || null);
+          if (deletingActive) {
+            const nextId = updated[0]?.id || null;
+            setActiveNodeId(nextId);
+            setSettingsState((prev) => ({ ...prev, activeNodeId: nextId }));
+            if (connectionStatus === 'connected' || connectionStatus === 'connecting') {
+              setConnectionStatus('disconnected');
+              setSessionSeconds(0);
+              setSettingsNeedsReconnect(false);
+            }
           }
           pushToast(`Removed ${target?.name || 'node'}`, 'neutral');
           return;
@@ -1012,17 +1078,28 @@ function MetroProvider({ children }) {
       }
       const remaining = nodes.filter((n) => n.id !== nodeId);
       setNodes(remaining);
-      if (activeNodeId === nodeId) setActiveNodeId(remaining[0]?.id || null);
+      if (deletingActive) {
+        setActiveNodeId(remaining[0]?.id || null);
+        if (connectionStatus === 'connected' || connectionStatus === 'connecting') {
+          setConnectionStatus('disconnected');
+          setSessionSeconds(0);
+        }
+      }
     },
-    [nodes, activeNodeId, pushToast]
+    [nodes, activeNodeId, connectionStatus, pushToast]
   );
 
   const updateNodeDetails = useCallback(
     async (updated) => {
+      const prevNode = nodes.find((n) => n.id === updated.id);
+      const sniChanged = prevNode && prevNode.sni !== updated.sni;
       if (IN_TAURI) {
         try {
           const saved = await invokeCmd('update_server', updated);
           setNodes((prev) => prev.map((n) => (n.id === saved.id ? saved : n)));
+          if (sniChanged && activeNodeId === saved.id && connectionStatus === 'connected') {
+            setSettingsNeedsReconnect(true);
+          }
           pushToast(`Updated ${saved.name}`, 'success');
           return;
         } catch (err) {
@@ -1032,7 +1109,7 @@ function MetroProvider({ children }) {
       }
       setNodes((prev) => prev.map((n) => (n.id === updated.id ? { ...n, ...updated } : n)));
     },
-    [pushToast]
+    [nodes, activeNodeId, connectionStatus, pushToast]
   );
 
   const testAllPings = useCallback(async () => {
@@ -1074,21 +1151,22 @@ function MetroProvider({ children }) {
     try {
       if (!IN_TAURI) {
         const mockInfo = {
-          currentVersion: '2.7.6',
-          latestVersion: '2.7.6',
+          currentVersion: APP_VERSION,
+          latestVersion: APP_VERSION,
           updateAvailable: false,
           releaseUrl: 'https://github.com/Metro-dens/MetroVPN-for-Windows/releases',
-          downloadUrl: 'https://github.com/Metro-dens/MetroVPN-for-Windows/releases/latest/download/Metrovpn-standalone-x64.exe',
-          assetName: 'Metrovpn-standalone-x64.exe',
-          title: 'Metrovpn v2.7.6',
+          downloadUrl: `https://github.com/Metro-dens/MetroVPN-for-Windows/releases/download/v${APP_VERSION}/Metrovpn_${APP_VERSION}_x64-setup.exe`,
+          assetName: `Metrovpn_${APP_VERSION}_x64-setup.exe`,
+          title: `Metrovpn v${APP_VERSION}`,
           message: 'You are running the latest version of Metrovpn for Windows.',
         };
         setUpdateInfo(mockInfo);
-        pushToast('You are on the latest version (v2.7.6)', 'success');
+        pushToast(`You are on the latest version (v${APP_VERSION})`, 'success');
         return;
       }
       const info = await invokeCmd('check_github_update');
       setUpdateInfo(info);
+      setUpdateDownloadProgress(null);
       if (info.updateAvailable) {
         setUpdateModalOpen(true);
       }
@@ -1111,16 +1189,31 @@ function MetroProvider({ children }) {
       openExternalUrl(updateInfo.downloadUrl);
       return;
     }
+    setUpdateModalOpen(true);
     setDownloadingUpdate(true);
-    setUpdateDownloadProgress({ percent: 0, downloadedBytes: 0, totalBytes: 0, phase: 'downloading' });
+    setUpdateDownloadProgress({
+      percent: 0,
+      downloadedBytes: 0,
+      totalBytes: 0,
+      phase: 'downloading',
+      error: null,
+    });
     try {
       await invokeCmd('download_and_install_update', {
         downloadUrl: updateInfo.downloadUrl,
         assetName: updateInfo.assetName || 'Metrovpn-Update-Setup.exe',
       });
     } catch (err) {
+      const errMsg = String(err);
       setDownloadingUpdate(false);
-      pushToast(`Update install failed: ${String(err)}`, 'amber');
+      setUpdateDownloadProgress({
+        percent: 0,
+        downloadedBytes: 0,
+        totalBytes: 0,
+        phase: 'error',
+        error: errMsg,
+      });
+      pushToast(`Update install failed: ${errMsg}`, 'amber');
     }
   }, [updateInfo, downloadingUpdate, pushToast]);
 
@@ -1324,6 +1417,8 @@ function MetroProvider({ children }) {
     setShareNodeModal,
     editNodeModal,
     setEditNodeModal,
+    licensesModalOpen,
+    setLicensesModalOpen,
     toasts,
     pushToast,
   };
@@ -1537,7 +1632,7 @@ function Titlebar() {
           }}
         >
           <span className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: COLORS.coral }} />
-          v2.7.6
+          v{APP_VERSION}
         </span>
       </div>
 
@@ -2644,7 +2739,15 @@ function ServersScreen() {
                             type="button"
                             onClick={async () => {
                               setOpenMenuId(null);
-                              await copyClipboard(node.uri);
+                              if (!node.uri) {
+                                pushToast(`No shareable URI available for ${node.name}`, 'amber');
+                                return;
+                              }
+                              const copied = await copyClipboard(node.uri);
+                              pushToast(
+                                copied ? `Copied URI for ${node.name}` : 'Clipboard write failed',
+                                copied ? 'success' : 'amber'
+                              );
                             }}
                             className="w-full px-2.5 py-1.5 rounded-[9px] text-[11.5px] font-medium flex items-center gap-2 cursor-pointer hover:bg-[#312829]"
                             style={{ color: COLORS.textPrimary }}
@@ -3364,6 +3467,7 @@ function SettingsScreen() {
     downloadAndInstallUpdate,
     setLogsDrawerOpen,
     setOnboardingOpen,
+    setLicensesModalOpen,
     settingsTab,
     setSettingsTab,
     appendLog,
@@ -3840,7 +3944,7 @@ function SettingsScreen() {
               <div className="min-w-0">
                 <img src={metrovpnWordmark} alt="Metrovpn" className="h-[20px] w-auto object-contain mb-0.5" />
                 <div className="font-mono text-[11px] truncate" style={{ color: COLORS.textMuted }}>
-                  v2.7.6 • Xray v26.11.9 • Fixed :10808/:10809
+                  v{APP_VERSION} • Xray v26.11.9 • Fixed :10808/:10809
                 </div>
               </div>
             </div>
@@ -3925,6 +4029,44 @@ function SettingsScreen() {
                 )}
               </div>
             )}
+
+            {/* Open Source Licenses & Third-Party Notices */}
+            <div
+              className="rounded-[14px] p-3 flex flex-col gap-2"
+              style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}` }}
+            >
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <Scale className="w-3.5 h-3.5 shrink-0" style={{ color: COLORS.amber }} />
+                  <span className="font-jakarta font-semibold text-[12px]" style={{ color: COLORS.textPrimary }}>
+                    Open Source Licenses
+                  </span>
+                </div>
+                <span
+                  className="px-2 py-0.5 rounded-full text-[9.5px] font-bold uppercase tracking-wider"
+                  style={{ backgroundColor: '#2A2223', color: COLORS.mint }}
+                >
+                  MIT
+                </span>
+              </div>
+              <div className="text-[10.5px] leading-relaxed space-y-0.5" style={{ color: COLORS.textMuted }}>
+                <div>• Metrovpn Desktop — MIT License (© 2026 Metro Dens)</div>
+                <div>• Xray-core v26.11.9 — MPL-2.0 (XTLS/Xray-core)</div>
+                <div>• tun2socks v2.7.0 — GPL-3.0 (xjasonlyu/tun2socks)</div>
+                <div>• Wintun Driver — WireGuard Prebuilt / GPL-2.0</div>
+                <div>• v2fly GeoIP/GeoSite — CC-BY-SA-4.0 (MaxMind) &amp; MIT</div>
+                <div>• Tauri v2, Rust Crates, React, qrcode &amp; jsQR — MIT / Apache-2.0</div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setLicensesModalOpen(true)}
+                className="mt-0.5 w-full h-[30px] px-3 rounded-full text-[11px] font-semibold flex items-center justify-center gap-1.5 cursor-pointer transition-colors hover:bg-[#2A2223]"
+                style={{ backgroundColor: '#1E1819', border: `1px solid ${COLORS.surfaceBorder}`, color: COLORS.coral }}
+              >
+                <Scale className="w-3 h-3" />
+                <span>View Full Notices &amp; Source Links</span>
+              </button>
+            </div>
 
             <div className="flex flex-col gap-2 pt-2 border-t" style={{ borderColor: '#292223' }}>
               <button
@@ -5032,6 +5174,9 @@ function NodeUtilityModals() {
   const [editName, setEditName] = useState('');
   const [editIsp, setEditIsp] = useState('');
   const [editSni, setEditSni] = useState('');
+  const [qrDataUrl, setQrDataUrl] = useState('');
+  const [qrError, setQrError] = useState('');
+  const [copiedUri, setCopiedUri] = useState(false);
 
   useEffect(() => {
     if (editNodeModal) {
@@ -5040,6 +5185,62 @@ function NodeUtilityModals() {
       setEditSni(editNodeModal.sni);
     }
   }, [editNodeModal]);
+
+  useEffect(() => {
+    if (!shareNodeModal) {
+      setQrDataUrl('');
+      setQrError('');
+      setCopiedUri(false);
+      return undefined;
+    }
+    const payload = String(shareNodeModal.uri || '').trim();
+    if (!payload) {
+      setQrDataUrl('');
+      setQrError('This node does not have a shareable VLESS/VMess/Trojan URI.');
+      return undefined;
+    }
+    let cancelled = false;
+    setQrError('');
+    setCopiedUri(false);
+    QRCode.toDataURL(payload, {
+      errorCorrectionLevel: payload.length > 700 ? 'L' : 'M',
+      margin: 3,
+      width: 512,
+      color: {
+        dark: '#111111',
+        light: '#FFFFFF',
+      },
+    })
+      .then((url) => {
+        if (!cancelled) {
+          setQrDataUrl(url);
+        }
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setQrDataUrl('');
+          setQrError(`Could not encode QR code (${String(err?.message || err)}). Use Copy URI instead.`);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [shareNodeModal]);
+
+  const handleSaveQrPng = () => {
+    if (!qrDataUrl || !shareNodeModal) return;
+    const safeName = (shareNodeModal.name || 'metrovpn-node')
+      .replace(/[^a-zA-Z0-9_-]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 48) || 'metrovpn-node';
+    const a = document.createElement('a');
+    a.href = qrDataUrl;
+    a.download = `${safeName}-qr.png`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    pushToast(`Saved QR code PNG for ${shareNodeModal.name}`, 'success');
+  };
 
   return (
     <>
@@ -5050,7 +5251,7 @@ function NodeUtilityModals() {
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
             className="absolute inset-0 z-50 flex items-center justify-center p-4"
-            style={{ backgroundColor: 'rgba(12, 10, 11, 0.75)', backdropFilter: 'blur(5px)' }}
+            style={{ backgroundColor: 'rgba(12, 10, 11, 0.78)', backdropFilter: 'blur(6px)' }}
             onClick={() => setShareNodeModal(null)}
           >
             <motion.div
@@ -5059,13 +5260,16 @@ function NodeUtilityModals() {
               exit={{ opacity: 0, scale: 0.94 }}
               transition={SPRING}
               onClick={(e) => e.stopPropagation()}
-              className="w-full max-w-[340px] rounded-[24px] p-5 text-center shadow-2xl"
+              className="w-full max-w-[350px] rounded-[24px] p-5 text-center shadow-2xl"
               style={{ backgroundColor: COLORS.surface, border: '1px solid #3D3132' }}
             >
               <div className="flex items-center justify-between mb-3">
-                <span className="font-jakarta font-bold text-[14.5px]" style={{ color: COLORS.textPrimary }}>
-                  Share Node URI
-                </span>
+                <div className="flex items-center gap-2">
+                  <QrCode className="w-4 h-4" style={{ color: COLORS.coral }} />
+                  <span className="font-jakarta font-bold text-[14.5px]" style={{ color: COLORS.textPrimary }}>
+                    Share Node QR
+                  </span>
+                </div>
                 <button
                   type="button"
                   onClick={() => setShareNodeModal(null)}
@@ -5077,55 +5281,64 @@ function NodeUtilityModals() {
               </div>
 
               <div
-                className="w-[172px] h-[172px] mx-auto rounded-[18px] p-3.5 flex items-center justify-center"
-                style={{ backgroundColor: '#F4ECEC' }}
+                className="w-[216px] h-[216px] mx-auto rounded-[18px] p-2.5 flex items-center justify-center shadow-inner"
+                style={{ backgroundColor: '#FFFFFF' }}
               >
-                <svg viewBox="0 0 21 21" className="w-full h-full">
-                  <rect width="21" height="21" fill="#F4ECEC" />
-                  {[
-                    [0, 0],
-                    [14, 0],
-                    [0, 14],
-                  ].map(([x, y], idx) => (
-                    <g key={idx}>
-                      <rect x={x} y={y} width="7" height="7" rx="1" fill="#141112" />
-                      <rect x={x + 1} y={y + 1} width="5" height="5" fill="#F4ECEC" />
-                      <rect x={x + 2} y={y + 2} width="3" height="3" fill="#9B0A12" />
-                    </g>
-                  ))}
-                  {Array.from({ length: 100 }).map((_, idx) => {
-                    const gx = 2 + (idx % 17);
-                    const gy = 2 + Math.floor(idx / 17) * 2;
-                    if ((gx < 8 && gy < 8) || (gx > 12 && gy < 8) || (gx < 8 && gy > 12) || gy > 19) {
-                      return null;
-                    }
-                    const seed = (shareNodeModal.name.charCodeAt(idx % shareNodeModal.name.length) + idx * 7) % 3;
-                    if (seed === 0) return null;
-                    return <rect key={idx} x={gx} y={gy} width="1" height="1" fill={seed === 1 ? '#141112' : '#3B2827'} />;
-                  })}
-                </svg>
+                {qrDataUrl ? (
+                  <img
+                    src={qrDataUrl}
+                    alt={`QR code for ${shareNodeModal.name}`}
+                    className="w-full h-full object-contain select-none"
+                    style={{ imageRendering: 'pixelated' }}
+                    draggable={false}
+                  />
+                ) : qrError ? (
+                  <div className="px-3 text-[11px] leading-relaxed font-medium text-[#7A1C1C]">
+                    {qrError}
+                  </div>
+                ) : (
+                  <div className="text-[11.5px] font-medium text-[#555555]">
+                    Generating QR code...
+                  </div>
+                )}
               </div>
 
-              <div className="mt-3.5 font-jakarta font-bold text-[14px]" style={{ color: COLORS.textPrimary }}>
+              <div className="mt-3 font-jakarta font-bold text-[13.5px] leading-snug break-words" style={{ color: COLORS.textPrimary }}>
                 {shareNodeModal.name}
               </div>
-              <div className="text-[11.5px] font-mono mt-0.5" style={{ color: COLORS.textMuted }}>
+              <div className="text-[11px] font-mono mt-0.5 truncate" style={{ color: COLORS.textMuted }}>
                 {shareNodeModal.isp} — {shareNodeModal.sni}
               </div>
 
-              <button
-                type="button"
-                onClick={async () => {
-                  await copyClipboard(shareNodeModal.uri);
-                  pushToast(`Copied share URI for ${shareNodeModal.name}`, 'success');
-                  setShareNodeModal(null);
-                }}
-                className="mt-4 w-full h-[38px] rounded-full text-[12.5px] font-semibold flex items-center justify-center gap-2 cursor-pointer"
-                style={{ backgroundColor: COLORS.taupe, color: COLORS.textPrimary }}
-              >
-                <Copy className="w-3.5 h-3.5" />
-                <span>Copy VLESS/VMess URI</span>
-              </button>
+              <div className="mt-3.5 grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  disabled={!qrDataUrl}
+                  onClick={handleSaveQrPng}
+                  className="h-[36px] rounded-full text-[12px] font-semibold flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-50 transition-colors hover:bg-[#2A2223]"
+                  style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}`, color: COLORS.textPrimary }}
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span>Save PNG</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={!shareNodeModal.uri}
+                  onClick={async () => {
+                    const ok = await copyClipboard(shareNodeModal.uri);
+                    if (ok) {
+                      setCopiedUri(true);
+                      pushToast(`Copied share URI for ${shareNodeModal.name}`, 'success');
+                      setTimeout(() => setCopiedUri(false), 1600);
+                    }
+                  }}
+                  className="h-[36px] rounded-full text-[12px] font-semibold flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-50 transition-colors hover:bg-[#B50D17]"
+                  style={{ backgroundColor: COLORS.crimson, color: COLORS.textPrimary, border: '1px solid #BC1F27' }}
+                >
+                  {copiedUri ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                  <span>{copiedUri ? 'Copied!' : 'Copy URI'}</span>
+                </button>
+              </div>
             </motion.div>
           </motion.div>
         )}
@@ -5855,6 +6068,7 @@ function AutoUpdateModal() {
     (updateDownloadProgress?.totalBytes || 0) > 0
       ? `/ ${((updateDownloadProgress?.totalBytes || 0) / (1024 * 1024)).toFixed(1)} MB`
       : 'MB';
+  const hasError = !downloadingUpdate && updateDownloadProgress?.phase === 'error' && updateDownloadProgress?.error;
 
   return (
     <AnimatePresence>
@@ -5919,12 +6133,12 @@ function AutoUpdateModal() {
             {downloadingUpdate && (
               <div className="flex flex-col gap-1.5">
                 <div className="flex items-center justify-between text-[11px] font-mono tabular-nums">
-                  <span style={{ color: COLORS.amber }}>
+                  <span className="truncate pr-2" style={{ color: COLORS.amber }}>
                     {updateDownloadProgress?.phase === 'launching'
-                      ? 'Launching Windows Installer...'
+                      ? 'Closing Metrovpn & launching updater...'
                       : `Downloading ${updateInfo.assetName || 'Update'}...`}
                   </span>
-                  <span style={{ color: COLORS.textPrimary }}>
+                  <span className="shrink-0" style={{ color: COLORS.textPrimary }}>
                     {pct}% ({dlMb} {totMb})
                   </span>
                 </div>
@@ -5937,26 +6151,179 @@ function AutoUpdateModal() {
               </div>
             )}
 
-            <div className="flex items-center justify-end gap-2 pt-1">
-              {!downloadingUpdate && (
+            {hasError && (
+              <div
+                className="rounded-[12px] p-2.5 text-[11px] leading-snug flex items-start gap-2"
+                style={{ backgroundColor: 'rgba(155, 10, 18, 0.22)', border: '1px solid rgba(255, 115, 105, 0.45)', color: '#FFD2CE' }}
+              >
+                <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" style={{ color: COLORS.coral }} />
+                <div className="min-w-0 break-words">
+                  <div className="font-semibold">Auto-update error</div>
+                  <div className="opacity-90 mt-0.5">{updateDownloadProgress.error}</div>
+                </div>
+              </div>
+            )}
+
+            <div className="flex items-center justify-between gap-2 pt-1">
+              {!downloadingUpdate ? (
                 <button
                   type="button"
-                  onClick={() => setUpdateModalOpen(false)}
-                  className="h-[34px] px-3.5 rounded-full text-[11.5px] font-semibold cursor-pointer hover:bg-[#272021]"
-                  style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}`, color: COLORS.textMuted }}
+                  onClick={() => openExternalUrl(updateInfo.releaseUrl || 'https://github.com/Metro-dens/MetroVPN-for-Windows/releases')}
+                  className="h-[34px] px-3 rounded-full text-[11px] font-semibold inline-flex items-center gap-1 cursor-pointer hover:bg-[#272021]"
+                  style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}`, color: COLORS.coral }}
                 >
-                  Later
+                  <ExternalLink className="w-3 h-3" />
+                  <span>GitHub</span>
                 </button>
+              ) : (
+                <span />
               )}
+              <div className="flex items-center gap-2">
+                {!downloadingUpdate && (
+                  <button
+                    type="button"
+                    onClick={() => setUpdateModalOpen(false)}
+                    className="h-[34px] px-3.5 rounded-full text-[11.5px] font-semibold cursor-pointer hover:bg-[#272021]"
+                    style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}`, color: COLORS.textMuted }}
+                  >
+                    Later
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={downloadAndInstallUpdate}
+                  disabled={downloadingUpdate}
+                  className="h-[34px] px-4 rounded-full text-[12px] font-semibold flex items-center gap-1.5 cursor-pointer disabled:opacity-70"
+                  style={{ backgroundColor: COLORS.crimson, color: COLORS.textPrimary, border: '1px solid #BC1F27' }}
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span>
+                    {downloadingUpdate
+                      ? updateDownloadProgress?.phase === 'launching'
+                        ? 'Launching...'
+                        : 'Downloading...'
+                      : hasError
+                        ? 'Retry Update'
+                        : 'Download & Install Now'}
+                  </span>
+                </button>
+              </div>
+            </div>
+          </motion.div>
+        </motion.div>
+      )}
+    </AnimatePresence>
+  );
+}
+
+// ============================================================================
+// OPEN SOURCE LICENSES & THIRD-PARTY NOTICES MODAL
+// ============================================================================
+function LicensesModal() {
+  const { licensesModalOpen, setLicensesModalOpen } = useMetro();
+
+  return (
+    <AnimatePresence>
+      {licensesModalOpen && (
+        <motion.div
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          transition={{ duration: 0.14 }}
+          className="fixed inset-0 z-50 flex items-center justify-center p-4"
+          style={{ backgroundColor: 'rgba(10, 8, 9, 0.82)', backdropFilter: 'blur(6px)' }}
+          onClick={() => setLicensesModalOpen(false)}
+        >
+          <motion.div
+            initial={{ scale: 0.96, opacity: 0, y: 10 }}
+            animate={{ scale: 1, opacity: 1, y: 0 }}
+            exit={{ scale: 0.96, opacity: 0, y: 10 }}
+            transition={{ duration: 0.15 }}
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-[430px] max-h-[520px] rounded-[22px] p-4 flex flex-col gap-3 shadow-2xl"
+            style={{ backgroundColor: COLORS.surface, border: `1px solid ${COLORS.surfaceBorder}` }}
+          >
+            <div className="flex items-center justify-between gap-2 shrink-0">
+              <div className="flex items-center gap-2.5">
+                <div
+                  className="w-9 h-9 rounded-[12px] flex items-center justify-center shrink-0"
+                  style={{ backgroundColor: '#2D1A1C', border: '1px solid #592C30' }}
+                >
+                  <Scale className="w-4 h-4" style={{ color: COLORS.amber }} />
+                </div>
+                <div>
+                  <h3 className="font-jakarta font-bold text-[14.5px]" style={{ color: COLORS.textPrimary }}>
+                    Open Source Licenses
+                  </h3>
+                  <p className="text-[10.5px]" style={{ color: COLORS.textMuted }}>
+                    Third-party attributions &amp; source code notices
+                  </p>
+                </div>
+              </div>
               <button
                 type="button"
-                onClick={downloadAndInstallUpdate}
-                disabled={downloadingUpdate}
-                className="h-[34px] px-4 rounded-full text-[12px] font-semibold flex items-center gap-1.5 cursor-pointer disabled:opacity-70"
-                style={{ backgroundColor: COLORS.crimson, color: COLORS.textPrimary, border: '1px solid #BC1F27' }}
+                onClick={() => setLicensesModalOpen(false)}
+                className="w-7 h-7 rounded-full flex items-center justify-center cursor-pointer hover:bg-[#2A2223]"
+                style={{ color: COLORS.textMuted }}
               >
-                <Download className="w-3.5 h-3.5" />
-                <span>{downloadingUpdate ? 'Installing...' : 'Download & Install Now'}</span>
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="flex-1 min-h-0 overflow-y-auto custom-scrollbar flex flex-col gap-2 pr-0.5">
+              {OPEN_SOURCE_LICENSES.map((item) => (
+                <div
+                  key={item.name}
+                  className="rounded-[14px] p-3 flex flex-col gap-1"
+                  style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}` }}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-jakarta font-bold text-[12px] truncate" style={{ color: COLORS.textPrimary }}>
+                      {item.name}
+                    </span>
+                    <span
+                      className="px-2 py-0.5 rounded-full text-[9.5px] font-bold shrink-0"
+                      style={{ backgroundColor: '#2D2122', color: COLORS.amber }}
+                    >
+                      {item.license}
+                    </span>
+                  </div>
+                  <div className="text-[10.5px] font-mono" style={{ color: COLORS.mint }}>
+                    {item.version} • {item.copyright}
+                  </div>
+                  <p className="text-[10.5px] leading-relaxed" style={{ color: COLORS.textMuted }}>
+                    {item.note}
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => openExternalUrl(item.url)}
+                    className="self-start mt-0.5 inline-flex items-center gap-1 text-[10.5px] font-semibold cursor-pointer hover:underline"
+                    style={{ color: COLORS.coral }}
+                  >
+                    <span>Source &amp; License</span>
+                    <ExternalLink className="w-3 h-3" />
+                  </button>
+                </div>
+              ))}
+            </div>
+
+            <div className="flex items-center justify-between gap-2 pt-1 shrink-0">
+              <button
+                type="button"
+                onClick={() => openExternalUrl('https://github.com/Metro-dens/MetroVPN-for-Windows/blob/main/THIRD-PARTY-LICENSES.md')}
+                className="h-[32px] px-3 rounded-full text-[11px] font-semibold inline-flex items-center gap-1.5 cursor-pointer hover:bg-[#272021]"
+                style={{ backgroundColor: COLORS.obsidian, border: `1px solid ${COLORS.surfaceBorder}`, color: COLORS.coral }}
+              >
+                <ExternalLink className="w-3 h-3" />
+                <span>THIRD-PARTY-LICENSES.md</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setLicensesModalOpen(false)}
+                className="h-[32px] px-4 rounded-full text-[11.5px] font-semibold cursor-pointer"
+                style={{ backgroundColor: COLORS.crimson, color: COLORS.textPrimary }}
+              >
+                Close
               </button>
             </div>
           </motion.div>
@@ -6022,6 +6389,7 @@ function DesktopStage() {
         <AdminElevationModal />
         <OnboardingGuideModal />
         <AutoUpdateModal />
+        <LicensesModal />
         <NodeUtilityModals />
         <XrayLogsDrawer />
       </div>
@@ -6065,6 +6433,7 @@ function DesktopStage() {
             <AdminElevationModal />
             <OnboardingGuideModal />
             <AutoUpdateModal />
+            <LicensesModal />
             <NodeUtilityModals />
             <XrayLogsDrawer />
           </motion.div>

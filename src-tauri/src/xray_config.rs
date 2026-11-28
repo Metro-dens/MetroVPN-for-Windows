@@ -113,11 +113,16 @@ pub fn build_xray_config_with_overrides(
         }));
     }
 
-    let security_is_tls = {
+    let security_is_tls_or_reality = {
         let s = node.tls_mode.trim().to_lowercase();
-        s.is_empty() || s == "tls" || s == "xtls"
+        s.is_empty() || s == "tls" || s == "xtls" || s == "reality"
     };
-    let use_tls_frag = settings.tunnel_profile == "TLS Frag" && security_is_tls;
+    let transport_is_udp = {
+        let t = node.transport.trim().to_lowercase();
+        t == "quic" || t == "kcp"
+    };
+    let use_tls_frag =
+        settings.tunnel_profile == "TLS Frag" && security_is_tls_or_reality && !transport_is_udp;
 
     let proxy_outbound = build_proxy_outbound(node, settings, overrides, use_tls_frag);
     let mut outbounds = vec![proxy_outbound];
@@ -203,7 +208,7 @@ pub fn build_xray_config_with_overrides(
             "outboundTag": "direct"
         }));
     } else {
-        if settings.bypass_lan && settings.routing_mode != "global" {
+        if (settings.bypass_lan && settings.routing_mode != "global") || settings.lan_proxy_sharing {
             routing_rules.push(json!({
                 "type": "field",
                 "ip": [
@@ -554,17 +559,18 @@ fn build_proxy_outbound(
         stream_settings["tlsSettings"] = tls_obj;
     }
 
+    let sanitized_vcn_host = node.vcn_host.as_deref().and_then(|raw| {
+        raw.split(',')
+            .map(str::trim)
+            .find(|h| !h.is_empty() && !h.contains('*') && !h.contains(' ') && !h.contains('/'))
+    });
+
     let host_header = node
         .host
         .as_deref()
         .map(str::trim)
         .filter(|h| !h.is_empty())
-        .or_else(|| {
-            node.vcn_host
-                .as_deref()
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-        })
+        .or(sanitized_vcn_host)
         .unwrap_or(effective_sni);
 
     let path_str = node

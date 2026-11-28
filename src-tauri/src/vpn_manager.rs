@@ -5,12 +5,15 @@ use crate::models::{
 use crate::network_win::{
     backup_file_path, capture_virtual_screen_rgba, capture_virtual_screen_with_bounds,
     configure_tun_interface, enable_system_proxy, get_active_lan_ipv4, is_elevated,
-    kill_stale_core_processes, relaunch_as_admin, restore_system_proxy,
-    scan_installed_windows_apps, send_windows_connected_notification, teardown_tun_routes,
-    CREATE_NO_WINDOW,
+    kill_stale_core_processes, launch_windows_update_handoff, relaunch_as_admin,
+    release_single_instance_mutex, restore_system_proxy, scan_installed_windows_apps,
+    send_windows_connected_notification, teardown_tun_routes,
 };
+#[cfg(windows)]
+use crate::network_win::CREATE_NO_WINDOW;
 use crate::parser::{
     decode_qr_from_bytes, decode_qr_from_rgba, fetch_subscription, normalize_saved_node, parse_any,
+    update_node_uri_fields,
 };
 use crate::tls_probe::{node_needs_auto_cert_pin, resolve_cert_pin_for_node};
 use crate::xray_config::{
@@ -22,8 +25,9 @@ use base64::Engine as _;
 use chrono::Local;
 use futures_util::future::join_all;
 use futures_util::StreamExt;
+use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
-use std::io::{BufRead, BufReader, Cursor, Write};
+use std::io::{BufRead, BufReader, Cursor, Read, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -1105,7 +1109,15 @@ pub async fn import_subscription(
     url: String,
 ) -> Result<Vec<ServerNode>, String> {
     let clean_url = url.trim().to_string();
-    let (nodes, quota) = fetch_subscription(&clean_url).await?;
+    let proxy_port = {
+        let guard = state.inner.lock().map_err(|_| "State lock poisoned")?;
+        if guard.store.settings.sub_use_proxy && guard.status == "Connected" {
+            Some(HTTP_PORT)
+        } else {
+            None
+        }
+    };
+    let (nodes, quota) = fetch_subscription(&clean_url, proxy_port).await?;
     {
         let mut guard = state.inner.lock().map_err(|_| "State lock poisoned")?;
         if guard.store.settings.sub_clear_before_update {
@@ -1117,8 +1129,11 @@ pub async fn import_subscription(
         for n in nodes.iter().rev() {
             guard.store.servers.insert(0, n.clone());
         }
-        if let Some(first) = nodes.first() {
-            guard.store.settings.active_node_id = Some(first.id.clone());
+        let is_tunnel_busy = guard.status == "Connected" || guard.status == "Connecting";
+        if !is_tunnel_busy || guard.store.settings.active_node_id.is_none() {
+            if let Some(first) = nodes.first() {
+                guard.store.settings.active_node_id = Some(first.id.clone());
+            }
         }
         save_store(&guard.store_path, &guard.store);
     }
@@ -1138,11 +1153,17 @@ pub async fn update_all_subscriptions(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Vec<ServerNode>, String> {
-    let (subs, clear_first) = {
+    let (subs, clear_first, proxy_port) = {
         let guard = state.inner.lock().map_err(|_| "State lock poisoned")?;
+        let px = if guard.store.settings.sub_use_proxy && guard.status == "Connected" {
+            Some(HTTP_PORT)
+        } else {
+            None
+        };
         (
             guard.store.settings.saved_subscriptions.clone(),
             guard.store.settings.sub_clear_before_update,
+            px,
         )
     };
     if subs.is_empty() {
@@ -1151,7 +1172,7 @@ pub async fn update_all_subscriptions(
 
     let mut fetched_all = Vec::new();
     for url in subs {
-        if let Ok((nodes, _)) = fetch_subscription(&url).await {
+        if let Ok((nodes, _)) = fetch_subscription(&url, proxy_port).await {
             fetched_all.extend(nodes);
         }
     }
@@ -1213,21 +1234,48 @@ pub async fn update_server(
     node.name = name.trim().to_string();
     node.isp = isp.trim().to_string();
     node.sni = sni.trim().to_string();
+    update_node_uri_fields(node);
     let updated = node.clone();
     save_store(&guard.store_path, &guard.store);
     Ok(updated)
 }
 
 #[tauri::command]
-pub async fn delete_server(state: State<'_, AppState>, id: String) -> Result<Vec<ServerNode>, String> {
-    let mut guard = state.inner.lock().map_err(|_| "State lock poisoned")?;
-    guard.store.servers.retain(|s| s.id != id);
-    if guard.store.settings.active_node_id.as_deref() == Some(id.as_str()) {
-        guard.store.settings.active_node_id =
-            guard.store.servers.first().map(|s| s.id.clone());
+pub async fn delete_server(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<Vec<ServerNode>, String> {
+    let should_disconnect = {
+        let guard = state.inner.lock().map_err(|_| "State lock poisoned")?;
+        guard.store.settings.active_node_id.as_deref() == Some(id.as_str())
+            && (guard.status == "Connected" || guard.status == "Connecting")
+    };
+
+    if should_disconnect {
+        state.cleanup_all();
+        state.push_log(
+            Some(&app),
+            "Info",
+            "Disconnected active VPN tunnel because its server profile was deleted",
+        );
     }
-    save_store(&guard.store_path, &guard.store);
-    Ok(guard.store.servers.clone())
+
+    let remaining = {
+        let mut guard = state.inner.lock().map_err(|_| "State lock poisoned")?;
+        guard.store.servers.retain(|s| s.id != id);
+        if guard.store.settings.active_node_id.as_deref() == Some(id.as_str()) {
+            guard.store.settings.active_node_id =
+                guard.store.servers.first().map(|s| s.id.clone());
+        }
+        save_store(&guard.store_path, &guard.store);
+        guard.store.servers.clone()
+    };
+
+    if should_disconnect {
+        emit_status(&app, state.inner());
+    }
+    Ok(remaining)
 }
 
 #[tauri::command]
@@ -1743,8 +1791,42 @@ pub async fn sync_all_quotas(
 }
 
 // ============================================================================
-// AUTO UPDATE CHECKER, DOWNLOADER & INSTALLER (Port of Android AppUpdateChecker.kt)
+// AUTO UPDATE CHECKER, DOWNLOADER & INSTALLER (Windows NSIS / MSI / Standalone)
 // ============================================================================
+
+const TRUSTED_UPDATE_HOSTS: &[&str] = &[
+    "github.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+    "raw.githubusercontent.com",
+    "api.github.com",
+];
+
+fn is_trusted_update_url(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let Ok(parsed) = url::Url::parse(trimmed) else {
+        return false;
+    };
+    if !parsed.scheme().eq_ignore_ascii_case("https") {
+        return false;
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return false;
+    }
+    if let Some(port) = parsed.port() {
+        if port != 443 {
+            return false;
+        }
+    }
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let normalized = host.trim_end_matches('.').to_ascii_lowercase();
+    TRUSTED_UPDATE_HOSTS.contains(&normalized.as_str())
+}
 
 fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
     let parse_parts = |s: &str| -> Vec<u32> {
@@ -1777,16 +1859,17 @@ fn select_best_windows_asset(assets: Option<&Vec<serde_json::Value>>) -> Option<
     let mut any_exe: Option<(String, String)> = None;
 
     for asset in list {
-        let name = asset["name"].as_str().unwrap_or("").to_string();
+        let name = asset["name"].as_str().unwrap_or("").trim().to_string();
         let url = asset["browser_download_url"]
             .as_str()
             .unwrap_or("")
+            .trim()
             .to_string();
-        if name.is_empty() || url.is_empty() {
+        if name.is_empty() || !is_trusted_update_url(&url) {
             continue;
         }
         let lower = name.to_lowercase();
-        if lower.ends_with("-setup.exe") || lower.contains("setup") && lower.ends_with(".exe") {
+        if lower.ends_with("-setup.exe") || (lower.contains("setup") && lower.ends_with(".exe")) {
             setup_asset = Some((name, url));
         } else if lower.contains("standalone") && lower.ends_with(".exe") {
             standalone_asset = Some((name, url));
@@ -1804,9 +1887,189 @@ fn select_best_windows_asset(assets: Option<&Vec<serde_json::Value>>) -> Option<
             .or(msi_asset)
     } else {
         setup_asset
-            .or(standalone_asset)
             .or(msi_asset)
+            .or(standalone_asset)
             .or(any_exe)
+    }
+}
+
+fn build_update_http_client(
+    current_ver: &str,
+    use_proxy: bool,
+    timeout_secs: u64,
+) -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder()
+        .user_agent(format!("Metrovpn-Desktop/{current_ver}"))
+        .connect_timeout(Duration::from_secs(12))
+        .timeout(Duration::from_secs(timeout_secs));
+    if use_proxy {
+        if let Ok(px) = reqwest::Proxy::all(format!("http://127.0.0.1:{HTTP_PORT}")) {
+            builder = builder.proxy(px);
+        }
+    } else {
+        builder = builder.no_proxy();
+    }
+    builder
+        .build()
+        .map_err(|e| format!("Failed to build update HTTP client: {e}"))
+}
+
+async fn fetch_github_release_info(
+    client: &reqwest::Client,
+    current: &str,
+) -> Result<ReleaseUpdateInfo, String> {
+    let resp = client
+        .get(GITHUB_RELEASES_API_URL)
+        .header("Accept", "application/vnd.github+json, application/json")
+        .header("Cache-Control", "no-cache")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if !resp.status().is_success() {
+        return Err(format!("GitHub API returned HTTP {}", resp.status()));
+    }
+
+    let body = resp
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("Invalid GitHub release JSON: {e}"))?;
+
+    let tag = body["tag_name"]
+        .as_str()
+        .unwrap_or(current)
+        .trim_start_matches(['v', 'V'])
+        .trim()
+        .to_string();
+    let html_url = body["html_url"]
+        .as_str()
+        .unwrap_or("https://github.com/Metro-dens/MetroVPN-for-Windows/releases")
+        .to_string();
+
+    let is_newer = compare_versions(&tag, current) == std::cmp::Ordering::Greater;
+    let best_asset = select_best_windows_asset(body["assets"].as_array());
+    let (asset_name, download_url, has_binary_asset) = match best_asset {
+        Some((name, url)) => (name, url, true),
+        None => (String::new(), String::new(), false),
+    };
+
+    let title = body["name"]
+        .as_str()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("New Update Available")
+        .to_string();
+    let message = body["body"]
+        .as_str()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("A newer version of Metrovpn for Windows is ready to install.")
+        .to_string();
+    let published_at = body["published_at"].as_str().unwrap_or("").to_string();
+
+    Ok(ReleaseUpdateInfo {
+        current_version: current.to_string(),
+        latest_version: tag,
+        update_available: is_newer && has_binary_asset,
+        release_url: html_url,
+        download_url,
+        asset_name,
+        title,
+        message,
+        published_at,
+        mandatory: false,
+    })
+}
+
+async fn fetch_manifest_release_info(
+    client: &reqwest::Client,
+    current: &str,
+) -> Result<ReleaseUpdateInfo, String> {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let url = format!("{UPDATE_MANIFEST_URL}?t={ts}");
+    let resp = client
+        .get(&url)
+        .header("Cache-Control", "no-cache")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if !resp.status().is_success() {
+        return Err(format!("Update manifest returned HTTP {}", resp.status()));
+    }
+
+    let json = resp
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("Invalid update.json: {e}"))?;
+
+    let remote_ver = json["versionName"]
+        .as_str()
+        .unwrap_or(current)
+        .trim_start_matches(['v', 'V'])
+        .trim()
+        .to_string();
+
+    let preferred_url = if cfg!(feature = "standalone-exe") {
+        json["standaloneDownloadUrl"]
+            .as_str()
+            .or_else(|| json["downloadUrl"].as_str())
+    } else {
+        json["downloadUrl"]
+            .as_str()
+            .or_else(|| json["msiDownloadUrl"].as_str())
+            .or_else(|| json["standaloneDownloadUrl"].as_str())
+    }
+    .unwrap_or("")
+    .trim()
+    .to_string();
+
+    if remote_ver.is_empty() || !is_trusted_update_url(&preferred_url) {
+        return Err("Update manifest missing valid trusted download URL".into());
+    }
+
+    let lower_url = preferred_url.to_lowercase();
+    let is_binary_url = lower_url.ends_with(".exe") || lower_url.ends_with(".msi");
+    let is_newer =
+        compare_versions(&remote_ver, current) == std::cmp::Ordering::Greater && is_binary_url;
+    let asset_name = preferred_url
+        .rsplit('/')
+        .next()
+        .map(|s| s.split('?').next().unwrap_or(s))
+        .filter(|s| !s.is_empty())
+        .unwrap_or("Metrovpn-Update.exe")
+        .to_string();
+
+    Ok(ReleaseUpdateInfo {
+        current_version: current.to_string(),
+        latest_version: remote_ver.clone(),
+        update_available: is_newer,
+        release_url: format!(
+            "https://github.com/Metro-dens/MetroVPN-for-Windows/releases/tag/v{remote_ver}"
+        ),
+        download_url: preferred_url,
+        asset_name,
+        title: json["title"]
+            .as_str()
+            .unwrap_or("New Update Available")
+            .to_string(),
+        message: json["message"]
+            .as_str()
+            .unwrap_or("A newer version of Metrovpn for Windows is ready.")
+            .to_string(),
+        published_at: String::new(),
+        mandatory: json["mandatory"].as_bool().unwrap_or(false),
+    })
+}
+
+async fn check_url_exists(client: &reqwest::Client, url: &str) -> bool {
+    if !is_trusted_update_url(url) {
+        return false;
+    }
+    match tokio::time::timeout(Duration::from_secs(5), client.head(url).send()).await {
+        Ok(Ok(resp)) => resp.status().is_success(),
+        _ => false,
     }
 }
 
@@ -1827,129 +2090,51 @@ pub async fn check_github_update(state: State<'_, AppState>) -> Result<ReleaseUp
 
     let mut github_info: Option<ReleaseUpdateInfo> = None;
     let mut manifest_info: Option<ReleaseUpdateInfo> = None;
+    let mut working_client: Option<reqwest::Client> = None;
     let mut last_err = String::from("Failed to reach update servers");
 
     for use_proxy in proxy_modes {
-        let mut builder = reqwest::Client::builder()
-            .user_agent(format!("Metrovpn-Desktop/{current}"))
-            .timeout(Duration::from_secs(8));
-        if use_proxy {
-            if let Ok(px) = reqwest::Proxy::all(format!("http://127.0.0.1:{HTTP_PORT}")) {
-                builder = builder.proxy(px);
-            }
-        }
-        let Ok(client) = builder.build() else {
+        let Ok(client) = build_update_http_client(&current, use_proxy, 12) else {
             continue;
         };
 
-        if github_info.is_none() {
-            match client
-                .get(GITHUB_RELEASES_API_URL)
-                .header("Accept", "application/vnd.github+json, application/json")
-                .header("Cache-Control", "no-cache")
-                .send()
-                .await
-            {
-                Ok(resp) if resp.status().is_success() => {
-                    if let Ok(body) = resp.json::<serde_json::Value>().await {
-                        let tag = body["tag_name"]
-                            .as_str()
-                            .unwrap_or(&current)
-                            .trim_start_matches(['v', 'V'])
-                            .trim()
-                            .to_string();
-                        let html_url = body["html_url"]
-                            .as_str()
-                            .unwrap_or("https://github.com/Metro-dens/MetroVPN-for-Windows/releases")
-                            .to_string();
-                        let (asset_name, download_url) =
-                            select_best_windows_asset(body["assets"].as_array()).unwrap_or_else(|| {
-                                ("Metrovpn-standalone-x64.exe".into(), html_url.clone())
-                            });
-                        let title = body["name"]
-                            .as_str()
-                            .filter(|s| !s.trim().is_empty())
-                            .unwrap_or("New Update Available")
-                            .to_string();
-                        let message = body["body"]
-                            .as_str()
-                            .filter(|s| !s.trim().is_empty())
-                            .unwrap_or("A newer version of Metrovpn for Windows is ready to install.")
-                            .to_string();
-                        let published_at = body["published_at"].as_str().unwrap_or("").to_string();
-                        let is_newer =
-                            compare_versions(&tag, &current) == std::cmp::Ordering::Greater;
-
-                        github_info = Some(ReleaseUpdateInfo {
-                            current_version: current.clone(),
-                            latest_version: tag,
-                            update_available: is_newer,
-                            release_url: html_url,
-                            download_url,
-                            asset_name,
-                            title,
-                            message,
-                            published_at,
-                            mandatory: false,
-                        });
-                    }
+        let (gh_res, mf_res) = tokio::join!(
+            async {
+                if github_info.is_none() {
+                    Some(fetch_github_release_info(&client, &current).await)
+                } else {
+                    None
                 }
-                Ok(r) => last_err = format!("GitHub API returned HTTP {}", r.status()),
-                Err(e) => last_err = e.to_string(),
+            },
+            async {
+                if manifest_info.is_none() {
+                    Some(fetch_manifest_release_info(&client, &current).await)
+                } else {
+                    None
+                }
+            }
+        );
+
+        if let Some(res) = gh_res {
+            match res {
+                Ok(info) => {
+                    github_info = Some(info);
+                    working_client = Some(client.clone());
+                }
+                Err(e) => last_err = e,
             }
         }
-
-        if manifest_info.is_none() {
-            let ts = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let url = format!("{UPDATE_MANIFEST_URL}?t={ts}");
-            if let Ok(resp) = client
-                .get(&url)
-                .header("Cache-Control", "no-cache")
-                .send()
-                .await
-            {
-                if resp.status().is_success() {
-                    if let Ok(json) = resp.json::<serde_json::Value>().await {
-                        let remote_ver = json["versionName"]
-                            .as_str()
-                            .unwrap_or(&current)
-                            .trim_start_matches(['v', 'V'])
-                            .trim()
-                            .to_string();
-                        let dl_url = json["downloadUrl"].as_str().unwrap_or("").trim().to_string();
-                        if !remote_ver.is_empty() && !dl_url.is_empty() {
-                            let is_newer = compare_versions(&remote_ver, &current)
-                                == std::cmp::Ordering::Greater;
-                            let asset_name = dl_url
-                                .rsplit('/')
-                                .next()
-                                .filter(|s| !s.is_empty())
-                                .unwrap_or("Metrovpn-Update.exe")
-                                .to_string();
-                            manifest_info = Some(ReleaseUpdateInfo {
-                                current_version: current.clone(),
-                                latest_version: remote_ver.clone(),
-                                update_available: is_newer,
-                                release_url: format!(
-                                    "https://github.com/Metro-dens/MetroVPN-for-Windows/releases/tag/v{remote_ver}"
-                                ),
-                                download_url: dl_url,
-                                asset_name,
-                                title: json["title"]
-                                    .as_str()
-                                    .unwrap_or("New Update Available")
-                                    .to_string(),
-                                message: json["message"]
-                                    .as_str()
-                                    .unwrap_or("A newer version of Metrovpn for Windows is ready.")
-                                    .to_string(),
-                                published_at: String::new(),
-                                mandatory: json["mandatory"].as_bool().unwrap_or(false),
-                            });
-                        }
+        if let Some(res) = mf_res {
+            match res {
+                Ok(info) => {
+                    manifest_info = Some(info);
+                    if working_client.is_none() {
+                        working_client = Some(client.clone());
+                    }
+                }
+                Err(e) => {
+                    if github_info.is_none() {
+                        last_err = e;
                     }
                 }
             }
@@ -1962,17 +2147,147 @@ pub async fn check_github_update(state: State<'_, AppState>) -> Result<ReleaseUp
 
     match (github_info, manifest_info) {
         (Some(g), Some(m)) => {
-            if compare_versions(&m.latest_version, &g.latest_version) == std::cmp::Ordering::Greater
-            {
-                Ok(m)
-            } else {
-                Ok(g)
+            match compare_versions(&m.latest_version, &g.latest_version) {
+                std::cmp::Ordering::Greater if m.update_available => {
+                    // Only prefer manifest over GitHub API if the manifest's binary asset is actually live
+                    if let Some(ref c) = working_client {
+                        if check_url_exists(c, &m.download_url).await {
+                            return Ok(m);
+                        }
+                    }
+                    Ok(g)
+                }
+                std::cmp::Ordering::Equal => {
+                    // Versions match: keep GitHub API's verified asset URL, enrich with manifest title/message/mandatory
+                    let mut merged = g;
+                    if !m.title.trim().is_empty() {
+                        merged.title = m.title;
+                    }
+                    if !m.message.trim().is_empty() {
+                        merged.message = m.message;
+                    }
+                    merged.mandatory = m.mandatory;
+                    if merged.download_url.is_empty() && !m.download_url.is_empty() {
+                        merged.download_url = m.download_url;
+                        merged.asset_name = m.asset_name;
+                        merged.update_available = m.update_available;
+                    }
+                    Ok(merged)
+                }
+                _ => Ok(g),
             }
         }
         (Some(g), None) => Ok(g),
         (None, Some(m)) => Ok(m),
         (None, None) => Err(last_err),
     }
+}
+
+fn verify_downloaded_binary(path: &Path, asset_name: &str) -> Result<String, String> {
+    let mut file =
+        std::fs::File::open(path).map_err(|e| format!("Cannot read downloaded installer: {e}"))?;
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("Cannot inspect downloaded installer: {e}"))?;
+    if meta.len() < 500_000 {
+        return Err(format!(
+            "Downloaded file is too small ({} bytes) and looks incomplete or corrupted",
+            meta.len()
+        ));
+    }
+
+    let mut header = [0u8; 8];
+    file.read_exact(&mut header)
+        .map_err(|e| format!("Failed reading downloaded file header: {e}"))?;
+
+    let lower = asset_name.to_lowercase();
+    if lower.ends_with(".exe") {
+        if &header[0..2] != b"MZ" {
+            return Err(
+                "Downloaded file is not a valid Windows executable (missing MZ header)".into(),
+            );
+        }
+    } else if lower.ends_with(".msi") {
+        const OLE_MAGIC: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
+        if header != OLE_MAGIC {
+            return Err(
+                "Downloaded file is not a valid Windows MSI installer package".into(),
+            );
+        }
+    }
+
+    // Compute full SHA-256 digest for optional checksum verification
+    let mut hasher = Sha256::new();
+    hasher.update(header);
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .map_err(|e| format!("Failed hashing downloaded installer: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(64);
+    for b in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut hex, "{b:02x}");
+    }
+    Ok(hex)
+}
+
+fn parse_sha256_for_asset(sums_text: &str, asset_name: &str) -> Option<String> {
+    let target = asset_name.trim().to_lowercase();
+    for line in sums_text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut parts = trimmed.split_whitespace();
+        let hash = parts.next()?.trim().to_lowercase();
+        let name = parts.next()?.trim().trim_start_matches('*').to_lowercase();
+        if hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()) && name == target {
+            return Some(hash);
+        }
+    }
+    None
+}
+
+async fn verify_optional_release_sha256(
+    client: &reqwest::Client,
+    download_url: &str,
+    asset_name: &str,
+    actual_sha256: &str,
+) -> Result<(), String> {
+    let Some((prefix, _)) = download_url.rsplit_once('/') else {
+        return Ok(());
+    };
+    let sums_url = format!("{prefix}/SHA256SUMS.txt");
+    if !is_trusted_update_url(&sums_url) {
+        return Ok(());
+    }
+    let Ok(Ok(resp)) = tokio::time::timeout(Duration::from_secs(8), client.get(&sums_url).send()).await
+    else {
+        return Ok(());
+    };
+    if !resp.status().is_success() {
+        return Ok(());
+    }
+    let Ok(body) = resp.text().await else {
+        return Ok(());
+    };
+    if let Some(expected) = parse_sha256_for_asset(&body, asset_name) {
+        if !expected.eq_ignore_ascii_case(actual_sha256) {
+            return Err(format!(
+                "SHA-256 checksum mismatch for {asset_name} (expected {}..., got {}...)",
+                &expected[..12],
+                &actual_sha256[..12]
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1982,6 +2297,23 @@ pub async fn download_and_install_update(
     download_url: String,
     asset_name: Option<String>,
 ) -> Result<String, String> {
+    let clean_url = download_url.trim().to_string();
+    if !is_trusted_update_url(&clean_url) {
+        let err = "Blocked untrusted update download URL (must be HTTPS on GitHub)".to_string();
+        let _ = app.emit(
+            "update://progress",
+            &UpdateDownloadProgress {
+                percent: 0,
+                downloaded_bytes: 0,
+                total_bytes: 0,
+                phase: "error".into(),
+                file_path: None,
+                error: Some(err.clone()),
+            },
+        );
+        return Err(err);
+    }
+
     let (app_data_dir, is_connected) = {
         let guard = state.inner.lock().map_err(|_| "State lock poisoned")?;
         (guard.app_data_dir.clone(), guard.status == "Connected")
@@ -1993,16 +2325,26 @@ pub async fn download_and_install_update(
     let safe_name = asset_name
         .filter(|n| !n.trim().is_empty())
         .or_else(|| {
-            download_url
+            clean_url
                 .rsplit('/')
                 .next()
                 .map(|s| s.split('?').next().unwrap_or(s).to_string())
         })
-        .filter(|n| n.ends_with(".exe") || n.ends_with(".msi"))
+        .map(|n| {
+            n.chars()
+                .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+                .collect::<String>()
+        })
+        .filter(|n| {
+            let low = n.to_lowercase();
+            low.ends_with(".exe") || low.ends_with(".msi")
+        })
         .unwrap_or_else(|| "Metrovpn-Update-Setup.exe".to_string());
 
     let out_path = updates_dir.join(&safe_name);
+    let part_path = updates_dir.join(format!("{safe_name}.part"));
     let _ = std::fs::remove_file(&out_path);
+    let _ = std::fs::remove_file(&part_path);
 
     let proxy_modes: Vec<bool> = if is_connected {
         vec![true, false]
@@ -2010,23 +2352,18 @@ pub async fn download_and_install_update(
         vec![false]
     };
 
+    let current_ver = env!("CARGO_PKG_VERSION");
     let mut downloaded_ok = false;
+    let mut final_downloaded: u64 = 0;
+    let mut final_total: u64 = 0;
     let mut last_err = String::from("Failed to download update installer");
 
     for use_proxy in proxy_modes {
-        let mut builder = reqwest::Client::builder()
-            .user_agent("Metrovpn-Desktop-Updater")
-            .timeout(Duration::from_secs(300));
-        if use_proxy {
-            if let Ok(px) = reqwest::Proxy::all(format!("http://127.0.0.1:{HTTP_PORT}")) {
-                builder = builder.proxy(px);
-            }
-        }
-        let Ok(client) = builder.build() else {
+        let Ok(client) = build_update_http_client(current_ver, use_proxy, 300) else {
             continue;
         };
 
-        let resp = match client.get(&download_url).send().await {
+        let resp = match client.get(&clean_url).send().await {
             Ok(r) if r.status().is_success() => r,
             Ok(r) => {
                 last_err = format!("Update download HTTP {}", r.status());
@@ -2038,8 +2375,19 @@ pub async fn download_and_install_update(
             }
         };
 
+        if let Some(ct) = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+        {
+            if ct.to_lowercase().contains("text/html") {
+                last_err = "Update link returned an HTML page instead of an installer binary".into();
+                continue;
+            }
+        }
+
         let total_bytes = resp.content_length().unwrap_or(0);
-        let mut file = std::fs::File::create(&out_path)
+        let mut file = std::fs::File::create(&part_path)
             .map_err(|e| format!("Failed to create update file: {e}"))?;
 
         let mut downloaded: u64 = 0;
@@ -2070,7 +2418,7 @@ pub async fn download_and_install_update(
                     downloaded += chunk.len() as u64;
                     let pct = (downloaded.saturating_mul(100))
                         .checked_div(total_bytes)
-                        .map(|p| p.min(100) as u8)
+                        .map(|p| p.min(99) as u8)
                         .unwrap_or_else(|| ((downloaded / (1024 * 350)).min(95) as u8).max(5));
                     if pct != last_pct || last_emit.elapsed() >= Duration::from_millis(200) {
                         last_pct = pct;
@@ -2098,17 +2446,36 @@ pub async fn download_and_install_update(
         drop(file);
 
         if let Some(err) = stream_err {
-            let _ = std::fs::remove_file(&out_path);
+            let _ = std::fs::remove_file(&part_path);
             last_err = err;
             continue;
         }
 
-        if downloaded < 100_000 {
-            let _ = std::fs::remove_file(&out_path);
-            last_err = "Downloaded update file looks incomplete".into();
+        let sha256_hex = match verify_downloaded_binary(&part_path, &safe_name) {
+            Ok(hex) => hex,
+            Err(err) => {
+                let _ = std::fs::remove_file(&part_path);
+                last_err = err;
+                continue;
+            }
+        };
+
+        if let Err(err) =
+            verify_optional_release_sha256(&client, &clean_url, &safe_name, &sha256_hex).await
+        {
+            let _ = std::fs::remove_file(&part_path);
+            last_err = err;
             continue;
         }
 
+        if let Err(e) = std::fs::rename(&part_path, &out_path) {
+            let _ = std::fs::remove_file(&part_path);
+            last_err = format!("Failed to finalize downloaded installer: {e}");
+            continue;
+        }
+
+        final_downloaded = downloaded;
+        final_total = total_bytes.max(downloaded);
         downloaded_ok = true;
         break;
     }
@@ -2133,8 +2500,8 @@ pub async fn download_and_install_update(
         "update://progress",
         &UpdateDownloadProgress {
             percent: 100,
-            downloaded_bytes: 0,
-            total_bytes: 0,
+            downloaded_bytes: final_downloaded,
+            total_bytes: final_total,
             phase: "launching".into(),
             file_path: Some(out_str.clone()),
             error: None,
@@ -2144,29 +2511,38 @@ pub async fn download_and_install_update(
     state.push_log(
         Some(&app),
         "Info",
-        &format!("Update downloaded to {out_str}. Launching installer..."),
+        &format!("Update verified at {out_str}. Handing off to Windows updater..."),
     );
 
-    // Tear down active VPN tunnel and remove tray icon so Windows installer can replace binaries cleanly
+    // Tear down active VPN tunnel, remove tray icon, and release single-instance mutex
+    // BEFORE launching the detached updater helper so Windows can cleanly overwrite binaries.
     state.cleanup_all();
     let _ = app.remove_tray_by_id("metrovpn-tray");
+    release_single_instance_mutex();
 
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        if out_str.to_lowercase().ends_with(".msi") {
-            let _ = Command::new("msiexec")
-                .args(["/i", &out_str])
-                .creation_flags(CREATE_NO_WINDOW)
-                .spawn();
-        } else {
-            let _ = Command::new(&out_path).spawn();
-        }
+    let is_standalone_replace = cfg!(feature = "standalone-exe")
+        && safe_name.to_lowercase().contains("standalone")
+        && safe_name.to_lowercase().ends_with(".exe");
+
+    if let Err(err) = launch_windows_update_handoff(&out_path, is_standalone_replace) {
+        state.push_log(Some(&app), "Warning", &format!("Updater launch failed: {err}"));
+        let _ = app.emit(
+            "update://progress",
+            &UpdateDownloadProgress {
+                percent: 100,
+                downloaded_bytes: final_downloaded,
+                total_bytes: final_total,
+                phase: "error".into(),
+                file_path: Some(out_str),
+                error: Some(err.clone()),
+            },
+        );
+        return Err(err);
     }
 
     let app_exit = app.clone();
     tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(450)).await;
+        tokio::time::sleep(Duration::from_millis(180)).await;
         app_exit.exit(0);
     });
 
@@ -2463,3 +2839,70 @@ pub async fn quit_app(app: AppHandle, state: State<'_, AppState>) -> Result<(), 
     app.exit(0);
     Ok(())
 }
+
+#[cfg(test)]
+mod updater_tests {
+    use super::*;
+
+    #[test]
+    fn test_trusted_update_url_validation() {
+        assert!(is_trusted_update_url(
+            "https://github.com/Metro-dens/MetroVPN-for-Windows/releases/download/v2.7.7/Metrovpn_2.7.7_x64-setup.exe"
+        ));
+        assert!(is_trusted_update_url(
+            "https://objects.githubusercontent.com/github-production-release-asset-123/test.exe"
+        ));
+        assert!(!is_trusted_update_url(
+            "http://github.com/Metro-dens/MetroVPN-for-Windows/releases/latest/download/Metrovpn.exe"
+        ));
+        assert!(!is_trusted_update_url("https://evil.example.com/Metrovpn.exe"));
+        assert!(!is_trusted_update_url(
+            "https://user:pass@github.com/Metro-dens/MetroVPN-for-Windows/releases/latest"
+        ));
+    }
+
+    #[test]
+    fn test_compare_versions_ordering() {
+        assert_eq!(compare_versions("2.7.7", "2.7.6"), std::cmp::Ordering::Greater);
+        assert_eq!(compare_versions("v2.7.6", "2.7.6"), std::cmp::Ordering::Equal);
+        assert_eq!(compare_versions("2.7.5", "2.7.6"), std::cmp::Ordering::Less);
+        assert_eq!(compare_versions("2.10.0", "2.9.9"), std::cmp::Ordering::Greater);
+    }
+
+    #[test]
+    fn test_select_best_windows_asset_filters_untrusted_and_picks_setup() {
+        let assets = vec![
+            serde_json::json!({
+                "name": "Metrovpn-windows-x64-portable.zip",
+                "browser_download_url": "https://github.com/Metro-dens/MetroVPN-for-Windows/releases/download/v2.7.7/Metrovpn-windows-x64-portable.zip"
+            }),
+            serde_json::json!({
+                "name": "Metrovpn_2.7.7_x64-setup.exe",
+                "browser_download_url": "https://github.com/Metro-dens/MetroVPN-for-Windows/releases/download/v2.7.7/Metrovpn_2.7.7_x64-setup.exe"
+            }),
+            serde_json::json!({
+                "name": "Metrovpn-standalone-x64.exe",
+                "browser_download_url": "https://github.com/Metro-dens/MetroVPN-for-Windows/releases/download/v2.7.7/Metrovpn-standalone-x64.exe"
+            }),
+        ];
+        let picked = select_best_windows_asset(Some(&assets)).expect("should pick asset");
+        if cfg!(feature = "standalone-exe") {
+            assert_eq!(picked.0, "Metrovpn-standalone-x64.exe");
+        } else {
+            assert_eq!(picked.0, "Metrovpn_2.7.7_x64-setup.exe");
+        }
+    }
+
+    #[test]
+    fn test_parse_sha256_for_asset() {
+        let sums = "\
+            0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  Metrovpn_2.7.7_x64-setup.exe\n\
+            fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210  Metrovpn-standalone-x64.exe\n";
+        assert_eq!(
+            parse_sha256_for_asset(sums, "Metrovpn_2.7.7_x64-setup.exe").as_deref(),
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(parse_sha256_for_asset(sums, "missing.exe"), None);
+    }
+}
+

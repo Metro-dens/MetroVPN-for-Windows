@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: "Release tag to create (e.g. v2.7.6)"
+        description: "Release tag to create (e.g. v2.7.7)"
         required: true
-        default: "v2.7.6"
+        default: "v2.7.7"
         type: string
       draft:
         description: "Create as a draft release (hidden until published)"
@@ -67,19 +67,20 @@ jobs:
           releaseBody: |
             ## Metrovpn Desktop for Windows 10/11 (x64)
 
-            Powered by **Xray-core `v26.11.9`** and **Wintun (`tun2socks v2.7.0`)**.
+            Powered by **Xray-core `v26.11.9`** (MPL-2.0) and **Wintun (`tun2socks v2.7.0`, GPL-3.0)**.
 
             ### Downloads
-            - **`Metrovpn_*_x64-setup.exe`** — Recommended NSIS Windows Installer (desktop/Start Menu shortcuts, WebView2 runtime check, clean uninstaller).
+            - **`Metrovpn_*_x64-setup.exe`** — Recommended NSIS Windows Installer (desktop/Start Menu shortcuts, WebView2 runtime check, license agreement, clean uninstaller).
             - **`Metrovpn_*_x64_en-US.msi`** — WiX Windows Installer package.
             - **`Metrovpn-standalone-x64.exe`** — Single-file portable executable (auto-extracts & version-upgrades `xray.exe`, `tun2socks.exe`, `wintun.dll`, `geoip.dat`, and `geosite.dat` in `%AppData%\site.metrodens.metrovpn\core\`).
-            - **`Metrovpn-windows-x64-portable.zip`** — Portable folder archive with all binaries side-by-side.
+            - **`Metrovpn-windows-x64-portable.zip`** — Portable folder archive with all binaries and third-party license notices side-by-side.
             - **`SHA256SUMS.txt`** — SHA-256 verification checksums (`Get-FileHash <file> -Algorithm SHA256`).
 
-            ### What's New in v2.7.6
-            - **Multi-Connection Ookla/Fast.com-Grade Speed Test Engine:** Replaced the old single-stream 25 MB / 10 MB test (which capped high-speed fiber links at half speed due to TCP slow-start and HTTP/2 single-socket multiplexing) with **8 parallel independent HTTP/1.1 TCP download streams (7s)** and **6 parallel independent upload streams (6s)**, discarding the initial 1.5s warm-up ramp and computing Ookla-style trimmed steady-state Mbps.
-            - **Warmed Keep-Alive Ping & Jitter:** Discards 2 cold TLS/SOCKS5 warm-up probes before timing 10 keep-alive RTT probes, reporting accurate low-percentile Ping and spike-filtered Jitter.
-            - **0–1000+ Mbps Nonlinear Speedometer Arc:** Upgraded the Speed tab gauge and telemetry bars to smoothly scale from 0 to 1,000+ Mbps instead of pinning at 100 Mbps.
+            ### What's New in v2.7.7
+            - **Fixed Windows Auto-Updater (NSIS, MSI & Standalone EXE):** Overhauled `check_github_update` and `download_and_install_update` with parallel GitHub/manifest checks, HTTPS trusted-host verification, PE (`MZ`) / MSI header + `SHA256SUMS.txt` verification, single-instance mutex release, and a detached PID-waiting handoff (in-place self-replace for Standalone EXE and ShellExecute/UAC launch for NSIS/MSI installers).
+            - **Real Scannable Config QR Generator:** Replaced the decorative SVG placeholder in **Share Node QR** with a true ISO/IEC 18004 QR code generator encoding the node's actual `vless://` / `vmess://` / `trojan://` URI, plus one-click **Save PNG** and **Copy URI**.
+            - **Core Bug Fixes:** Disconnecting automatically if the currently active node is deleted; syncing `node.uri` when editing node Name/SNI; honoring the Subscription Proxy setting; guarding TLS Frag against UDP transports (`quic`/`kcp`); sanitizing comma/wildcard VCN before HTTP `Host` headers; and fixing tray mode persistence + UAC checks.
+            - **Open-Source License Compliance:** Added `THIRD-PARTY-LICENSES.md`, full license texts (`GPL-3.0.txt`, `MPL-2.0.txt`, `GPL-2.0.txt`, `APACHE-2.0.txt`) bundled into NSIS/MSI installers and Portable ZIP, installer license screen, and an in-app **Open Source Licenses** viewer in **Settings → About**.
 
             > **SmartScreen Note:** If Windows Defender SmartScreen prompts on an unsigned build, verify the SHA-256 checksum against `SHA256SUMS.txt` and click **More info → Run anyway**.
           releaseDraft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft || false }}
@@ -112,12 +113,15 @@ jobs:
         run: |
           npx tauri build --target x86_64-pc-windows-msvc --no-bundle --features custom-protocol
           $outDir = "portable-stage"
-          New-Item -ItemType Directory -Force -Path "$outDir/resources" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$outDir/resources", "$outDir/licenses" | Out-Null
           Copy-Item "src-tauri/target/x86_64-pc-windows-msvc/release/metrovpn.exe" "$outDir/Metrovpn.exe"
           Copy-Item "src-tauri/binaries/xray-x86_64-pc-windows-msvc.exe" "$outDir/xray.exe"
           Copy-Item "src-tauri/binaries/tun2socks-x86_64-pc-windows-msvc.exe" "$outDir/tun2socks.exe"
           Copy-Item "src-tauri/resources/wintun.dll" "$outDir/wintun.dll"
           Copy-Item "src-tauri/resources/*" "$outDir/resources/"
+          Copy-Item "LICENSE" "$outDir/LICENSE.txt"
+          Copy-Item "THIRD-PARTY-LICENSES.md" "$outDir/THIRD-PARTY-LICENSES.md"
+          Copy-Item "licenses/*" "$outDir/licenses/"
           Compress-Archive -Path "$outDir/*" -DestinationPath "Metrovpn-windows-x64-portable.zip" -Force
 
           $hashTargets = @()
